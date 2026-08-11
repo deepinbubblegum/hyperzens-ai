@@ -10,7 +10,8 @@ Optimisation
 * AdamW + **LR warmup + cosine decay** (``lr → min_lr``)
 * Micro-batch ``batch_size=8`` × ``grad_accum_steps=8`` (effective 64) for ~12GB VRAM
 * Mixed precision: CUDA autocast ``float16`` for forward + CE (logits stay fp16)
-* ``torch.compile(..., mode="reduce-overhead")`` on CUDA with fallback
+* ``torch.compile`` on CUDA with ``mode="default"`` (not ``reduce-overhead`` when
+  ``grad_accum_steps > 1`` — CUDA Graphs would corrupt accumulated grads)
 * DataLoader workers + ``pin_memory`` + ``persistent_workers`` on CUDA
 * Caps: ``max_epochs=5``, ``max_steps=3000``
 """
@@ -81,7 +82,7 @@ class TrainConfig:
     max_epochs: int = 5
     grad_clip: float = 1.0
     compile_model: bool = True  # torch.compile on CUDA only
-    compile_mode: str = "reduce-overhead"  # lower warm-up VRAM vs "default"
+    compile_mode: str = "default"  # avoid reduce-overhead with grad accumulation
     lr_warmup_frac: float = 0.05  # fraction of optimizer steps for LR warmup
 
     # FFF routing schedule
@@ -180,12 +181,14 @@ def maybe_compile(
     model: FFFTransformer,
     enabled: bool,
     device: torch.device,
-    mode: str = "reduce-overhead",
+    mode: str = "default",
+    grad_accum_steps: int = 1,
 ) -> FFFTransformer:
     """Compile with ``torch.compile`` on CUDA when requested.
 
-    Tries ``mode`` first (default ``reduce-overhead`` to limit warm-up VRAM),
-    then falls back to ``"default"``, then returns the eager model.
+    Uses ``mode="default"`` by default. ``reduce-overhead`` enables CUDA Graphs,
+    which overwrite gradient buffers across micro-batches and is **unsafe** when
+    ``grad_accum_steps > 1`` — in that case we force ``"default"``.
     """
     if not enabled:
         return model
@@ -196,24 +199,30 @@ def maybe_compile(
         print("torch.compile unavailable — skipping")
         return model
 
-    modes = [mode]
-    if mode != "default":
-        modes.append("default")
+    compile_mode = mode
+    if grad_accum_steps > 1 and compile_mode == "reduce-overhead":
+        print(
+            "torch.compile: refusing mode='reduce-overhead' with "
+            f"grad_accum_steps={grad_accum_steps} (CUDA Graphs vs grad accum); "
+            "using mode='default'"
+        )
+        compile_mode = "default"
 
-    for compile_mode in modes:
-        try:
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            compiled = torch.compile(model, mode=compile_mode)  # type: ignore[assignment]
-            print(f"torch.compile enabled (mode={compile_mode!r}, device={device.type})")
-            return compiled  # type: ignore[return-value]
-        except Exception as exc:  # pragma: no cover
-            print(f"torch.compile mode={compile_mode!r} failed ({exc}); trying fallback...")
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-
-    print("torch.compile skipped — using eager model")
-    return model
+    try:
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        # Prefer explicit default mode (equivalent to torch.compile(model)).
+        compiled = torch.compile(model, mode=compile_mode)  # type: ignore[assignment]
+        print(
+            f"torch.compile enabled (mode={compile_mode!r}, device={device.type}, "
+            f"grad_accum_steps={grad_accum_steps})"
+        )
+        return compiled  # type: ignore[return-value]
+    except Exception as exc:  # pragma: no cover
+        print(f"torch.compile mode={compile_mode!r} failed ({exc}); using eager model")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return model
 
 
 def make_dataloader(
@@ -441,8 +450,11 @@ def build_argparser() -> argparse.ArgumentParser:
         "--compile-mode",
         type=str,
         default=d.compile_mode,
-        choices=["reduce-overhead", "default", "max-autotune"],
-        help="torch.compile mode (CUDA); reduce-overhead uses less warm-up VRAM",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help=(
+            "torch.compile mode (CUDA). Do not use reduce-overhead with "
+            "grad_accum_steps>1 (CUDA Graphs overwrite accumulated grads)."
+        ),
     )
     p.add_argument("--checkpoint-path", type=str, default=d.checkpoint_path)
     p.add_argument("--wandb", action="store_true")
@@ -555,6 +567,7 @@ def main() -> None:
         enabled=cfg.compile_model,
         device=device,
         mode=cfg.compile_mode,
+        grad_accum_steps=cfg.grad_accum_steps,
     )
 
     optimizer = torch.optim.AdamW(
@@ -620,6 +633,10 @@ def main() -> None:
             if epoch_micro >= micro_per_epoch:
                 break
 
+            # Start of a new accumulation cycle: clear grads before micro-batch 0.
+            if accum_count == 0:
+                optimizer.zero_grad(set_to_none=True)
+
             input_ids = to_device(input_ids, device, non_blocking=pin_memory)
             targets = to_device(targets, device, non_blocking=pin_memory)
 
@@ -672,6 +689,7 @@ def main() -> None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
+                # End of accumulation cycle — clear before the next cycle begins.
                 optimizer.zero_grad(set_to_none=True)
                 accum_count = 0
                 global_opt_step += 1
