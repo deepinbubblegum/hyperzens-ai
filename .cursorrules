@@ -1,0 +1,58 @@
+# Fast Feedforward Network (FFF) Language Model — Cursor Rules
+# Paper: Belcak & Wattenhofer, "Fast Feedforward Networks"
+
+## Stack & Language
+
+- Use **PyTorch 2.x** exclusively (`torch.nn`, `torch.nn.functional`, modern APIs).
+- Use **Type Hints everywhere**: function signatures, module attributes, return types, and public constants.
+- Prefer `from __future__ import annotations` at the top of Python modules when it improves clarity.
+- Target Python 3.10+ syntax (`X | None`, `list[Tensor]`, etc.).
+
+## Code Quality
+
+- Enforce **clean, modular code**: one responsibility per module/class; keep training, model cores, and inference decoupled.
+- Every public class and function must have an **explicit docstring** that explains:
+  - Mathematical intent (routing, leaf MLP, temperature, load-balancing, etc.)
+  - **Tensor shapes** for inputs/outputs (e.g. `(B, T, D)`, `(B*T, n_leaves)`, …)
+  - Key hyperparameters and their roles
+- Prefer readable math-aligned naming (`node_weights`, `leaf_w1`, `temperature`, `balance_loss`) over opaque abbreviations.
+- Avoid silent shape magic; document broadcast/reshape steps in comments or docstrings when non-obvious.
+- No unnecessary comments that restate the code; comments/docstrings must add math or shape clarity.
+
+## FFF Routing Contract (Mandatory)
+
+Maintain **separate forward passes** for training vs inference:
+
+### Soft Routing (Training)
+
+- Differentiable mixture over tree paths (sigmoid/softmax over node decisions).
+- Support **temperature annealing** (`τ → 0`) during training.
+- Return or expose auxiliaries needed for **load-balancing loss** (leaf usage / region occupancy).
+- Must be batched and GPU-friendly; no Python `if/else` per token.
+
+### Hard Routing (Inference)
+
+- Discrete tree traversal: **hard decisions / if-else style** path selection.
+- Activate **only one leaf** (or the log-depth path) per token — no soft mixture.
+- Optimized for **fast CPU inference**; avoid allocating full soft mixture tensors when possible.
+- Must be numerically consistent with the annealed soft policy at `τ → 0` (same leaf choice for a given input, barring ties).
+
+### API Expectations
+
+- Expose clearly named entry points, e.g. `forward_soft(...)` / `forward_hard(...)`, or a `forward(..., hard: bool = False)` with an explicit hard path implementation—not a single blended path with a boolean that only tweaks temperature.
+- Training scripts (`train.py`) must use Soft Routing + temperature annealing + load-balancing loss.
+- Inference scripts (`infer.py`) must use Hard Routing only.
+
+## Project Layout
+
+- `models/fff_layer.py` — core FFF layer (nodes, leaves, soft/hard forwards, balance stats).
+- `models/transformer.py` — Transformer blocks with FFF replacing the standard MLP/FFN.
+- `train.py` — training loop, annealing schedule, load-balancing loss, logging (e.g. WandB).
+- `infer.py` — hard-routing CPU inference.
+- Keep modules importable without side effects (no training on import).
+
+## Testing & Safety Habits
+
+- Assert or document expected dtypes/devices at module boundaries when helpful.
+- Do not commit secrets (WandB keys, tokens). Use env vars.
+- Prefer reproducible seeds for experiments when adding training utilities.
