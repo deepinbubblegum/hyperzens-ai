@@ -481,3 +481,137 @@ class FFFTransformer(nn.Module):
             next_id = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat((input_ids, next_id), dim=1)
         return input_ids
+
+
+# ---------------------------------------------------------------------------
+# Dense MLP baseline (same outer architecture, standard FFN)
+# ---------------------------------------------------------------------------
+
+
+class StandardDenseBlock(nn.Module):
+    """Pre-norm block identical to :class:`TransformerBlock` but with dense MLP.
+
+    MLP (NanoGPT / Vaswani style expansion ``4×``):
+        ``nn.Sequential(Linear(D, 4D), GELU(), Linear(4D, D))``
+    """
+
+    def __init__(self, config: FFFConfig) -> None:
+        super().__init__()
+        self.ln_1 = RMSNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = RMSNorm(config.n_embd)
+        d = config.n_embd
+        self.mlp = nn.Sequential(
+            nn.Linear(d, 4 * d, bias=config.bias),
+            nn.GELU(),
+            nn.Linear(4 * d, d, bias=config.bias),
+        )
+        self.mlp_dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """``x: (B, T, D) → (B, T, D)``."""
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp_dropout(self.mlp(self.ln_2(x)))
+        return x
+
+
+class StandardTransformer(nn.Module):
+    """Decoder-only causal LM with standard dense MLP/FFN (benchmark baseline).
+
+    Shares :class:`FFFConfig` fields ``vocab_size, n_embd, n_layer, n_head,
+    block_size`` with :class:`FFFTransformer`. The sole architectural difference
+    is the feedforward sublayer (dense ``D→4D→D`` vs FFF tree).
+
+    Forward returns ``logits`` only (no balance loss): ``(B, T, V)``.
+    """
+
+    def __init__(self, config: FFFConfig) -> None:
+        super().__init__()
+        self.config = config
+
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.drop = nn.Dropout(config.dropout)
+        self.blocks = nn.ModuleList(
+            StandardDenseBlock(config) for _ in range(config.n_layer)
+        )
+        self.ln_f = RMSNorm(config.n_embd)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        if config.tie_weights:
+            self.lm_head.weight = self.wte.weight
+
+        self.apply(self._init_weights)
+        for pn, p in self.named_parameters():
+            if pn.endswith("proj.weight") or pn.endswith("mlp.2.weight"):
+                nn.init.normal_(p, mean=0.0, std=0.02 / (2 * config.n_layer) ** 0.5)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        """
+        Parameters
+        ----------
+        input_ids:
+            ``(B, T)``
+
+        Returns
+        -------
+        Tensor
+            Logits ``(B, T, vocab_size)``.
+        """
+        if input_ids.ndim != 2:
+            raise ValueError(
+                f"input_ids must be (B, T), got shape {tuple(input_ids.shape)}"
+            )
+        _bsz, seq_len = input_ids.shape
+        if seq_len > self.config.block_size:
+            raise ValueError(
+                f"sequence length {seq_len} exceeds block_size "
+                f"{self.config.block_size}"
+            )
+
+        x = self.drop(self.wte(input_ids))
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        return self.lm_head(x)
+
+    def get_num_params(self, non_embedding: bool = True) -> int:
+        """Count parameters; optionally exclude the token embedding table."""
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.wte.weight.numel()
+        return n_params
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+    ) -> Tensor:
+        """Autoregressive sampling (dense baseline)."""
+        self.eval()
+        for _ in range(max_new_tokens):
+            idx_cond = (
+                input_ids
+                if input_ids.size(1) <= self.config.block_size
+                else input_ids[:, -self.config.block_size :]
+            )
+            logits = self(idx_cond)
+            logits = logits[:, -1, :] / max(temperature, 1e-8)
+            if top_k is not None:
+                values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < values[:, [-1]]] = -float("inf")
+            probs = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+            input_ids = torch.cat((input_ids, next_id), dim=1)
+        return input_ids
