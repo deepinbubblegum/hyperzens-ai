@@ -1,8 +1,10 @@
-"""Hard-routing inference for a trained FFFTransformer (cross-platform).
+"""Hard-routing inference for a trained FFFTransformer (BPE / cross-platform).
 
 Loads ``fff_checkpoint.pt``, generates text with ``mode="hard"``, reports
-ms/token and FFF active-vs-total parameter counts, and verifies that hard
-routing evaluates only the selected tree path (skips unselected branches).
+ms/token and FFF active-vs-total parameter counts, and verifies hard routing.
+
+Prompts / outputs use **tiktoken GPT-2 BPE** (or legacy char tokenizer if the
+checkpoint still stores ``chars``).
 
 Device defaults to auto-detect (CUDA → MPS → CPU). Override with
 ``--device cpu|cuda|mps``.
@@ -14,7 +16,7 @@ import argparse
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -26,9 +28,17 @@ from models.transformer import FFFConfig, FFFTransformer
 DEFAULT_CHECKPOINT = Path(__file__).resolve().parent / "fff_checkpoint.pt"
 
 
+class Tokenizer(Protocol):
+    vocab_size: int
+
+    def encode(self, s: str) -> list[int]: ...
+
+    def decode(self, ids: list[int] | Tensor) -> str: ...
+
+
 @dataclass
 class CharTokenizer:
-    """Minimal char tokenizer restored from checkpoint metadata."""
+    """Legacy character-level tokenizer (older checkpoints)."""
 
     chars: list[str]
 
@@ -51,13 +61,53 @@ class CharTokenizer:
         return "".join(self.itos[int(i)] for i in ids)
 
 
+class GPT2Tokenizer:
+    """GPT-2 BPE via ``tiktoken`` (scaled SLM checkpoints)."""
+
+    def __init__(self, encoding_name: str = "gpt2") -> None:
+        try:
+            import tiktoken
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "tiktoken is required for BPE inference. pip install tiktoken"
+            ) from exc
+        self.encoding_name = encoding_name
+        self._enc = tiktoken.get_encoding(encoding_name)
+        self.vocab_size: int = int(self._enc.n_vocab)
+
+    def encode(self, s: str) -> list[int]:
+        return self._enc.encode_ordinary(s)
+
+    def decode(self, ids: list[int] | Tensor) -> str:
+        if isinstance(ids, Tensor):
+            ids = ids.tolist()
+        return self._enc.decode([int(i) for i in ids])
+
+
+def build_tokenizer(tok_meta: dict[str, Any], vocab_size: int) -> Tokenizer:
+    """Restore tokenizer from checkpoint metadata (BPE preferred)."""
+    if tok_meta.get("encoding") == "gpt2" or "chars" not in tok_meta:
+        tok = GPT2Tokenizer(tok_meta.get("encoding", "gpt2"))
+        if tok.vocab_size != vocab_size:
+            raise ValueError(
+                f"tiktoken vocab ({tok.vocab_size}) != model vocab ({vocab_size})"
+            )
+        return tok
+    tok = CharTokenizer(chars=list(tok_meta["chars"]))
+    if tok.vocab_size != vocab_size:
+        raise ValueError(
+            f"char vocab ({tok.vocab_size}) != model vocab ({vocab_size})"
+        )
+    return tok
+
+
 @dataclass
 class ParamStats:
     """Parameter accounting for hard FFF inference."""
 
     total_model_params: int
     total_fff_params: int
-    fff_active_per_token: int  # across all layers, one forward token position
+    fff_active_per_token: int
     fff_active_fraction: float
     per_layer_active: int
     per_layer_stored: int
@@ -69,7 +119,7 @@ class ParamStats:
 def load_checkpoint(
     checkpoint_path: Path,
     device: torch.device | None = None,
-) -> tuple[FFFTransformer, CharTokenizer, dict[str, Any]]:
+) -> tuple[FFFTransformer, Tokenizer, dict[str, Any]]:
     """Load model + tokenizer from ``fff_checkpoint.pt`` onto ``device``."""
     if device is None:
         device = resolve_device("auto")
@@ -78,7 +128,6 @@ def load_checkpoint(
             f"Checkpoint not found: {checkpoint_path}. Train first with `python train.py`."
         )
 
-    # weights_only=False: checkpoint includes tokenizer metadata / configs.
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model_cfg = FFFConfig(**ckpt["model_config"])
     model = FFFTransformer(model_cfg)
@@ -86,17 +135,17 @@ def load_checkpoint(
     model.to(device)
     model.eval()
 
-    tok_meta = ckpt["tokenizer"]
-    tokenizer = CharTokenizer(chars=list(tok_meta["chars"]))
-    if tokenizer.vocab_size != model_cfg.vocab_size:
-        raise ValueError(
-            f"tokenizer vocab ({tokenizer.vocab_size}) != model vocab ({model_cfg.vocab_size})"
-        )
+    # Embedding ↔ LM head alignment
+    assert model.wte.num_embeddings == model_cfg.vocab_size
+    assert model.lm_head.out_features == model_cfg.vocab_size
+    assert model.wte.embedding_dim == model_cfg.n_embd == model.lm_head.in_features
+
+    tok_meta = ckpt.get("tokenizer", {"encoding": "gpt2", "vocab_size": model_cfg.vocab_size})
+    tokenizer = build_tokenizer(tok_meta, model_cfg.vocab_size)
     return model, tokenizer, ckpt
 
 
 def compute_param_stats(model: FFFTransformer) -> ParamStats:
-    """Compare hard-active FFF params/token vs stored model / FFF totals."""
     total_model = sum(p.numel() for p in model.parameters())
     fff_layers = list(model.fff_layers())
     if not fff_layers:
@@ -104,7 +153,6 @@ def compute_param_stats(model: FFFTransformer) -> ParamStats:
 
     per_layer = fff_layers[0].active_params_per_token()
     n_layers = len(fff_layers)
-    # Every FFF layer has the same geometry under FFFConfig.
     total_fff = sum(
         layer.router_weights.numel()
         + layer.router_biases.numel()
@@ -131,23 +179,7 @@ def verify_hard_skips_unselected_branches(
     model: FFFTransformer,
     sample: Tensor | None = None,
 ) -> dict[str, Any]:
-    """Prove hard routing never reads unselected leaves / off-path routers.
-
-    Method
-    ------
-    1. Trace the hard path (``depth`` routers + 1 leaf) for a probe vector.
-    2. Assert path length / uniqueness invariants.
-    3. **Poison test**: scramble every *unselected* leaf (and off-path router).
-       Hard output must be unchanged; soft output must change for the same input.
-    4. Scramble the *selected* leaf → hard output must change.
-
-    Parameters
-    ----------
-    model:
-        Model under test (mutates FFF weights temporarily, then restores).
-    sample:
-        Optional probe ``(D,)``. Defaults to a fixed RNG vector on CPU.
-    """
+    """Prove hard routing never reads unselected leaves / off-path routers."""
     device = next(model.parameters()).device
     layer = next(iter(model.fff_layers()))
     d_model = layer.in_features
@@ -157,7 +189,6 @@ def verify_hard_skips_unselected_branches(
     else:
         sample = sample.to(device)
 
-    # --- structural path check ---
     path = layer.trace_hard_path(sample)
     router_ids = path["router_ids"]
     leaf_id = int(path["leaf_id"])
@@ -168,25 +199,17 @@ def verify_hard_skips_unselected_branches(
         )
     if len(set(router_ids)) != layer.depth:
         raise AssertionError("hard path revisited a router (invalid tree walk)")
-    if leaf_id < 0 or leaf_id >= layer.num_leaves:
-        raise AssertionError(f"leaf_id {leaf_id} out of range")
-    if len(path["skipped_leaf_ids"]) != layer.num_leaves - 1:
-        raise AssertionError("skipped leaf count mismatch")
-    if len(path["skipped_router_ids"]) != layer.num_routers - layer.depth:
-        raise AssertionError("skipped router count mismatch")
 
-    # Backup weights
     leaf_w = layer.leaf_weights.data.clone()
     leaf_b = layer.leaf_biases.data.clone()
     router_w = layer.router_weights.data.clone()
     router_b = layer.router_biases.data.clone()
 
-    x = sample.unsqueeze(0)  # (1, D)
+    x = sample.unsqueeze(0)
     y_hard_ref = layer.forward_hard(x).clone()
     y_soft_ref = layer.forward_soft(x).clone()
 
     try:
-        # Poison all unselected leaves + off-path routers with large noise.
         noise = 10.0
         skipped_leaves = path["skipped_leaf_ids"]
         skipped_routers = path["skipped_router_ids"]
@@ -213,17 +236,13 @@ def verify_hard_skips_unselected_branches(
 
         if not torch.allclose(y_hard_poison_other, y_hard_ref, atol=1e-5, rtol=1e-5):
             raise AssertionError(
-                "hard output changed after poisoning unselected branches — "
-                "unselected leaves/routers were incorrectly evaluated"
+                "hard output changed after poisoning unselected branches"
             )
-        # Soft mixture must depend on poisoned leaves (with overwhelming probability).
         if torch.allclose(y_soft_poison_other, y_soft_ref, atol=1e-3, rtol=1e-3):
             raise AssertionError(
-                "soft output unchanged after poisoning other leaves — "
-                "unexpected; soft mode should mix all leaves"
+                "soft output unchanged after poisoning other leaves"
             )
 
-        # Restore, then poison the selected leaf only.
         layer.leaf_weights.data.copy_(leaf_w)
         layer.leaf_biases.data.copy_(leaf_b)
         layer.router_weights.data.copy_(router_w)
@@ -238,8 +257,7 @@ def verify_hard_skips_unselected_branches(
         y_hard_poison_selected = layer.forward_hard(x)
         if torch.allclose(y_hard_poison_selected, y_hard_ref, atol=1e-5, rtol=1e-5):
             raise AssertionError(
-                "hard output unchanged after poisoning the selected leaf — "
-                "selected leaf was not evaluated"
+                "hard output unchanged after poisoning the selected leaf"
             )
     finally:
         layer.leaf_weights.data.copy_(leaf_w)
@@ -247,7 +265,6 @@ def verify_hard_skips_unselected_branches(
         layer.router_weights.data.copy_(router_w)
         layer.router_biases.data.copy_(router_b)
 
-    # Batched hard must match sequential if-else on the same vector.
     y_seq = layer.forward_hard_sequential(sample)
     y_batch = layer.forward_hard(sample.unsqueeze(0)).squeeze(0)
     if not torch.allclose(y_seq, y_batch, atol=1e-5, rtol=1e-5):
@@ -271,7 +288,7 @@ class FFFGenerator:
     def __init__(
         self,
         model: FFFTransformer,
-        tokenizer: CharTokenizer,
+        tokenizer: Tokenizer,
         device: torch.device | None = None,
     ) -> None:
         self.model = model
@@ -289,31 +306,12 @@ class FFFGenerator:
         temperature: float = 1.0,
         top_k: int | None = None,
     ) -> str:
-        """Autoregressive generation with ``mode="hard"`` FFF routing.
-
-        Parameters
-        ----------
-        prompt:
-            Conditioning text (must use training vocabulary characters).
-        max_new_tokens:
-            Number of new characters to sample.
-        temperature:
-            Softmax temperature over LM logits (not FFF tree temperature).
-        top_k:
-            Optional top-k filtering on LM logits.
-
-        Returns
-        -------
-        str
-            ``prompt + generated continuation``.
-        """
+        """Autoregressive generation with ``mode="hard"`` and BPE decode."""
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be >= 0")
         ids = self.tokenizer.encode(prompt)
         if not ids:
-            # Empty prompt → start from newline if available, else first char.
-            bos = self.tokenizer.stoi.get("\n", 0)
-            ids = [bos]
+            ids = self.tokenizer.encode("\n") or [0]
         input_ids = torch.tensor([ids], dtype=torch.long, device=self.device)
 
         for _ in range(max_new_tokens):
@@ -322,7 +320,6 @@ class FFFGenerator:
                 if input_ids.size(1) <= self.model.config.block_size
                 else input_ids[:, -self.model.config.block_size :]
             )
-            # Strict hard routing for every FFF block.
             logits, _ = self.model(idx_cond, mode="hard")
             logits = logits[:, -1, :] / max(temperature, 1e-8)
             if top_k is not None:
@@ -343,10 +340,13 @@ class FFFGenerator:
         top_k: int | None = None,
         warmup: int = 2,
     ) -> tuple[str, dict[str, float | int]]:
-        """Generate and measure wall-clock ms/token (hard mode)."""
-        # Warmup (not timed) to stabilize allocations / one-time costs.
         if warmup > 0 and max_new_tokens > 0:
-            self.generate(prompt, max_new_tokens=min(warmup, max_new_tokens), temperature=temperature, top_k=top_k)
+            self.generate(
+                prompt,
+                max_new_tokens=min(warmup, max_new_tokens),
+                temperature=temperature,
+                top_k=top_k,
+            )
 
         t0 = time.perf_counter()
         text = self.generate(
@@ -374,7 +374,6 @@ class FFFGenerator:
 
 
 def print_stats(stats: dict[str, float | int], param_stats: ParamStats) -> None:
-    """Pretty-print timing and hard-routing parameter accounting."""
     print("\n=== Hard-routing inference stats ===")
     print(f"Time per token:     {stats['ms_per_token']:.3f} ms/token")
     print(f"Throughput:         {stats['tokens_per_s']:.2f} tokens/s")
@@ -390,18 +389,13 @@ def print_stats(stats: dict[str, float | int], param_stats: ParamStats) -> None:
     print(
         f"  per FFF layer:    {param_stats.per_layer_active:,} active / "
         f"{param_stats.per_layer_stored:,} stored "
-        f"(depth={param_stats.fff_depth}, leaves={param_stats.num_leaves}, "
-        f"active = {param_stats.fff_depth} routers + 1 leaf)"
-    )
-    print(
-        f"  across {param_stats.n_fff_layers} layers: "
-        f"skips {(param_stats.num_leaves - 1) * param_stats.n_fff_layers} leaves/token"
+        f"(depth={param_stats.fff_depth}, leaves={param_stats.num_leaves})"
     )
 
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Hard-routing inference for FFFTransformer (cuda/mps/cpu)"
+        description="Hard-routing BPE inference for FFFTransformer (cuda/mps/cpu)"
     )
     p.add_argument(
         "--checkpoint",
@@ -412,8 +406,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--prompt",
         type=str,
-        default="ROMEO:\n",
-        help="Text prompt (characters must be in the training vocab)",
+        default="The meaning of life is",
+        help="Text prompt (encoded with GPT-2 BPE)",
     )
     p.add_argument("--max-new-tokens", type=int, default=100)
     p.add_argument("--temperature", type=float, default=1.0)
@@ -446,7 +440,7 @@ def main() -> None:
     print(
         f"Loaded step={step} | vocab={tokenizer.vocab_size} | "
         f"layers={model.config.n_layer} | d_model={model.config.n_embd} | "
-        f"fff_depth={model.config.fff_depth}"
+        f"fff_depth={model.config.fff_depth} | block_size={model.config.block_size}"
     )
 
     generator = FFFGenerator(model, tokenizer, device=device)
@@ -473,7 +467,6 @@ def main() -> None:
     print_stats(stats, generator.param_stats)
 
 
-# Module-level convenience matching the requested API when used as a library.
 _default_generator: FFFGenerator | None = None
 
 

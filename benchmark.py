@@ -485,12 +485,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--n-tokens", type=int, default=200, help="Timed generation length")
     p.add_argument("--warmup", type=int, default=10, help="Warmup tokens before timing")
     p.add_argument("--prompt-len", type=int, default=32, help="Prompt length (batch=1)")
-    p.add_argument("--n-embd", type=int, default=256)
-    p.add_argument("--n-layer", type=int, default=4)
-    p.add_argument("--n-head", type=int, default=4)
-    p.add_argument("--fff-depth", type=int, default=4)
-    p.add_argument("--block-size", type=int, default=128)
-    p.add_argument("--vocab-size", type=int, default=65)
+    p.add_argument("--n-embd", type=int, default=512)
+    p.add_argument("--n-layer", type=int, default=8)
+    p.add_argument("--n-head", type=int, default=8)
+    p.add_argument("--fff-depth", type=int, default=6)
+    p.add_argument("--block-size", type=int, default=256)
+    p.add_argument("--vocab-size", type=int, default=50257)
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument(
         "--checkpoint",

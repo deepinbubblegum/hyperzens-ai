@@ -53,14 +53,14 @@ class FFFConfig:
         Share token embedding weights with the LM head (saves ``V·D`` params).
     """
 
-    vocab_size: int = 50304
-    n_layer: int = 6
-    n_head: int = 6
-    n_embd: int = 384
+    vocab_size: int = 50_257  # GPT-2 BPE (tiktoken ``gpt2``)
+    n_layer: int = 8
+    n_head: int = 8
+    n_embd: int = 512
     block_size: int = 256
     dropout: float = 0.0
     bias: bool = False
-    fff_depth: int = 4
+    fff_depth: int = 6  # 2^6 = 64 leaves per FFF block
     init_temp: float = 1.0
     rope_theta: float = 10_000.0
     tie_weights: bool = True
