@@ -1,11 +1,12 @@
 # Fast Feedforward Network (FFF) Language Model
 # Belcak & Wattenhofer — PyTorch 2.x stack
 #
-# Note: torchtext / torchdata are intentionally omitted — training uses a
-# native torch.utils.data.Dataset over data/tinyshakespeare.txt (char-level).
+# Tokenization: tiktoken (GPT-2 BPE). Corpora: HuggingFace `datasets` (WikiText).
 
 torch>=2.0.0
 tqdm>=4.66.0
 wandb>=0.16.0
 numpy>=1.24.0
 psutil>=5.9.0
+tiktoken>=0.7.0
+datasets>=2.18.0
