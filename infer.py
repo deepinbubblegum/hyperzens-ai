@@ -1,8 +1,11 @@
-"""CPU hard-routing inference for a trained FFFTransformer.
+"""Hard-routing inference for a trained FFFTransformer (cross-platform).
 
 Loads ``fff_checkpoint.pt``, generates text with ``mode="hard"``, reports
 ms/token and FFF active-vs-total parameter counts, and verifies that hard
 routing evaluates only the selected tree path (skips unselected branches).
+
+Device defaults to auto-detect (CUDA → MPS → CPU). Override with
+``--device cpu|cuda|mps``.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from device_utils import apply_hardware_optimizations, print_device_info, resolve_device
 from models.transformer import FFFConfig, FFFTransformer
 
 DEFAULT_CHECKPOINT = Path(__file__).resolve().parent / "fff_checkpoint.pt"
@@ -66,9 +70,9 @@ def load_checkpoint(
     checkpoint_path: Path,
     device: torch.device | None = None,
 ) -> tuple[FFFTransformer, CharTokenizer, dict[str, Any]]:
-    """Load model + tokenizer from ``fff_checkpoint.pt`` onto CPU by default."""
+    """Load model + tokenizer from ``fff_checkpoint.pt`` onto ``device``."""
     if device is None:
-        device = torch.device("cpu")
+        device = resolve_device("auto")
     if not checkpoint_path.exists():
         raise FileNotFoundError(
             f"Checkpoint not found: {checkpoint_path}. Train first with `python train.py`."
@@ -339,7 +343,7 @@ class FFFGenerator:
         top_k: int | None = None,
         warmup: int = 2,
     ) -> tuple[str, dict[str, float | int]]:
-        """Generate and measure wall-clock ms/token on CPU (hard mode)."""
+        """Generate and measure wall-clock ms/token (hard mode)."""
         # Warmup (not timed) to stabilize allocations / one-time costs.
         if warmup > 0 and max_new_tokens > 0:
             self.generate(prompt, max_new_tokens=min(warmup, max_new_tokens), temperature=temperature, top_k=top_k)
@@ -371,7 +375,7 @@ class FFFGenerator:
 
 def print_stats(stats: dict[str, float | int], param_stats: ParamStats) -> None:
     """Pretty-print timing and hard-routing parameter accounting."""
-    print("\n=== Hard-routing inference stats (CPU) ===")
+    print("\n=== Hard-routing inference stats ===")
     print(f"Time per token:     {stats['ms_per_token']:.3f} ms/token")
     print(f"Throughput:         {stats['tokens_per_s']:.2f} tokens/s")
     print(f"Generated tokens:   {stats['max_new_tokens']}")
@@ -396,7 +400,9 @@ def print_stats(stats: dict[str, float | int], param_stats: ParamStats) -> None:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Hard-routing CPU inference for FFFTransformer")
+    p = argparse.ArgumentParser(
+        description="Hard-routing inference for FFFTransformer (cuda/mps/cpu)"
+    )
     p.add_argument(
         "--checkpoint",
         type=str,
@@ -414,6 +420,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--top-k", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="auto (cuda>mps>cpu) | cuda | mps | cpu",
+    )
+    p.add_argument(
         "--skip-verify",
         action="store_true",
         help="Skip hard-routing branch-skip verification",
@@ -424,9 +436,11 @@ def build_argparser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argparser().parse_args()
     torch.manual_seed(args.seed)
-    device = torch.device("cpu")
+    device = resolve_device(args.device)
+    apply_hardware_optimizations(device)
+    print_device_info(device)
 
-    print(f"Loading checkpoint (CPU): {args.checkpoint}")
+    print(f"Loading checkpoint: {args.checkpoint}")
     model, tokenizer, ckpt = load_checkpoint(Path(args.checkpoint), device=device)
     step = ckpt.get("step", "?")
     print(
@@ -464,11 +478,12 @@ _default_generator: FFFGenerator | None = None
 
 
 def generate(prompt: str, max_new_tokens: int = 100) -> str:
-    """Generate with hard routing using the default ``fff_checkpoint.pt`` on CPU."""
+    """Generate with hard routing using the default checkpoint on auto device."""
     global _default_generator
     if _default_generator is None:
-        model, tokenizer, _ = load_checkpoint(DEFAULT_CHECKPOINT, device=torch.device("cpu"))
-        _default_generator = FFFGenerator(model, tokenizer)
+        device = resolve_device("auto")
+        model, tokenizer, _ = load_checkpoint(DEFAULT_CHECKPOINT, device=device)
+        _default_generator = FFFGenerator(model, tokenizer, device=device)
     return _default_generator.generate(prompt, max_new_tokens=max_new_tokens)
 
 

@@ -38,6 +38,15 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from models.transformer import FFFConfig, FFFTransformer
+from device_utils import (
+    amp_autocast,
+    apply_hardware_optimizations,
+    make_grad_scaler,
+    pin_memory_for,
+    print_device_info,
+    resolve_device,
+    to_device,
+)
 
 # ---------------------------------------------------------------------------
 # Data: TinyShakespeare (char-level)
@@ -186,28 +195,8 @@ def load_datasets(
 
 
 def select_device(requested: str = "auto") -> torch.device:
-    """Pick training device — prefer Apple MPS, then CUDA, else CPU.
-
-    Explicit request (``mps`` / ``cuda`` / ``cpu``) is honored when available.
-    """
-    req = (requested or "auto").lower()
-    if req == "auto":
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        return torch.device("cpu")
-    if req == "mps":
-        if not torch.backends.mps.is_available():
-            raise RuntimeError("MPS requested but torch.backends.mps.is_available() is False")
-        return torch.device("mps")
-    if req == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA requested but not available")
-        return torch.device("cuda")
-    if req == "cpu":
-        return torch.device("cpu")
-    raise ValueError(f"Unknown device {requested!r}; use auto|mps|cuda|cpu")
+    """Compatibility wrapper around :func:`device_utils.resolve_device`."""
+    return resolve_device(requested)
 
 
 def maybe_compile(model: FFFTransformer, enabled: bool, device: torch.device) -> FFFTransformer:
@@ -320,10 +309,11 @@ def evaluate(
     for i, (x, y) in enumerate(loader):
         if i >= max_batches:
             break
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        logits, balance_loss = model(x, mode=mode)
-        ce = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        x = to_device(x, device)
+        y = to_device(y, device)
+        with amp_autocast(device):
+            logits, balance_loss = model(x, mode=mode)
+            ce = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
         preds = logits.argmax(dim=-1)
         total_correct += int((preds == y).sum().item())
         total_tokens += y.numel()
@@ -448,7 +438,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--device",
         type=str,
         default="auto",
-        help="auto (prefer mps) | mps | cuda | cpu",
+        help="auto (prefer cuda > mps > cpu) | cuda | mps | cpu",
     )
     p.add_argument("--num-workers", type=int, default=defaults.num_workers)
     p.add_argument(
@@ -515,18 +505,18 @@ def main() -> None:
 
     torch.manual_seed(cfg.seed)
 
-    # Apple Silicon: prefer Metal Performance Shaders (MPS).
-    device = select_device(cfg.device)
-    # User-facing confirmation (exact MPS / CPU / CUDA).
-    print(f"Selected device: {device}", flush=True)
-    if device.type == "mps":
-        print("MPS (Metal Performance Shaders) acceleration enabled", flush=True)
+    device = resolve_device(cfg.device)
+    apply_hardware_optimizations(device)
+    print_device_info(device)
+    if device.type == "cuda":
+        print("Automatic Mixed Precision (AMP) + GradScaler enabled", flush=True)
+    elif device.type == "mps":
+        print("MPS AMP autocast enabled when supported by this PyTorch build", flush=True)
 
     data_dir = Path(cfg.data_dir)
     tokenizer, train_ds, val_ds = load_datasets(data_dir, cfg.block_size)
 
-    # pin_memory helps host→device copies on CUDA; on MPS it is harmless / no-op.
-    pin_memory = device.type in {"cuda", "mps"}
+    pin_memory = pin_memory_for(device)
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
@@ -562,6 +552,8 @@ def main() -> None:
         weight_decay=cfg.weight_decay,
         betas=(0.9, 0.95),
     )
+    # AMP GradScaler — enabled on CUDA; disabled (passthrough) on MPS/CPU.
+    scaler = make_grad_scaler(device)
 
     full_steps_per_epoch = len(train_loader)
     epoch_step_cap = cfg.steps_per_epoch or full_steps_per_epoch
@@ -631,25 +623,28 @@ def main() -> None:
             )
             last_tau, last_lam = tau, lam
 
-            input_ids = input_ids.to(device, non_blocking=pin_memory)
-            targets = targets.to(device, non_blocking=pin_memory)
+            input_ids = to_device(input_ids, device, non_blocking=pin_memory)
+            targets = to_device(targets, device, non_blocking=pin_memory)
 
             optimizer.zero_grad(set_to_none=True)
-            total_loss, ce_loss, bal_loss = compute_batch_loss(
-                model,
-                input_ids,
-                targets,
-                lambda_balance=lam,
-                mode="soft",
-            )
-            total_loss.backward()
+            with amp_autocast(device):
+                total_loss, ce_loss, bal_loss = compute_batch_loss(
+                    model,
+                    input_ids,
+                    targets,
+                    lambda_balance=lam,
+                    mode="soft",
+                )
+            scaler.scale(total_loss).backward()
 
-            # Diagnostics need grads — capture before next zero_grad.
-            last_diag = unwrap_model(model).get_routing_diagnostics()
+            # Diagnostics need grads — capture before optimizer clears them.
+            last_diag = unwrap_model(model).get_routing_diagnostics()  # type: ignore[union-attr]
 
             if cfg.grad_clip > 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             global_step += 1
             epoch_steps += 1

@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""CPU inference benchmark: StandardTransformer (dense MLP) vs FFFTransformer (hard).
+"""Cross-platform inference benchmark: StandardTransformer vs FFFTransformer (hard).
 
 Execution
 ---------
-    # Default: compare both models for N=200 tokens on CPU (1-thread + multi-thread)
+    # Auto GPU (if available) + CPU side-by-side
     python benchmark.py
+
+    # Force devices
+    python benchmark.py --device auto          # GPU (or CPU) then always also CPU
+    python benchmark.py --device cuda --skip-cpu
+    python benchmark.py --device cpu
 
     # Faster smoke / custom size
     python benchmark.py --n-tokens 50 --warmup 5 --n-embd 256 --n-layer 4
 
-    # Match a trained checkpoint's config (weights optional; architecture is what matters)
+    # Match a trained checkpoint's config
     python benchmark.py --checkpoint fff_checkpoint.pt
 
 Notes
 -----
-* Forced ``torch.device("cpu")``.
-* Measures single-thread (``torch.set_num_threads(1)``) and multi-thread
-  (``torch.set_num_threads(os.cpu_count())``).
+* Compares Dense MLP vs FFF hard routing.
+* By default benchmarks the auto-detected accelerator **and** CPU for a
+  side-by-side report (skip CPU with ``--skip-cpu``).
 * Peak RAM via ``psutil`` when available, else ``tracemalloc`` fallback.
 """
 
@@ -36,6 +41,12 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from device_utils import (
+    apply_hardware_optimizations,
+    device_label,
+    print_device_info,
+    resolve_device,
+)
 from models.transformer import FFFConfig, FFFTransformer, StandardTransformer
 
 # ---------------------------------------------------------------------------
@@ -151,34 +162,6 @@ def param_report_fff(model: FFFTransformer) -> ModelParamReport:
 # ---------------------------------------------------------------------------
 
 
-@torch.no_grad()
-def generate_timed(
-    forward_step: Callable[[Tensor], Tensor],
-    input_ids: Tensor,
-    max_new_tokens: int,
-    block_size: int,
-    temperature: float = 1.0,
-) -> tuple[Tensor, float]:
-    """Autoregressive loop with a custom logits step; returns ``(ids, elapsed_s)``.
-
-    ``forward_step(idx_cond) -> logits (B, T, V)``.
-    """
-    t0 = time.perf_counter()
-    for _ in range(max_new_tokens):
-        idx_cond = (
-            input_ids
-            if input_ids.size(1) <= block_size
-            else input_ids[:, -block_size:]
-        )
-        logits = forward_step(idx_cond)
-        logits = logits[:, -1, :] / max(temperature, 1e-8)
-        # Greedy argmax — deterministic, avoids multinomial RNG overhead variance.
-        next_id = torch.argmax(logits, dim=-1, keepdim=True)
-        input_ids = torch.cat((input_ids, next_id), dim=1)
-    elapsed = time.perf_counter() - t0
-    return input_ids, elapsed
-
-
 def make_fff_step(model: FFFTransformer) -> Callable[[Tensor], Tensor]:
     def step(idx: Tensor) -> Tensor:
         logits, _ = model(idx, mode="hard")
@@ -219,9 +202,43 @@ class ModelBenchResult:
     multi: SpeedResult
 
 
-def _sync_cpu() -> None:
-    """CPU path has no device sync; keep hook for API symmetry."""
-    return
+def _sync_device(device: torch.device) -> None:
+    """Flush pending device work before timing boundaries."""
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
+@torch.no_grad()
+def generate_timed(
+    forward_step: Callable[[Tensor], Tensor],
+    input_ids: Tensor,
+    max_new_tokens: int,
+    block_size: int,
+    temperature: float = 1.0,
+) -> tuple[Tensor, float]:
+    """Autoregressive loop with a custom logits step; returns ``(ids, elapsed_s)``.
+
+    ``forward_step(idx_cond) -> logits (B, T, V)``.
+    """
+    device = input_ids.device
+    _sync_device(device)
+    t0 = time.perf_counter()
+    for _ in range(max_new_tokens):
+        idx_cond = (
+            input_ids
+            if input_ids.size(1) <= block_size
+            else input_ids[:, -block_size:]
+        )
+        logits = forward_step(idx_cond)
+        logits = logits[:, -1, :] / max(temperature, 1e-8)
+        # Greedy argmax — deterministic, avoids multinomial RNG overhead variance.
+        next_id = torch.argmax(logits, dim=-1, keepdim=True)
+        input_ids = torch.cat((input_ids, next_id), dim=1)
+    _sync_device(device)
+    elapsed = time.perf_counter() - t0
+    return input_ids, elapsed
 
 
 def benchmark_speed(
@@ -246,12 +263,12 @@ def benchmark_speed(
         generate_timed(
             forward_step, model_device_prompt.clone(), warmup, block_size
         )
-        _sync_cpu()
+        _sync_device(prompt.device)
 
     _ids, elapsed = generate_timed(
         forward_step, model_device_prompt.clone(), n_tokens, block_size
     )
-    _sync_cpu()
+    _sync_device(prompt.device)
     ms = (elapsed * 1000.0) / max(n_tokens, 1)
     tps = n_tokens / max(elapsed, 1e-12)
     return SpeedResult(
@@ -482,21 +499,162 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Optional fff_checkpoint.pt to copy architecture (+ load FFF weights)",
     )
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Primary device: auto|cuda|mps|cpu (default auto)",
+    )
+    p.add_argument(
+        "--skip-cpu",
+        action="store_true",
+        help="Do not also run a CPU baseline when primary device is a GPU",
+    )
     return p
+
+
+def run_pair_on_device(
+    device: torch.device,
+    config: FFFConfig,
+    ckpt_path: Path | None,
+    prompt_cpu: Tensor,
+    n_tokens: int,
+    warmup: int,
+    cpu_count: int,
+) -> tuple[ModelBenchResult, ModelBenchResult]:
+    """Benchmark Dense vs FFF hard routing on a single device."""
+    apply_hardware_optimizations(device)
+    print("\n" + "-" * 72)
+    print(f"Device run: {device} — {device_label(device)}")
+    print("-" * 72)
+
+    prompt = prompt_cpu.to(device)
+
+    print("\n[1/2] Benchmarking StandardTransformer (dense MLP)...")
+
+    def dense_factory() -> StandardTransformer:
+        m = StandardTransformer(config).to(device)
+        m.eval()
+        return m
+
+    dense_model, dense_step, dense_mem = measure_memory_and_load(
+        dense_factory,
+        make_dense_step,
+        prompt,
+        config.block_size,
+        gen_tokens=min(32, n_tokens),
+    )
+    dense_param = param_report_standard(dense_model)
+
+    dense_single = benchmark_speed(
+        dense_step, prompt, config.block_size, n_tokens, warmup, num_threads=1
+    )
+    dense_multi = benchmark_speed(
+        dense_step,
+        prompt,
+        config.block_size,
+        n_tokens,
+        warmup,
+        num_threads=cpu_count,
+    )
+
+    dense_result = ModelBenchResult(
+        param=dense_param, memory=dense_mem, single=dense_single, multi=dense_multi
+    )
+    print(
+        f"  params={dense_param.total_params:,} | "
+        f"speed={dense_multi.tokens_per_s:.2f} tok/s | "
+        f"latency={dense_multi.ms_per_token:.3f} ms | "
+        f"peak_RAM={dense_mem.peak_generate_mb:.1f} MB"
+    )
+
+    del dense_model
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    print("\n[2/2] Benchmarking FFFTransformer (mode=hard)...")
+
+    def fff_factory() -> FFFTransformer:
+        m = FFFTransformer(config).to(device)
+        if ckpt_path is not None:
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            m.load_state_dict(ckpt["model_state_dict"])
+        m.eval()
+        return m
+
+    fff_model, fff_step, fff_mem = measure_memory_and_load(
+        fff_factory,
+        make_fff_step,
+        prompt,
+        config.block_size,
+        gen_tokens=min(32, n_tokens),
+    )
+    fff_param = param_report_fff(fff_model)
+    fff_single = benchmark_speed(
+        fff_step, prompt, config.block_size, n_tokens, warmup, num_threads=1
+    )
+    fff_multi = benchmark_speed(
+        fff_step,
+        prompt,
+        config.block_size,
+        n_tokens,
+        warmup,
+        num_threads=cpu_count,
+    )
+    fff_result = ModelBenchResult(
+        param=fff_param, memory=fff_mem, single=fff_single, multi=fff_multi
+    )
+    print(
+        f"  params={fff_param.total_params:,} | "
+        f"active/token={fff_param.active_params_per_token:,} "
+        f"({fff_param.active_pct:.1f}%) | "
+        f"speed={fff_multi.tokens_per_s:.2f} tok/s | "
+        f"latency={fff_multi.ms_per_token:.3f} ms | "
+        f"peak_RAM={fff_mem.peak_generate_mb:.1f} MB"
+    )
+
+    print(f"\n=== Dense vs FFF on {device.type.upper()} ===")
+    print_comparison_table(dense_result, fff_result)
+
+    del fff_model
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return dense_result, fff_result
+
+
+def print_gpu_vs_cpu_summary(
+    gpu_device: torch.device,
+    gpu_fff: ModelBenchResult,
+    cpu_fff: ModelBenchResult,
+) -> None:
+    """Side-by-side FFF hard-routing throughput: accelerator vs CPU."""
+    gpu_tps = gpu_fff.multi.tokens_per_s
+    cpu_tps = cpu_fff.multi.tokens_per_s
+    speedup = gpu_tps / max(cpu_tps, 1e-12)
+    print("\n" + "=" * 72)
+    print("FFF Hard Routing — Accelerator vs CPU")
+    print("=" * 72)
+    print(f"  {device_label(gpu_device):<40} {gpu_tps:8.2f} tok/s")
+    print(f"  {'CPU Fallback':<40} {cpu_tps:8.2f} tok/s")
+    print(f"  GPU/Accelerator speedup vs CPU:        {speedup:.2f}x")
+    print("=" * 72)
 
 
 def main() -> None:
     args = build_argparser().parse_args()
-
-    # Force CPU
-    device = torch.device("cpu")
     torch.set_grad_enabled(False)
 
+    primary = resolve_device(args.device)
     cpu_count = os.cpu_count() or 1
+
     print("=" * 72)
-    print("FFF vs Dense MLP — CPU Inference Benchmark")
+    print("FFF vs Dense MLP — Cross-Platform Inference Benchmark")
     print("=" * 72)
-    print(f"device=cpu | logical_cpus={cpu_count} | psutil={'yes' if _HAS_PSUTIL else 'NO (tracemalloc fallback)'}")
+    print_device_info(primary)
+    print(f"logical_cpus={cpu_count} | psutil={'yes' if _HAS_PSUTIL else 'NO (tracemalloc fallback)'}")
     if not _HAS_PSUTIL:
         print(
             "WARNING: install psutil for accurate RSS peak memory "
@@ -537,96 +695,34 @@ def main() -> None:
     )
 
     torch.manual_seed(args.seed)
-    prompt = torch.randint(
-        0, config.vocab_size, (1, args.prompt_len), dtype=torch.long, device=device
+    prompt_cpu = torch.randint(
+        0, config.vocab_size, (1, args.prompt_len), dtype=torch.long
     )
 
-    # ----- Dense baseline -----
-    print("\n[1/2] Benchmarking StandardTransformer (dense MLP)...")
-
-    def dense_factory() -> StandardTransformer:
-        m = StandardTransformer(config).to(device)
-        m.eval()
-        return m
-
-    dense_model, dense_step, dense_mem = measure_memory_and_load(
-        dense_factory,
-        make_dense_step,
-        prompt,
-        config.block_size,
-        gen_tokens=min(32, args.n_tokens),
-    )
-    dense_param = param_report_standard(dense_model)
-    dense_single = benchmark_speed(
-        dense_step, prompt, config.block_size, args.n_tokens, args.warmup, num_threads=1
-    )
-    dense_multi = benchmark_speed(
-        dense_step,
-        prompt,
-        config.block_size,
+    # Primary device (auto GPU or forced)
+    _dense_p, fff_primary = run_pair_on_device(
+        primary,
+        config,
+        ckpt_path,
+        prompt_cpu,
         args.n_tokens,
         args.warmup,
-        num_threads=cpu_count,
-    )
-    dense_result = ModelBenchResult(
-        param=dense_param, memory=dense_mem, single=dense_single, multi=dense_multi
-    )
-    print(
-        f"  params={dense_param.total_params:,} | "
-        f"1-thr={dense_single.tokens_per_s:.2f} tok/s | "
-        f"{cpu_count}-thr={dense_multi.tokens_per_s:.2f} tok/s | "
-        f"peak_RAM={dense_mem.peak_generate_mb:.1f} MB"
+        cpu_count,
     )
 
-    # Free dense before FFF load for cleaner RSS attribution on the next stage.
-    del dense_model
-    gc.collect()
+    # Side-by-side CPU when primary is an accelerator
+    if primary.type != "cpu" and not args.skip_cpu:
+        _dense_c, fff_cpu = run_pair_on_device(
+            torch.device("cpu"),
+            config,
+            ckpt_path,
+            prompt_cpu,
+            args.n_tokens,
+            args.warmup,
+            cpu_count,
+        )
+        print_gpu_vs_cpu_summary(primary, fff_primary, fff_cpu)
 
-    # ----- FFF hard -----
-    print("\n[2/2] Benchmarking FFFTransformer (mode=hard)...")
-
-    def fff_factory() -> FFFTransformer:
-        m = FFFTransformer(config).to(device)
-        if ckpt_path is not None:
-            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-            m.load_state_dict(ckpt["model_state_dict"])
-        m.eval()
-        return m
-
-    fff_model, fff_step, fff_mem = measure_memory_and_load(
-        fff_factory,
-        make_fff_step,
-        prompt,
-        config.block_size,
-        gen_tokens=min(32, args.n_tokens),
-    )
-    fff_param = param_report_fff(fff_model)
-    fff_single = benchmark_speed(
-        fff_step, prompt, config.block_size, args.n_tokens, args.warmup, num_threads=1
-    )
-    fff_multi = benchmark_speed(
-        fff_step,
-        prompt,
-        config.block_size,
-        args.n_tokens,
-        args.warmup,
-        num_threads=cpu_count,
-    )
-    fff_result = ModelBenchResult(
-        param=fff_param, memory=fff_mem, single=fff_single, multi=fff_multi
-    )
-    print(
-        f"  params={fff_param.total_params:,} | "
-        f"active/token={fff_param.active_params_per_token:,} "
-        f"({fff_param.active_pct:.1f}%) | "
-        f"1-thr={fff_single.tokens_per_s:.2f} tok/s | "
-        f"{cpu_count}-thr={fff_multi.tokens_per_s:.2f} tok/s | "
-        f"peak_RAM={fff_mem.peak_generate_mb:.1f} MB"
-    )
-
-    print_comparison_table(dense_result, fff_result)
-
-    # Restore a reasonable default thread count for the process.
     torch.set_num_threads(cpu_count)
 
 
