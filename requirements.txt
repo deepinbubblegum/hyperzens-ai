@@ -1,9 +1,10 @@
 # Fast Feedforward Network (FFF) Language Model
 # Belcak & Wattenhofer — PyTorch 2.x stack
+#
+# Note: torchtext / torchdata are intentionally omitted — training uses a
+# native torch.utils.data.Dataset over data/tinyshakespeare.txt (char-level).
 
 torch>=2.0.0
-torchtext>=0.15.0
-torchdata>=0.7.0
 tqdm>=4.66.0
 wandb>=0.16.0
 numpy>=1.24.0

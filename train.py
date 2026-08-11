@@ -107,12 +107,15 @@ class CharTokenizer:
         return "".join(self.itos[i] for i in ids)
 
 
-class CharLMDataset(Dataset):
-    """Sliding windows of ``block_size`` tokens → next-token LM pairs.
+class CharDataset(Dataset):
+    """Character-level causal LM dataset over integer token ids.
 
-    Each item:
-        ``x``: ``(T,)`` input ids
-        ``y``: ``(T,)`` targets (x shifted by 1 in the underlying stream)
+    Loads sliding windows from a 1-D id stream (typically encoded
+    ``data/tinyshakespeare.txt``).
+
+    Each item returns standard next-token pairs:
+        ``x``: ``(T,)`` LongTensor — input character ids
+        ``y``: ``(T,)`` LongTensor — targets (``x`` shifted by +1 in the corpus)
     """
 
     def __init__(self, token_ids: Tensor, block_size: int) -> None:
@@ -136,6 +139,10 @@ class CharLMDataset(Dataset):
         return x, y
 
 
+# Backwards-compatible alias
+CharLMDataset = CharDataset
+
+
 def download_tinyshakespeare(data_dir: Path) -> Path:
     """Download TinyShakespeare into ``data_dir`` if missing; return path."""
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -151,8 +158,12 @@ def load_datasets(
     data_dir: Path,
     block_size: int,
     split_ratio: float = 0.9,
-) -> tuple[CharTokenizer, CharLMDataset, CharLMDataset]:
-    """Build char tokenizer + train/val datasets (90/10 chronological split)."""
+) -> tuple[CharTokenizer, CharDataset, CharDataset]:
+    """Build char tokenizer + train/val ``CharDataset`` (90/10 chronological split).
+
+    Tokenization is purely native: characters ↔ integer ids via
+    :class:`CharTokenizer` (no torchtext).
+    """
     path = download_tinyshakespeare(data_dir)
     text = path.read_text(encoding="utf-8")
     tokenizer = CharTokenizer(text)
@@ -162,8 +173,8 @@ def load_datasets(
     n_train = int(n * split_ratio)
     train_ids = ids[:n_train]
     val_ids = ids[n_train:]
-    train_ds = CharLMDataset(train_ids, block_size)
-    val_ds = CharLMDataset(val_ids, block_size)
+    train_ds = CharDataset(train_ids, block_size)
+    val_ds = CharDataset(val_ids, block_size)
     return tokenizer, train_ds, val_ds
 
 
