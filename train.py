@@ -8,9 +8,11 @@ with dynamic ``λ`` and FFF temperature annealing ``τ: 1.0 → 0.02``.
 Optimisation
 ------------
 * AdamW + **LR warmup + cosine decay** (``lr → min_lr``)
-* **Gradient accumulation** (default 4) for larger effective batch on ~12GB VRAM
+* Larger micro-batches (``batch_size=32``) + light grad accum on ~12GB VRAM
 * Mixed precision via ``device_utils.amp_autocast`` / ``GradScaler`` (CUDA)
+* ``torch.compile`` on CUDA; DataLoader workers + ``pin_memory`` + ``persistent_workers``
 * Cross-platform device: CUDA → MPS → CPU
+* Caps: ``max_epochs=5``, ``max_steps=3000`` (keeps full runs in tens of minutes)
 """
 
 from __future__ import annotations
@@ -67,15 +69,15 @@ class TrainConfig:
     # Data
     wiki_variant: str = "wikitext-2"  # or wikitext-103
 
-    # Optimisation (12GB-friendly micro-batch + accumulation)
-    batch_size: int = 8
-    grad_accum_steps: int = 4  # effective batch = batch_size * grad_accum_steps
+    # Optimisation (RTX 3060 12GB-friendly defaults)
+    batch_size: int = 32
+    grad_accum_steps: int = 2  # effective batch = batch_size * grad_accum_steps
     lr: float = 3e-4
     min_lr: float = 3e-5
     weight_decay: float = 0.1
-    max_epochs: int = 3
+    max_epochs: int = 5
     grad_clip: float = 1.0
-    compile_model: bool = False  # safer default for large FFF + AMP
+    compile_model: bool = True  # torch.compile on CUDA only
     lr_warmup_frac: float = 0.05  # fraction of optimizer steps for LR warmup
 
     # FFF routing schedule
@@ -90,13 +92,13 @@ class TrainConfig:
     eval_batches: int = 20
     seed: int = 42
     device: str = "auto"
-    num_workers: int = 0
+    num_workers: int = 4
     checkpoint_path: str = CHECKPOINT_NAME
     wandb: bool = False
     wandb_project: str = "fff-transformer"
     data_dir: str = str(DATA_DIR)
     steps_per_epoch: int | None = None
-    max_steps: int | None = None
+    max_steps: int | None = 3000  # hard cap so training finishes in a reasonable time
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +173,11 @@ def set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
 
 
 def maybe_compile(model: FFFTransformer, enabled: bool, device: torch.device) -> FFFTransformer:
+    """Compile with ``torch.compile`` on CUDA when requested."""
     if not enabled:
+        return model
+    if device.type != "cuda":
+        print(f"torch.compile skipped (device={device.type}; CUDA only)")
         return model
     if not hasattr(torch, "compile"):
         print("torch.compile unavailable — skipping")
@@ -183,6 +189,32 @@ def maybe_compile(model: FFFTransformer, enabled: bool, device: torch.device) ->
     except Exception as exc:  # pragma: no cover
         print(f"torch.compile skipped ({exc})")
         return model
+
+
+def make_dataloader(
+    dataset: BPEDataset,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    pin_memory: bool,
+    drop_last: bool,
+    device: torch.device,
+) -> DataLoader:
+    """Build a DataLoader with CUDA-friendly worker / pin_memory settings."""
+    kwargs: dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "drop_last": drop_last,
+        "pin_memory": pin_memory,
+    }
+    # persistent_workers requires num_workers > 0; enable on CUDA for throughput.
+    if num_workers > 0 and device.type == "cuda":
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 2
+    return DataLoader(**kwargs)
 
 
 def unwrap_model(model: nn.Module) -> nn.Module:
@@ -380,7 +412,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--wandb-project", type=str, default=d.wandb_project)
     p.add_argument("--data-dir", type=str, default=d.data_dir)
     p.add_argument("--steps-per-epoch", type=int, default=None)
-    p.add_argument("--max-steps", type=int, default=None, help="Cap on optimizer steps")
+    p.add_argument(
+        "--max-steps",
+        type=int,
+        default=d.max_steps,
+        help="Cap on optimizer steps (default 3000; use 0 for no cap)",
+    )
     return p
 
 
@@ -417,7 +454,7 @@ def train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         wandb_project=args.wandb_project,
         data_dir=args.data_dir,
         steps_per_epoch=args.steps_per_epoch,
-        max_steps=args.max_steps,
+        max_steps=None if args.max_steps == 0 else args.max_steps,
     )
 
 
@@ -440,22 +477,24 @@ def main() -> None:
     assert int(meta["vocab_size"]) == cfg.vocab_size == GPT2_VOCAB_SIZE
     _ = get_gpt2_encoding()  # ensure tiktoken is importable early
 
-    pin_memory = pin_memory_for(device)
-    train_loader = DataLoader(
+    pin_memory = bool(pin_memory_for(device) or device.type == "cuda")
+    train_loader = make_dataloader(
         train_ds,
         batch_size=cfg.batch_size,
         shuffle=True,
         num_workers=cfg.num_workers,
-        drop_last=True,
         pin_memory=pin_memory,
+        drop_last=True,
+        device=device,
     )
-    val_loader = DataLoader(
+    val_loader = make_dataloader(
         val_ds,
         batch_size=cfg.batch_size,
         shuffle=False,
         num_workers=cfg.num_workers,
-        drop_last=False,
         pin_memory=pin_memory,
+        drop_last=False,
+        device=device,
     )
 
     model_cfg = FFFConfig(
@@ -497,7 +536,8 @@ def main() -> None:
         f"D={cfg.n_embd} L={cfg.n_layer} H={cfg.n_head} fff_depth={cfg.fff_depth} | "
         f"batch={cfg.batch_size}×accum={cfg.grad_accum_steps} "
         f"(eff={cfg.batch_size * cfg.grad_accum_steps}) | "
-        f"train_windows={len(train_ds):,} | opt_steps={total_opt_steps} | "
+        f"train_chunks={len(train_ds):,} (stride={train_ds.stride}) | "
+        f"opt_steps={total_opt_steps} | "
         f"τ={cfg.init_temp}→{cfg.min_temp} | lr={cfg.lr}→{cfg.min_lr}"
     )
 
