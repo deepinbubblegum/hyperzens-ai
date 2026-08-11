@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
@@ -61,12 +62,13 @@ class TrainConfig:
     block_size: int = 128
     dropout: float = 0.1
 
-    # Optimisation
-    batch_size: int = 32
+    # Optimisation (tuned for Apple Silicon M4 / 16GB — larger batches feed MPS)
+    batch_size: int = 64
     lr: float = 3e-4
     weight_decay: float = 0.1
     max_epochs: int = 5
     grad_clip: float = 1.0
+    compile_model: bool = True
 
     # FFF extras
     init_temp: float = 1.0
@@ -79,7 +81,7 @@ class TrainConfig:
     eval_interval: int = 200  # optimizer steps between val runs
     eval_batches: int = 20
     seed: int = 42
-    device: str = "cpu"
+    device: str = "auto"  # auto → mps > cuda > cpu
     num_workers: int = 0
     checkpoint_path: str = CHECKPOINT_NAME
     wandb: bool = False
@@ -183,6 +185,53 @@ def load_datasets(
 # ---------------------------------------------------------------------------
 
 
+def select_device(requested: str = "auto") -> torch.device:
+    """Pick training device — prefer Apple MPS, then CUDA, else CPU.
+
+    Explicit request (``mps`` / ``cuda`` / ``cpu``) is honored when available.
+    """
+    req = (requested or "auto").lower()
+    if req == "auto":
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+    if req == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError("MPS requested but torch.backends.mps.is_available() is False")
+        return torch.device("mps")
+    if req == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but not available")
+        return torch.device("cuda")
+    if req == "cpu":
+        return torch.device("cpu")
+    raise ValueError(f"Unknown device {requested!r}; use auto|mps|cuda|cpu")
+
+
+def maybe_compile(model: FFFTransformer, enabled: bool, device: torch.device) -> FFFTransformer:
+    """Wrap with ``torch.compile`` when enabled and backend-compatible."""
+    if not enabled:
+        return model
+    if not hasattr(torch, "compile"):
+        print("torch.compile unavailable on this PyTorch build — skipping")
+        return model
+    try:
+        # MPS compile support varies by PyTorch version; fall back cleanly.
+        compiled = torch.compile(model, mode="default")  # type: ignore[assignment]
+        print(f"torch.compile enabled (device={device.type})")
+        return compiled  # type: ignore[return-value]
+    except Exception as exc:  # pragma: no cover
+        print(f"torch.compile skipped ({exc})")
+        return model
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """Return the underlying module when wrapped by ``torch.compile``."""
+    return getattr(model, "_orig_mod", model)
+
+
 def annealed_temperature(
     step: int,
     total_steps: int,
@@ -271,8 +320,8 @@ def evaluate(
     for i, (x, y) in enumerate(loader):
         if i >= max_batches:
             break
-        x = x.to(device)
-        y = y.to(device)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
         logits, balance_loss = model(x, mode=mode)
         ce = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
         preds = logits.argmax(dim=-1)
@@ -345,10 +394,11 @@ def save_checkpoint(
     extras: dict[str, Any] | None = None,
 ) -> None:
     """Persist model + optimizer + tokenizer metadata for ``infer.py``."""
+    core = unwrap_model(model)
     payload: dict[str, Any] = {
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": core.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "model_config": asdict(model.config),
+        "model_config": asdict(core.config),  # type: ignore[union-attr]
         "train_config": asdict(train_cfg),
         "tokenizer": {
             "chars": tokenizer.chars,
@@ -397,9 +447,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
+        default="auto",
+        help="auto (prefer mps) | mps | cuda | cpu",
     )
     p.add_argument("--num-workers", type=int, default=defaults.num_workers)
+    p.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.compile_model,
+        help="Enable torch.compile when supported (default: on)",
+    )
     p.add_argument("--checkpoint-path", type=str, default=defaults.checkpoint_path)
     p.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
     p.add_argument("--wandb-project", type=str, default=defaults.wandb_project)
@@ -442,6 +499,7 @@ def train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         seed=args.seed,
         device=args.device,
         num_workers=args.num_workers,
+        compile_model=args.compile,
         checkpoint_path=args.checkpoint_path,
         wandb=args.wandb,
         wandb_project=args.wandb_project,
@@ -456,16 +514,26 @@ def main() -> None:
     max_steps_cap: int | None = args.max_steps
 
     torch.manual_seed(cfg.seed)
-    device = torch.device(cfg.device)
+
+    # Apple Silicon: prefer Metal Performance Shaders (MPS).
+    device = select_device(cfg.device)
+    # User-facing confirmation (exact MPS / CPU / CUDA).
+    print(f"Selected device: {device}", flush=True)
+    if device.type == "mps":
+        print("MPS (Metal Performance Shaders) acceleration enabled", flush=True)
 
     data_dir = Path(cfg.data_dir)
     tokenizer, train_ds, val_ds = load_datasets(data_dir, cfg.block_size)
+
+    # pin_memory helps host→device copies on CUDA; on MPS it is harmless / no-op.
+    pin_memory = device.type in {"cuda", "mps"}
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
         shuffle=True,
         num_workers=cfg.num_workers,
         drop_last=True,
+        pin_memory=pin_memory,
     )
     val_loader = DataLoader(
         val_ds,
@@ -473,6 +541,7 @@ def main() -> None:
         shuffle=False,
         num_workers=cfg.num_workers,
         drop_last=False,
+        pin_memory=pin_memory,
     )
 
     model_cfg = FFFConfig(
@@ -486,6 +555,7 @@ def main() -> None:
         init_temp=cfg.init_temp,
     )
     model = FFFTransformer(model_cfg).to(device)
+    model = maybe_compile(model, enabled=cfg.compile_model, device=device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.lr,
@@ -501,9 +571,12 @@ def main() -> None:
         total_steps = min(total_steps, max_steps_cap)
 
     warmup_steps = int(total_steps * cfg.warmup_frac)
+    # get_num_params may fail on compiled modules — unwrap if needed.
+    raw_model = getattr(model, "_orig_mod", model)
     print(
         f"Device={device} | vocab={tokenizer.vocab_size} | "
-        f"params={model.get_num_params():,} | "
+        f"params={raw_model.get_num_params():,} | "
+        f"batch_size={cfg.batch_size} | fff_depth={cfg.fff_depth} | "
         f"train_windows={len(train_ds):,} | val_windows={len(val_ds):,} | "
         f"steps/epoch={epoch_step_cap} | total_steps={total_steps} | "
         f"temp_warmup_steps={warmup_steps} | "
@@ -548,7 +621,8 @@ def main() -> None:
                 cfg.min_temp,
                 warmup_frac=cfg.warmup_frac,
             )
-            model.set_temperature(tau)
+            model_set = unwrap_model(model)
+            model_set.set_temperature(tau)  # type: ignore[union-attr]
             lam = dynamic_lambda_balance(
                 global_step,
                 total_steps,
@@ -557,8 +631,8 @@ def main() -> None:
             )
             last_tau, last_lam = tau, lam
 
-            input_ids = input_ids.to(device)
-            targets = targets.to(device)
+            input_ids = input_ids.to(device, non_blocking=pin_memory)
+            targets = targets.to(device, non_blocking=pin_memory)
 
             optimizer.zero_grad(set_to_none=True)
             total_loss, ce_loss, bal_loss = compute_batch_loss(
@@ -571,7 +645,7 @@ def main() -> None:
             total_loss.backward()
 
             # Diagnostics need grads — capture before next zero_grad.
-            last_diag = model.get_routing_diagnostics()
+            last_diag = unwrap_model(model).get_routing_diagnostics()
 
             if cfg.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)

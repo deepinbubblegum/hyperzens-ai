@@ -95,6 +95,17 @@ class FastFeedforwardLinear(nn.Module):
             persistent=True,
         )
 
+        # Precomputed path tables for fully vectorized soft routing (no depth loop).
+        # path_router_idx[ℓ, k] = heap router index on leaf ℓ's path at level k.
+        # path_go_right[ℓ, k]   = True iff leaf ℓ takes the right child at level k.
+        # leaf_router_inc[ℓ, r] = 1 if leaf ℓ's path visits router r.
+        path_router_idx, path_go_right, leaf_router_inc = self._build_path_tables(
+            depth, self.num_leaves, self.num_routers
+        )
+        self.register_buffer("path_router_idx", path_router_idx, persistent=False)
+        self.register_buffer("path_go_right", path_go_right, persistent=False)
+        self.register_buffer("leaf_router_inc", leaf_router_inc, persistent=False)
+
         # Cached soft-routing stats for compute_balance_loss() after forward_soft.
         # _last_node_decisions: (N, R) — c_n(x) for every router (batched).
         # _last_reach_probs:    (N, R) — prob of visiting each router.
@@ -104,6 +115,31 @@ class FastFeedforwardLinear(nn.Module):
         self._last_leaf_probs: Tensor | None = None
 
         self.reset_parameters()
+
+    @staticmethod
+    def _build_path_tables(
+        depth: int, num_leaves: int, num_routers: int
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Build leaf→path index tables (CPU, copied to device with the module).
+
+        Leaf index bit order matches the soft mixture layout
+        (MSB = root decision, LSB = deepest decision):
+            leaf 0 = all-left, leaf ``2^d-1`` = all-right.
+        """
+        path_router_idx = torch.empty(num_leaves, depth, dtype=torch.long)
+        path_go_right = torch.empty(num_leaves, depth, dtype=torch.bool)
+        leaf_router_inc = torch.zeros(num_leaves, num_routers, dtype=torch.float32)
+
+        for leaf in range(num_leaves):
+            node = 0
+            for level in range(depth):
+                path_router_idx[leaf, level] = node
+                leaf_router_inc[leaf, node] = 1.0
+                go_right = bool((leaf >> (depth - 1 - level)) & 1)
+                path_go_right[leaf, level] = go_right
+                node = (node << 1) + 1 + int(go_right)
+
+        return path_router_idx, path_go_right, leaf_router_inc
 
     def reset_parameters(self) -> None:
         """Initialize routers near 0 (≈ uniform soft splits) and leaves like Linear.
@@ -115,9 +151,11 @@ class FastFeedforwardLinear(nn.Module):
         nn.init.normal_(self.router_weights, mean=0.0, std=1e-3)
         nn.init.zeros_(self.router_biases)
 
-        # Per-leaf Xavier, matching nn.Linear fan-in/fan-out on (D_in, D_out).
-        for leaf in range(self.num_leaves):
-            nn.init.xavier_uniform_(self.leaf_weights[leaf])
+        # Vectorized Xavier-uniform over all leaves (same fan-in/out per leaf).
+        # a = sqrt(6 / (fan_in + fan_out))
+        fan_in, fan_out = self.in_features, self.out_features
+        a = math.sqrt(6.0 / float(fan_in + fan_out))
+        nn.init.uniform_(self.leaf_weights, -a, a)
         nn.init.zeros_(self.leaf_biases)
 
     def set_temperature(self, temp: float) -> None:
@@ -170,23 +208,22 @@ class FastFeedforwardLinear(nn.Module):
     # ------------------------------------------------------------------
 
     def forward_soft(self, x: Tensor) -> Tensor:
-        """Soft mixture over all leaves via **log-space** path products.
+        """Soft mixture over all leaves via **vectorized log-space** path products.
 
         Math
         ----
         ``c_n = σ((w_nᵀ x + b_n) / τ)`` — P(go right | node n).
-        Path probabilities are accumulated as
-            ``log m_left ← log m + log(1-c)``, ``log m_right ← log m + log c``
-        using ``logsigmoid`` (avoids ``∏ p_k → 0`` underflow that kills grads).
-        Then ``y = Σ_ℓ m_ℓ (x W_ℓ + b_ℓ)`` with ``m = exp(log m)``.
+        For every leaf ``ℓ`` in parallel:
+            ``log P(ℓ|x) = Σ_{k∈path(ℓ)} logsigmoid(±z_{r_k})``
+        then ``y = Σ_ℓ P(ℓ|x) · (x W_ℓ + b_ℓ)``.
+
+        Implementation is fully batched (no Python depth/leaf loops): gather path
+        logits with index tables, sum in log-space, ``softmax`` over leaves.
 
         Shapes
         ------
         x: ``(..., D_in)``
         returns: ``(..., D_out)``
-
-        Caches node decisions / reach probs / leaf mixture for
-        :meth:`compute_balance_loss` and :meth:`get_routing_diagnostics`.
         """
         flat, leading = self._flatten_input(x)
         # flat: (N, D_in)
@@ -200,18 +237,20 @@ class FastFeedforwardLinear(nn.Module):
         self._last_node_decisions = node_decisions
         self._last_reach_probs = reach_probs
 
-        # Per-leaf affine: (N, L, D_out)
-        leaf_out = torch.einsum("ni,lio->nlo", flat, self.leaf_weights)
+        # Batched leaf affine via bmm: (L, N, D_in) @ (L, D_in, D_out) → (L, N, D_out)
+        flat_b = flat.unsqueeze(0).expand(self.num_leaves, -1, -1)
+        leaf_out = torch.bmm(flat_b, self.leaf_weights).transpose(0, 1)
+        # leaf_out: (N, L, D_out)
         leaf_out = leaf_out + self.leaf_biases.unsqueeze(0)
 
         # Soft-weighted sum over leaves → (N, D_out)
-        y = torch.einsum("nl,nlo->no", leaf_probs, leaf_out)
+        y = torch.bmm(leaf_probs.unsqueeze(1), leaf_out).squeeze(1)
         return y.view(*leading, self.out_features)
 
     def _soft_leaf_probs(
         self, flat: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Compute leaf mixture via log-space path products (numerically stable).
+        """Vectorized leaf mixture: parallel log-path products over the batch.
 
         Parameters
         ----------
@@ -221,51 +260,43 @@ class FastFeedforwardLinear(nn.Module):
         Returns
         -------
         leaf_probs:
-            ``(N, L)`` — Σ_ℓ leaf_probs[n, ℓ] = 1 (up to float error, then renorm).
+            ``(N, L)`` — row-stochastic mixture weights.
         node_decisions:
             ``(N, R)`` — clamped right-child sigmoid at every router.
         reach_probs:
-            ``(N, R)`` — probability of visiting each router under soft paths.
+            ``(N, R)`` — soft visit mass per router (= ``leaf_probs @ incidence``).
         """
-        n_batch = flat.shape[0]
-        device = flat.device
-        dtype = flat.dtype
         eps = 1e-7
 
-        # All router logits at once: (N, R)
+        # All router logits at once: (N, R) — batch matmul via F.linear
         router_logits = (
             F.linear(flat, self.router_weights, self.router_biases)
             / self.temperature
         )
-        # Clamp probs for diagnostics / balance; path uses logsigmoid on logits.
         node_decisions = torch.sigmoid(router_logits).clamp(min=eps, max=1.0 - eps)
 
-        # log_mixture: (N, 1) starts at log(1)=0
-        log_mixture = torch.zeros(n_batch, 1, device=device, dtype=dtype)
-        reach_chunks: list[Tensor] = []
-        node_offset = 0
+        # Log-space edge weights for every router (N, R)
+        log_c = F.logsigmoid(router_logits)
+        log_not_c = F.logsigmoid(-router_logits)
 
-        for level in range(self.depth):
-            n_level = 1 << level
-            # Soft mass at this frontier (for reach / balance diagnostics)
-            reach_chunks.append(log_mixture.exp())
+        # Gather path routers for all leaves in one shot: (N, L, depth)
+        # path_router_idx: (L, depth)
+        idx = self.path_router_idx
+        log_c_path = log_c[:, idx]
+        log_not_c_path = log_not_c[:, idx]
 
-            level_logits = router_logits[:, node_offset : node_offset + n_level]
-            # log σ(z) and log(1-σ(z)) = log σ(-z) — stable for deep trees
-            log_c = F.logsigmoid(level_logits)
-            log_not_c = F.logsigmoid(-level_logits)
+        # Select left/right log-prob along each leaf's path — still (N, L, depth)
+        go_right = self.path_go_right.unsqueeze(0)  # (1, L, depth)
+        log_edges = torch.where(go_right, log_c_path, log_not_c_path)
 
-            log_left = log_mixture + log_not_c
-            log_right = log_mixture + log_c
-            log_mixture = torch.stack((log_left, log_right), dim=-1).reshape(
-                n_batch, -1
-            )
-            node_offset += n_level
+        # Parallel path product in log-space → (N, L)
+        log_leaf = log_edges.sum(dim=-1)
+        leaf_probs = torch.softmax(log_leaf, dim=-1)
 
-        reach_probs = torch.cat(reach_chunks, dim=-1)  # (N, R)
-        # Exp + renorm guards residual float drift across depth levels.
-        leaf_probs = torch.exp(log_mixture)
-        leaf_probs = leaf_probs / leaf_probs.sum(dim=-1, keepdim=True).clamp_min(eps)
+        # Reach mass: which routers soft-mass visits (N, R)
+        # leaf_router_inc: (L, R)
+        reach_probs = leaf_probs @ self.leaf_router_inc
+
         return leaf_probs, node_decisions, reach_probs
 
     # ------------------------------------------------------------------
