@@ -8,11 +8,11 @@ with dynamic ``λ`` and FFF temperature annealing ``τ: 1.0 → 0.02``.
 Optimisation
 ------------
 * AdamW + **LR warmup + cosine decay** (``lr → min_lr``)
-* Larger micro-batches (``batch_size=32``) + light grad accum on ~12GB VRAM
-* Mixed precision via ``device_utils.amp_autocast`` / ``GradScaler`` (CUDA)
-* ``torch.compile`` on CUDA; DataLoader workers + ``pin_memory`` + ``persistent_workers``
-* Cross-platform device: CUDA → MPS → CPU
-* Caps: ``max_epochs=5``, ``max_steps=3000`` (keeps full runs in tens of minutes)
+* Micro-batch ``batch_size=8`` × ``grad_accum_steps=8`` (effective 64) for ~12GB VRAM
+* Mixed precision: CUDA autocast ``float16`` for forward + CE (logits stay fp16)
+* ``torch.compile(..., mode="reduce-overhead")`` on CUDA with fallback
+* DataLoader workers + ``pin_memory`` + ``persistent_workers`` on CUDA
+* Caps: ``max_epochs=5``, ``max_steps=3000``
 """
 
 from __future__ import annotations
@@ -24,6 +24,9 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+# Reduce CUDA allocator fragmentation before importing torch.
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 import torch.nn as nn
@@ -69,15 +72,16 @@ class TrainConfig:
     # Data
     wiki_variant: str = "wikitext-2"  # or wikitext-103
 
-    # Optimisation (RTX 3060 12GB-friendly defaults)
-    batch_size: int = 32
-    grad_accum_steps: int = 2  # effective batch = batch_size * grad_accum_steps
+    # Optimisation (RTX 3060 12GB — small micro-batch, same effective batch 64)
+    batch_size: int = 8
+    grad_accum_steps: int = 8  # effective batch = 8 * 8 = 64
     lr: float = 3e-4
     min_lr: float = 3e-5
     weight_decay: float = 0.1
     max_epochs: int = 5
     grad_clip: float = 1.0
     compile_model: bool = True  # torch.compile on CUDA only
+    compile_mode: str = "reduce-overhead"  # lower warm-up VRAM vs "default"
     lr_warmup_frac: float = 0.05  # fraction of optimizer steps for LR warmup
 
     # FFF routing schedule
@@ -172,8 +176,17 @@ def set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
 # ---------------------------------------------------------------------------
 
 
-def maybe_compile(model: FFFTransformer, enabled: bool, device: torch.device) -> FFFTransformer:
-    """Compile with ``torch.compile`` on CUDA when requested."""
+def maybe_compile(
+    model: FFFTransformer,
+    enabled: bool,
+    device: torch.device,
+    mode: str = "reduce-overhead",
+) -> FFFTransformer:
+    """Compile with ``torch.compile`` on CUDA when requested.
+
+    Tries ``mode`` first (default ``reduce-overhead`` to limit warm-up VRAM),
+    then falls back to ``"default"``, then returns the eager model.
+    """
     if not enabled:
         return model
     if device.type != "cuda":
@@ -182,13 +195,25 @@ def maybe_compile(model: FFFTransformer, enabled: bool, device: torch.device) ->
     if not hasattr(torch, "compile"):
         print("torch.compile unavailable — skipping")
         return model
-    try:
-        compiled = torch.compile(model, mode="default")  # type: ignore[assignment]
-        print(f"torch.compile enabled (device={device.type})")
-        return compiled  # type: ignore[return-value]
-    except Exception as exc:  # pragma: no cover
-        print(f"torch.compile skipped ({exc})")
-        return model
+
+    modes = [mode]
+    if mode != "default":
+        modes.append("default")
+
+    for compile_mode in modes:
+        try:
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            compiled = torch.compile(model, mode=compile_mode)  # type: ignore[assignment]
+            print(f"torch.compile enabled (mode={compile_mode!r}, device={device.type})")
+            return compiled  # type: ignore[return-value]
+        except Exception as exc:  # pragma: no cover
+            print(f"torch.compile mode={compile_mode!r} failed ({exc}); trying fallback...")
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    print("torch.compile skipped — using eager model")
+    return model
 
 
 def make_dataloader(
@@ -228,7 +253,11 @@ def compute_batch_loss(
     lambda_balance: float,
     mode: str,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """``input_ids, targets: (B, T)`` → ``(total, ce, balance)``."""
+    """``input_ids, targets: (B, T)`` → ``(total, ce, balance)``.
+
+    Caller must wrap this in :func:`amp_autocast` so the forward pass and
+    ``F.cross_entropy`` run under CUDA ``float16`` autocast (logits stay fp16).
+    """
     logits, balance_loss = model(input_ids, mode=mode)
     if logits.ndim != 3 or logits.shape[:2] != input_ids.shape:
         raise RuntimeError(
@@ -240,6 +269,7 @@ def compute_batch_loss(
             f"LM head width {logits.size(-1)} != vocab_size "
             f"{unwrap_model(model).config.vocab_size}"  # type: ignore[union-attr]
         )
+    # Keep CE inside the outer autocast context (do not cast logits to fp32 here).
     ce = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
     if mode == "soft":
         total = ce + lambda_balance * balance_loss
@@ -407,6 +437,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default=d.device)
     p.add_argument("--num-workers", type=int, default=d.num_workers)
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=d.compile_model)
+    p.add_argument(
+        "--compile-mode",
+        type=str,
+        default=d.compile_mode,
+        choices=["reduce-overhead", "default", "max-autotune"],
+        help="torch.compile mode (CUDA); reduce-overhead uses less warm-up VRAM",
+    )
     p.add_argument("--checkpoint-path", type=str, default=d.checkpoint_path)
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", type=str, default=d.wandb_project)
@@ -439,6 +476,7 @@ def train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         max_epochs=args.max_epochs,
         grad_clip=args.grad_clip,
         compile_model=args.compile,
+        compile_mode=args.compile_mode,
         init_temp=args.init_temp,
         min_temp=args.min_temp,
         temp_warmup_frac=args.temp_warmup_frac,
@@ -510,7 +548,14 @@ def main() -> None:
     )
     model = FFFTransformer(model_cfg).to(device)
     assert_embed_lm_alignment(model)
-    model = maybe_compile(model, enabled=cfg.compile_model, device=device)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    model = maybe_compile(
+        model,
+        enabled=cfg.compile_model,
+        device=device,
+        mode=cfg.compile_mode,
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
