@@ -1,16 +1,15 @@
-"""Triton CUDA FFF hard routing with leaf-sorted coalesced GEMM.
+"""Triton CUDA FFF hard routing with hybrid fused / leaf-sorted paths.
 
-Strategy (batch / multi-token)
------------------------------
-1. **Pass 1 — route:** lightweight Triton kernel walks the tree and writes
-   ``leaf_id[n]`` for every token ``n ∈ [0, N)`` (``N = B·T``).
-2. **Pass 2 — sort:** ``torch.sort`` buckets tokens by ``leaf_id`` so equal
-   leaves are contiguous (fixes memory divergence across the batch).
-3. **Pass 3 — coalesced leaf GEMM:** for each unique leaf run, one
-   ``addmm`` / ``mm`` loads ``w_leaf[k]`` once and applies it to all tokens
-   routed to that leaf.
-
-``N == 1`` keeps the fused single-token kernel (no sort overhead).
+Hybrid dispatch (``N = B·T`` flattened tokens)
+---------------------------------------------
+* **``N <= 4`` (small / decode):** single fused Triton kernel
+  (tree-walk + leaf GEMV). Avoids sort/bucket overhead — best for
+  single-token and tiny-batch generation (~189+ tok/s).
+* **``N > 4`` (batched inference):** multi-pass leaf-sorted path
+  1. Pass 1 — route: Triton writes ``leaf_id[n]`` for all tokens.
+  2. Pass 2 — sort: ``torch.sort`` buckets by ``leaf_id``.
+  3. Pass 3 — coalesced leaf GEMM: one ``mm`` per unique leaf so
+     ``w_leaf[k]`` is loaded once and reused (~513+ tok/s at large N).
 
 Buffers for ``y``, ``leaf_ids``, sort indices, and sorted ``x``/``y`` are
 pooled and reused to avoid allocator churn / fragmentation on RTX 3060.
@@ -123,6 +122,10 @@ def clear_triton_buffer_pool(*, empty_cache: bool = False) -> None:
         torch.cuda.empty_cache()
 
 
+# Max token count that uses the fused kernel (no sort). Above this → grouped path.
+FUSED_MAX_N: int = 4
+
+
 if _HAS_TRITON:
 
     # ------------------------------------------------------------------
@@ -232,7 +235,7 @@ if _HAS_TRITON:
         tl.store(leaf_ptr + n, leaf_id.to(tl.int32))
 
     # ------------------------------------------------------------------
-    # Fused path (N==1): tree walk + leaf GEMV in one launch
+    # Fused path (N <= FUSED_MAX_N): tree walk + leaf GEMV in one launch
     # ------------------------------------------------------------------
 
     @_decorate_autotune(
@@ -267,7 +270,7 @@ if _HAS_TRITON:
         BLOCK_SIZE_O: tl.constexpr,
         BLOCK_SIZE_I: tl.constexpr,
     ):
-        """Fused single-/tiny-batch hard routing (no cross-token leaf reuse)."""
+        """Fused hard routing for small ``N`` (no cross-token leaf reuse)."""
         n = tl.program_id(0)
         o_tile = tl.program_id(1)
         if n >= N:
@@ -464,7 +467,7 @@ def fff_hard_forward_triton(
     *,
     out: Tensor | None = None,
 ) -> Tensor:
-    """Hard-routing forward with leaf-sorted coalesced GEMM (batched) or fused (N=1).
+    """Hard-routing forward with hybrid fused (``N<=4``) / sorted (``N>4``) paths.
 
     Parameters
     ----------
@@ -529,15 +532,13 @@ def fff_hard_forward_triton(
                 )
             y = out.contiguous()
 
-        # N==1: fused kernel (autoregressive single-token microbatch).
-        if n == 1:
+        # Small N: fused kernel — skip sort/bucket overhead (decode / microbatch).
+        if n <= FUSED_MAX_N:
             _launch_fused(x, wr, br, wl, bl, depth, y[:n])
             return y[:n]
 
-        # Pass 1 — leaf ids for all tokens
+        # Large N: Pass 1 route → Pass 2–3 sort + coalesced GEMM per leaf.
         _launch_route_leaf_ids(x, wr, br, buf.leaf_ids[:n], depth)
-
-        # Pass 2–3 — sort by leaf + coalesced GEMM per leaf bucket
         return _coalesced_leaf_gemm(x, wl, bl, buf.leaf_ids, y, buf)
 
     except torch.cuda.OutOfMemoryError:
@@ -559,11 +560,12 @@ def warmup_fff_hard_triton(
     """Force Triton autotune + buffer pool init before benchmark timing."""
     if not _HAS_TRITON or x.device.type != "cuda":
         return
-    # Warm both N=1 fused path and a multi-token sorted path.
-    x1 = x[:1].contiguous() if x.shape[0] >= 1 else x
+    # Warm fused (N<=4) and sorted (N>4) paths when sample size allows.
+    n = x.shape[0]
+    x_fused = x[: min(n, FUSED_MAX_N)].contiguous()
     for _ in range(max(n_iters, 1)):
-        fff_hard_forward_triton(x1, w_router, b_router, w_leaf, b_leaf, depth)
-        if x.shape[0] > 1:
+        fff_hard_forward_triton(x_fused, w_router, b_router, w_leaf, b_leaf, depth)
+        if n > FUSED_MAX_N:
             fff_hard_forward_triton(x, w_router, b_router, w_leaf, b_leaf, depth)
     torch.cuda.synchronize(x.device)
 
@@ -574,7 +576,7 @@ def warmup_fff_model_triton(
     sample_tokens: int = 32,
     n_iters: int = 5,
 ) -> None:
-    """Warmup every FFF layer (fused N=1 + sorted multi-token paths)."""
+    """Warmup every FFF layer (fused ``N<=4`` + sorted ``N>4`` paths)."""
     if not _HAS_TRITON:
         return
     device = next(model.parameters()).device
@@ -586,8 +588,8 @@ def warmup_fff_model_triton(
         return
 
     d_model = int(layers[0].in_features)
-    # Include batch>1 so route/sort/GEMM path is compiled + autotuned.
-    n = max(int(sample_tokens), 8)
+    # N > FUSED_MAX_N so both hybrid branches are compiled + autotuned.
+    n = max(int(sample_tokens), FUSED_MAX_N + 1)
     x = torch.randn(n, d_model, device=device, dtype=torch.float32)
     for layer in layers:
         warmup_fff_hard_triton(

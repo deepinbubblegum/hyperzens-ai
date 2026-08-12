@@ -537,7 +537,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--batch-sizes",
         type=str,
-        default="1,2,4,8,16",
+        default="1,2,4,8,16,32",
         help="Comma-separated batch sizes for CUDA batch sweep",
     )
     p.add_argument(
@@ -1008,7 +1008,7 @@ def run_cuda_batch_scaling_benchmark(
         )
         return []
 
-    batch_sizes = batch_sizes or [1, 2, 4, 8, 16]
+    batch_sizes = batch_sizes or [1, 2, 4, 8, 16, 32]
     apply_hardware_optimizations(device)
 
     print("\n" + "-" * 72)
