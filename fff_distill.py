@@ -384,20 +384,116 @@ def load_wikitext_tokens(
     split: str = "train",
     max_chars: int | None = 2_000_000,
 ) -> Tensor:
-    """Tokenize WikiText-2 with the GPT-2 tokenizer → ``int64`` 1-D tensor."""
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:
-        raise SystemExit(
-            "pip install datasets  (needed for WikiText-2 distillation data)"
-        ) from exc
+    """Tokenize WikiText-2 with the GPT-2 tokenizer → ``int64`` 1-D tensor.
 
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
-    text = "\n".join(t for t in ds["text"] if t and t.strip())
+    Uses ``Salesforce/wikitext`` (required by recent ``huggingface_hub``).
+    Falls back to the legacy ``wikitext`` id, then to the MetaMind/HF zip.
+    """
+    text = _load_wikitext2_text(split=split)
     if max_chars is not None:
-        text = text[: max_chars]
+        text = text[:max_chars]
     ids = tokenizer.encode(text)
     return torch.tensor(ids, dtype=torch.long)
+
+
+def _load_wikitext2_text(*, split: str = "train") -> str:
+    """Fetch WikiText-2 raw text for ``split`` (train/validation/test)."""
+    last_err: Exception | None = None
+
+    # 1) HuggingFace datasets — namespace/name first (fixes HfUriError on 'wikitext')
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        load_dataset = None  # type: ignore[assignment]
+        last_err = ImportError("datasets not installed")
+
+    if load_dataset is not None:
+        for repo_id, config_name in (
+            ("Salesforce/wikitext", "wikitext-2-raw-v1"),
+            ("wikitext", "wikitext-2-raw-v1"),
+        ):
+            try:
+                print(f"Loading HuggingFace '{repo_id}' / '{config_name}' ({split}) ...")
+                ds = load_dataset(repo_id, config_name, split=split)
+                text = "\n".join(t for t in ds["text"] if t and str(t).strip())
+                if text.strip():
+                    print(f"  loaded {len(text):,} characters")
+                    return text
+            except Exception as exc:
+                last_err = exc
+                print(f"  attempt failed: {exc.__class__.__name__}: {exc}")
+
+    # 2) Zip fallback (same mirrors as data/dataset_loader.py)
+    print("Falling back to WikiText-2 zip download ...")
+    try:
+        return _load_wikitext2_text_from_zip(split=split)
+    except Exception as exc:
+        last_err = exc
+        print(f"  zip fallback failed: {exc}")
+
+    raise SystemExit(
+        "Could not load WikiText-2.\n"
+        "  pip install -U datasets huggingface_hub\n"
+        "  or check network access to huggingface.co\n"
+        f"Last error: {last_err}"
+    )
+
+
+def _load_wikitext2_text_from_zip(*, split: str = "train") -> str:
+    """Download WikiText-2 raw zip and return the requested split text."""
+    import urllib.request
+    import zipfile
+
+    cache_dir = DATA_DIR / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = cache_dir / "wikitext-2-raw-v1.zip"
+    urls = (
+        "https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/data/wikitext-2-raw-v1.zip",
+        "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-raw-v1.zip",
+    )
+    if not zip_path.exists():
+        last_err: Exception | None = None
+        for url in urls:
+            try:
+                print(f"  downloading {url} ...")
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "hyperzens-ai/fff_distill"}
+                )
+                with urllib.request.urlopen(req, timeout=120) as resp, open(
+                    zip_path, "wb"
+                ) as out:
+                    out.write(resp.read())
+                last_err = None
+                break
+            except Exception as exc:
+                last_err = exc
+                zip_path.unlink(missing_ok=True)
+        if last_err is not None and not zip_path.exists():
+            raise RuntimeError("all WikiText-2 zip URLs failed") from last_err
+
+    split_map = {
+        "train": "wikitext-2-raw/wiki.train.raw",
+        "validation": "wikitext-2-raw/wiki.valid.raw",
+        "valid": "wikitext-2-raw/wiki.valid.raw",
+        "test": "wikitext-2-raw/wiki.test.raw",
+    }
+    member = split_map.get(split)
+    if member is None:
+        raise ValueError(f"unknown split {split!r}; use train|validation|test")
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        # Some archives use slightly different inner paths — search by suffix.
+        names = zf.namelist()
+        path = next((n for n in names if n.endswith(member.split("/")[-1])), None)
+        if path is None:
+            path = member if member in names else None
+        if path is None:
+            raise FileNotFoundError(
+                f"split file for {split!r} not in zip; members sample={names[:8]}"
+            )
+        text = zf.read(path).decode("utf-8", errors="replace")
+    print(f"  zip loaded {len(text):,} characters ({split})")
+    return text
 
 
 # ---------------------------------------------------------------------------
