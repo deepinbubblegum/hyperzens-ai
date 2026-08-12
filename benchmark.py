@@ -19,7 +19,7 @@ Execution
 
 Notes
 -----
-* Compares Dense MLP vs FFF hard routing.
+* Compares Dense MLP vs FFF PyTorch hard vs FFF C++ hard (CPU).
 * By default benchmarks the auto-detected accelerator **and** CPU for a
   side-by-side report (skip CPU with ``--skip-cpu``).
 * Peak RAM via ``psutil`` when available, else ``tracemalloc`` fallback.
@@ -47,6 +47,7 @@ from device_utils import (
     print_device_info,
     resolve_device,
 )
+from models.fff_layer import is_fff_cpp_available
 from models.transformer import FFFConfig, FFFTransformer, StandardTransformer
 
 # ---------------------------------------------------------------------------
@@ -165,6 +166,16 @@ def param_report_fff(model: FFFTransformer) -> ModelParamReport:
 def make_fff_step(model: FFFTransformer) -> Callable[[Tensor], Tensor]:
     def step(idx: Tensor) -> Tensor:
         logits, _ = model(idx, mode="hard")
+        return logits
+
+    return step
+
+
+def make_fff_cpp_step(model: FFFTransformer) -> Callable[[Tensor], Tensor]:
+    """Hard routing through the C++ CPU extension (``mode='hard_cpp'``)."""
+
+    def step(idx: Tensor) -> Tensor:
+        logits, _ = model(idx, mode="hard_cpp")
         return logits
 
     return step
@@ -355,117 +366,108 @@ def _cell(text: str, width: int) -> str:
 def print_comparison_table(
     dense: ModelBenchResult,
     fff: ModelBenchResult,
+    fff_cpp: ModelBenchResult | None = None,
 ) -> None:
-    """ASCII summary table matching the requested layout."""
-    speedup_single = fff.single.tokens_per_s / max(dense.single.tokens_per_s, 1e-12)
-    speedup_multi = fff.multi.tokens_per_s / max(dense.multi.tokens_per_s, 1e-12)
-    # Primary latency / speedup rows use multi-thread (typical laptop default),
-    # with single-thread called out explicitly above.
-    speedup = speedup_multi
+    """ASCII summary: Dense vs FFF PyTorch Hard vs optional FFF C++ Hard."""
+    has_cpp = fff_cpp is not None
+    names = ["Standard Dense", "FFF PyTorch Hard"]
+    results = [dense, fff]
+    if has_cpp:
+        names.append("FFF C++ Hard")
+        results.append(fff_cpp)  # type: ignore[arg-type]
 
-    col0, col1, col2 = 32, 20, 20
-    total_w = col0 + col1 + col2 + 4
-    sep = "+" + "-" * col0 + "+" + "-" * col1 + "+" + "-" * col2 + "+"
-    header = (
-        "|"
-        + _cell("Metric", col0)
-        + "|"
-        + _cell("Standard Dense", col1)
-        + "|"
-        + _cell("FFF Hard Routing", col2)
-        + "|"
-    )
+    col0 = 34
+    col_w = 20
+    n_cols = len(names)
+    sep = "+" + "-" * col0 + ("+" + "-" * col_w) * n_cols + "+"
+    header = "|" + _cell("Metric", col0)
+    for name in names:
+        header += "|" + _cell(name, col_w)
+    header += "|"
+
+    def row(metric: str, values: list[str]) -> str:
+        line = "|" + _cell(metric, col0)
+        for v in values:
+            line += "|" + _cell(v, col_w)
+        return line + "|"
+
+    # Speeds vs dense (multi-thread primary)
+    speedups = [
+        r.multi.tokens_per_s / max(dense.multi.tokens_per_s, 1e-12) for r in results
+    ]
 
     rows = [
         (
             "Total Parameters",
-            _fmt_int(dense.param.total_params),
-            _fmt_int(fff.param.total_params),
+            [_fmt_int(r.param.total_params) for r in results],
         ),
         (
             "Active Params / Token",
-            "100%",
-            _fmt_pct(fff.param.active_pct),
+            [
+                "100%" if i == 0 else _fmt_pct(r.param.active_pct)
+                for i, r in enumerate(results)
+            ],
         ),
         (
             "Active Params (abs)",
-            _fmt_int(dense.param.active_params_per_token),
-            _fmt_int(fff.param.active_params_per_token),
+            [_fmt_int(r.param.active_params_per_token) for r in results],
         ),
         (
             "FFN Active / Stored",
-            f"{_fmt_int(dense.param.ffn_active)} / {_fmt_int(dense.param.ffn_stored)}",
-            f"{_fmt_int(fff.param.ffn_active)} / {_fmt_int(fff.param.ffn_stored)}",
+            [
+                f"{_fmt_int(r.param.ffn_active)} / {_fmt_int(r.param.ffn_stored)}"
+                for r in results
+            ],
         ),
         (
-            "Peak RAM Usage (MB)",
-            _fmt_mb(dense.memory.peak_generate_mb),
-            _fmt_mb(fff.memory.peak_generate_mb),
+            "Latency 1-thread",
+            [_fmt_ms(r.single.ms_per_token) for r in results],
         ),
         (
-            "Single-Thread Speed (tok/s)",
-            _fmt_tps(dense.single.tokens_per_s),
-            _fmt_tps(fff.single.tokens_per_s),
+            "Throughput 1-thread",
+            [_fmt_tps(r.single.tokens_per_s) for r in results],
         ),
         (
-            "Multi-Thread Speed (tok/s)",
-            _fmt_tps(dense.multi.tokens_per_s),
-            _fmt_tps(fff.multi.tokens_per_s),
+            f"Latency {results[0].multi.threads}-thread",
+            [_fmt_ms(r.multi.ms_per_token) for r in results],
         ),
         (
-            "Latency per Token (ms)",
-            _fmt_ms(dense.multi.ms_per_token),
-            _fmt_ms(fff.multi.ms_per_token),
+            f"Throughput {results[0].multi.threads}-thread",
+            [_fmt_tps(r.multi.tokens_per_s) for r in results],
         ),
         (
-            "Latency (1-thread, ms)",
-            _fmt_ms(dense.single.ms_per_token),
-            _fmt_ms(fff.single.ms_per_token),
+            "Speedup vs Dense (multi)",
+            [f"{s:.2f}x" for s in speedups],
         ),
         (
-            "Throughput Speedup Ratio",
-            "1.0x (Baseline)",
-            f"{speedup:.2f}x",
-        ),
-        (
-            "Speedup (1-thread)",
-            "1.0x",
-            f"{speedup_single:.2f}x",
+            "Peak RAM (gen)",
+            [_fmt_mb(r.memory.peak_generate_mb) for r in results],
         ),
     ]
 
-    print()
     print(sep)
     print(header)
     print(sep)
-    for metric, a, b in rows:
-        print(
-            "|"
-            + _cell(metric, col0)
-            + "|"
-            + _cell(a, col1)
-            + "|"
-            + _cell(b, col2)
-            + "|"
-        )
+    for metric, values in rows:
+        print(row(metric, values))
     print(sep)
+
     print(
-        f"Memory backend: dense={dense.memory.backend} | fff={fff.memory.backend}"
+        "Memory backend: "
+        + " | ".join(f"{n}={r.memory.backend}" for n, r in zip(names, results))
     )
-    print(
-        f"RAM baseline→load→gen | Dense "
-        f"{dense.memory.baseline_mb:.1f}→{dense.memory.after_load_mb:.1f}→"
-        f"{dense.memory.peak_generate_mb:.1f} MB | FFF "
-        f"{fff.memory.baseline_mb:.1f}→{fff.memory.after_load_mb:.1f}→"
-        f"{fff.memory.peak_generate_mb:.1f} MB"
-    )
+    if has_cpp and fff_cpp is not None:
+        cpp_vs_pt = fff_cpp.multi.tokens_per_s / max(fff.multi.tokens_per_s, 1e-12)
+        print(
+            f"FFF C++ vs PyTorch Hard (multi-thread): {cpp_vs_pt:.2f}x "
+            f"({fff_cpp.multi.tokens_per_s:.2f} / {fff.multi.tokens_per_s:.2f} tok/s)"
+        )
     print(
         f"FFF FFN sparsity: hard-active "
         f"{100.0 * fff.param.ffn_active / max(fff.param.ffn_stored, 1):.2f}% "
         f"of stored FFF params "
         f"({_fmt_int(fff.param.ffn_active)} / {_fmt_int(fff.param.ffn_stored)})"
     )
-    _ = total_w  # layout width documented for maintainers
 
 
 # ---------------------------------------------------------------------------
@@ -521,8 +523,8 @@ def run_pair_on_device(
     n_tokens: int,
     warmup: int,
     cpu_count: int,
-) -> tuple[ModelBenchResult, ModelBenchResult]:
-    """Benchmark Dense vs FFF hard routing on a single device."""
+) -> tuple[ModelBenchResult, ModelBenchResult, ModelBenchResult | None]:
+    """Benchmark Dense vs FFF PyTorch Hard (and FFF C++ Hard on CPU)."""
     apply_hardware_optimizations(device)
     print("\n" + "-" * 72)
     print(f"Device run: {device} — {device_label(device)}")
@@ -530,7 +532,7 @@ def run_pair_on_device(
 
     prompt = prompt_cpu.to(device)
 
-    print("\n[1/2] Benchmarking StandardTransformer (dense MLP)...")
+    print("\n[1/3] Benchmarking StandardTransformer (dense MLP)...")
 
     def dense_factory() -> StandardTransformer:
         m = StandardTransformer(config).to(device)
@@ -573,7 +575,7 @@ def run_pair_on_device(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    print("\n[2/2] Benchmarking FFFTransformer (mode=hard)...")
+    print("\n[2/3] Benchmarking FFFTransformer (PyTorch mode=hard)...")
 
     def fff_factory() -> FFFTransformer:
         m = FFFTransformer(config).to(device)
@@ -591,6 +593,15 @@ def run_pair_on_device(
         gen_tokens=min(32, n_tokens),
     )
     fff_param = param_report_fff(fff_model)
+    # Rename for table clarity
+    fff_param = ModelParamReport(
+        name="FFF PyTorch Hard",
+        total_params=fff_param.total_params,
+        active_params_per_token=fff_param.active_params_per_token,
+        active_pct=fff_param.active_pct,
+        ffn_stored=fff_param.ffn_stored,
+        ffn_active=fff_param.ffn_active,
+    )
     fff_single = benchmark_speed(
         fff_step, prompt, config.block_size, n_tokens, warmup, num_threads=1
     )
@@ -614,15 +625,87 @@ def run_pair_on_device(
         f"peak_RAM={fff_mem.peak_generate_mb:.1f} MB"
     )
 
+    fff_cpp_result: ModelBenchResult | None = None
+    if device.type == "cpu":
+        print("\n[3/3] Benchmarking FFFTransformer (C++ mode=hard_cpp)...")
+        if not is_fff_cpp_available():
+            print("  SKIP — C++ extension unavailable (fallback-only)")
+        else:
+            # Numerical check: one forward must match PyTorch hard.
+            with torch.no_grad():
+                layer = next(iter(fff_model.fff_layers()))
+                probe = torch.randn(8, layer.in_features)
+                y_pt = layer.forward_hard(probe)
+                y_cpp = layer.forward_hard_cpp(probe)
+                max_abs = float((y_pt - y_cpp).abs().max().item())
+                if not torch.allclose(y_pt, y_cpp, atol=1e-5, rtol=1e-5):
+                    raise AssertionError(
+                        f"C++ hard ≠ PyTorch hard (max |Δ|={max_abs:.3e})"
+                    )
+                print(f"  numerical match OK (max |Δ|={max_abs:.3e})")
+
+            fff_cpp_step = make_fff_cpp_step(fff_model)
+            # Reuse loaded model; measure a short gen for RAM peak.
+            generate_timed(
+                fff_cpp_step,
+                prompt.clone(),
+                min(32, n_tokens),
+                config.block_size,
+            )
+            cpp_mem = MemoryResult(
+                baseline_mb=fff_mem.baseline_mb,
+                after_load_mb=fff_mem.after_load_mb,
+                peak_generate_mb=_rss_mb(),
+                backend=fff_mem.backend,
+            )
+            cpp_param = ModelParamReport(
+                name="FFF C++ Hard Routing",
+                total_params=fff_param.total_params,
+                active_params_per_token=fff_param.active_params_per_token,
+                active_pct=fff_param.active_pct,
+                ffn_stored=fff_param.ffn_stored,
+                ffn_active=fff_param.ffn_active,
+            )
+            cpp_single = benchmark_speed(
+                fff_cpp_step,
+                prompt,
+                config.block_size,
+                n_tokens,
+                warmup,
+                num_threads=1,
+            )
+            cpp_multi = benchmark_speed(
+                fff_cpp_step,
+                prompt,
+                config.block_size,
+                n_tokens,
+                warmup,
+                num_threads=cpu_count,
+            )
+            fff_cpp_result = ModelBenchResult(
+                param=cpp_param,
+                memory=cpp_mem,
+                single=cpp_single,
+                multi=cpp_multi,
+            )
+            print(
+                f"  params={cpp_param.total_params:,} | "
+                f"speed={cpp_multi.tokens_per_s:.2f} tok/s | "
+                f"latency={cpp_multi.ms_per_token:.3f} ms | "
+                f"peak_RAM={cpp_mem.peak_generate_mb:.1f} MB"
+            )
+    else:
+        print("\n[3/3] FFF C++ Hard skipped (CPU-only kernel)")
+
     print(f"\n=== Dense vs FFF on {device.type.upper()} ===")
-    print_comparison_table(dense_result, fff_result)
+    print_comparison_table(dense_result, fff_result, fff_cpp_result)
 
     del fff_model
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    return dense_result, fff_result
+    return dense_result, fff_result, fff_cpp_result
 
 
 def print_gpu_vs_cpu_summary(
@@ -655,6 +738,7 @@ def main() -> None:
     print("=" * 72)
     print_device_info(primary)
     print(f"logical_cpus={cpu_count} | psutil={'yes' if _HAS_PSUTIL else 'NO (tracemalloc fallback)'}")
+    print(f"FFF C++ hard extension: {'available' if is_fff_cpp_available() else 'UNAVAILABLE (PyTorch fallback)'}")
     if not _HAS_PSUTIL:
         print(
             "WARNING: install psutil for accurate RSS peak memory "
@@ -700,7 +784,7 @@ def main() -> None:
     )
 
     # Primary device (auto GPU or forced)
-    _dense_p, fff_primary = run_pair_on_device(
+    _dense_p, fff_primary, _cpp_p = run_pair_on_device(
         primary,
         config,
         ckpt_path,
@@ -712,7 +796,7 @@ def main() -> None:
 
     # Side-by-side CPU when primary is an accelerator
     if primary.type != "cpu" and not args.skip_cpu:
-        _dense_c, fff_cpu = run_pair_on_device(
+        _dense_c, fff_cpu, _cpp_c = run_pair_on_device(
             torch.device("cpu"),
             config,
             ckpt_path,

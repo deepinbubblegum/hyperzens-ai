@@ -100,9 +100,13 @@ def mps_autocast_supported() -> bool:
 
 @contextmanager
 def amp_autocast(device: torch.device) -> Iterator[None]:
-    """Context manager for CUDA / MPS autocast with graceful MPS fallback."""
+    """Context manager for CUDA / MPS autocast with graceful MPS fallback.
+
+    On CUDA, forces ``dtype=torch.float16`` so large LM logits stay in fp16
+    (lower peak VRAM than the default which may promote to bf16/fp32).
+    """
     if device.type == "cuda":
-        with torch.amp.autocast(device_type="cuda"):
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
             yield
         return
     if device.type == "mps":

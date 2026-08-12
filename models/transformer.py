@@ -284,7 +284,7 @@ class FFFTransformer(nn.Module):
 
     Forward
     -------
-    ``logits, total_balance_loss = model(input_ids, mode="soft"|"hard")``
+    ``logits, total_balance_loss = model(input_ids, mode="soft"|"hard"|"hard_cpp")``
 
     - ``logits``: ``(B, T, V)``
     - ``total_balance_loss``: scalar sum of per-block FFF balance losses

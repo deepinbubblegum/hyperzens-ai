@@ -1,13 +1,14 @@
 """Hard-routing inference for a trained FFFTransformer (BPE / cross-platform).
 
-Loads ``fff_checkpoint.pt``, generates text with ``mode="hard"``, reports
-ms/token and FFF active-vs-total parameter counts, and verifies hard routing.
+Loads ``fff_checkpoint.pt``, generates text with hard FFF routing (PyTorch or
+optional C++ CPU kernel), reports ms/token and FFF active-vs-total parameter
+counts, and verifies hard routing.
 
 Prompts / outputs use **tiktoken GPT-2 BPE** (or legacy char tokenizer if the
 checkpoint still stores ``chars``).
 
 Device defaults to auto-detect (CUDA → MPS → CPU). Override with
-``--device cpu|cuda|mps``.
+``--device cpu|cuda|mps``. Hard C++ routing is CPU-only (``--fff-backend cpp``).
 """
 
 from __future__ import annotations
@@ -16,16 +17,19 @@ import argparse
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from device_utils import apply_hardware_optimizations, print_device_info, resolve_device
+from models.fff_layer import is_fff_cpp_available
 from models.transformer import FFFConfig, FFFTransformer
 
 DEFAULT_CHECKPOINT = Path(__file__).resolve().parent / "fff_checkpoint.pt"
+
+FFFBackend = Literal["pytorch", "cpp", "auto"]
 
 
 class Tokenizer(Protocol):
@@ -282,6 +286,49 @@ def verify_hard_skips_unselected_branches(
     }
 
 
+def resolve_fff_mode(backend: FFFBackend, device: torch.device) -> str:
+    """Map CLI backend → model ``mode`` (``hard`` / ``hard_cpp``)."""
+    if backend == "pytorch":
+        return "hard"
+    if backend == "cpp":
+        if device.type != "cpu":
+            raise RuntimeError(
+                "FFF C++ hard routing is CPU-only; use --device cpu or --fff-backend pytorch"
+            )
+        if not is_fff_cpp_available():
+            raise RuntimeError(
+                "FFF C++ extension unavailable (compile failed or missing toolchain)"
+            )
+        return "hard_cpp"
+    # auto: prefer C++ on CPU when available
+    if device.type == "cpu" and is_fff_cpp_available():
+        return "hard_cpp"
+    return "hard"
+
+
+@torch.no_grad()
+def verify_cpp_matches_pytorch(model: FFFTransformer) -> dict[str, Any]:
+    """Check C++ hard outputs match PyTorch hard on a random batch (CPU)."""
+    if not is_fff_cpp_available():
+        return {"ok": False, "skipped": True, "reason": "cpp unavailable"}
+    device = next(model.parameters()).device
+    if device.type != "cpu":
+        return {"ok": False, "skipped": True, "reason": f"device={device.type}"}
+
+    layer = next(iter(model.fff_layers()))
+    g = torch.Generator(device="cpu").manual_seed(0)
+    x = torch.randn(4, 8, layer.in_features, generator=g)
+    y_pt = layer.forward_hard(x)
+    y_cpp = layer.forward_hard_cpp(x)
+    max_abs = float((y_pt - y_cpp).abs().max().item())
+    ok = bool(torch.allclose(y_pt, y_cpp, atol=1e-5, rtol=1e-5))
+    if not ok:
+        raise AssertionError(
+            f"C++ hard routing diverges from PyTorch (max |Δ|={max_abs:.3e})"
+        )
+    return {"ok": True, "skipped": False, "max_abs_diff": max_abs}
+
+
 class FFFGenerator:
     """Hard-routing text generator bound to a loaded checkpoint."""
 
@@ -290,10 +337,12 @@ class FFFGenerator:
         model: FFFTransformer,
         tokenizer: Tokenizer,
         device: torch.device | None = None,
+        fff_mode: str = "hard",
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.device = device or next(model.parameters()).device
+        self.fff_mode = fff_mode
         self.model.to(self.device)
         self.model.eval()
         self.param_stats = compute_param_stats(model)
@@ -306,7 +355,7 @@ class FFFGenerator:
         temperature: float = 1.0,
         top_k: int | None = None,
     ) -> str:
-        """Autoregressive generation with ``mode="hard"`` and BPE decode."""
+        """Autoregressive generation with hard / hard_cpp FFF and BPE decode."""
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be >= 0")
         ids = self.tokenizer.encode(prompt)
@@ -320,7 +369,7 @@ class FFFGenerator:
                 if input_ids.size(1) <= self.model.config.block_size
                 else input_ids[:, -self.model.config.block_size :]
             )
-            logits, _ = self.model(idx_cond, mode="hard")
+            logits, _ = self.model(idx_cond, mode=self.fff_mode)  # type: ignore[arg-type]
             logits = logits[:, -1, :] / max(temperature, 1e-8)
             if top_k is not None:
                 values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -339,7 +388,7 @@ class FFFGenerator:
         temperature: float = 1.0,
         top_k: int | None = None,
         warmup: int = 2,
-    ) -> tuple[str, dict[str, float | int]]:
+    ) -> tuple[str, dict[str, float | int | str]]:
         if warmup > 0 and max_new_tokens > 0:
             self.generate(
                 prompt,
@@ -357,11 +406,12 @@ class FFFGenerator:
         )
         elapsed_s = time.perf_counter() - t0
         ms_per_token = (elapsed_s * 1000.0) / max(max_new_tokens, 1)
-        stats: dict[str, float | int] = {
+        stats: dict[str, float | int | str] = {
             "max_new_tokens": max_new_tokens,
             "elapsed_s": elapsed_s,
             "ms_per_token": ms_per_token,
             "tokens_per_s": max_new_tokens / max(elapsed_s, 1e-12),
+            "fff_mode": self.fff_mode,
             "total_model_params": self.param_stats.total_model_params,
             "total_fff_params": self.param_stats.total_fff_params,
             "fff_active_params_per_token": self.param_stats.fff_active_per_token,
@@ -373,8 +423,12 @@ class FFFGenerator:
         return text, stats
 
 
-def print_stats(stats: dict[str, float | int], param_stats: ParamStats) -> None:
+def print_stats(
+    stats: dict[str, float | int | str],
+    param_stats: ParamStats,
+) -> None:
     print("\n=== Hard-routing inference stats ===")
+    print(f"FFF backend:        {stats.get('fff_mode', 'hard')}")
     print(f"Time per token:     {stats['ms_per_token']:.3f} ms/token")
     print(f"Throughput:         {stats['tokens_per_s']:.2f} tokens/s")
     print(f"Generated tokens:   {stats['max_new_tokens']}")
@@ -420,6 +474,13 @@ def build_argparser() -> argparse.ArgumentParser:
         help="auto (cuda>mps>cpu) | cuda | mps | cpu",
     )
     p.add_argument(
+        "--fff-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "pytorch", "cpp"],
+        help="FFF hard routing: pytorch | cpp (CPU) | auto (cpp on CPU if available)",
+    )
+    p.add_argument(
         "--skip-verify",
         action="store_true",
         help="Skip hard-routing branch-skip verification",
@@ -434,6 +495,12 @@ def main() -> None:
     apply_hardware_optimizations(device)
     print_device_info(device)
 
+    fff_mode = resolve_fff_mode(args.fff_backend, device)  # type: ignore[arg-type]
+    print(
+        f"FFF routing mode: {fff_mode} "
+        f"(backend={args.fff_backend}, cpp_available={is_fff_cpp_available()})"
+    )
+
     print(f"Loading checkpoint: {args.checkpoint}")
     model, tokenizer, ckpt = load_checkpoint(Path(args.checkpoint), device=device)
     step = ckpt.get("step", "?")
@@ -443,7 +510,7 @@ def main() -> None:
         f"fff_depth={model.config.fff_depth} | block_size={model.config.block_size}"
     )
 
-    generator = FFFGenerator(model, tokenizer, device=device)
+    generator = FFFGenerator(model, tokenizer, device=device, fff_mode=fff_mode)
 
     if not args.skip_verify:
         print("\nVerifying hard routing skips unselected branches...")
@@ -455,6 +522,13 @@ def main() -> None:
             f"{result['num_leaves_skipped']} leaves "
             f"(path routers={result['router_ids']}, leaf={result['leaf_id']})"
         )
+        if device.type == "cpu":
+            print("Verifying C++ hard matches PyTorch hard...")
+            cpp_check = verify_cpp_matches_pytorch(model)
+            if cpp_check.get("skipped"):
+                print(f"  skipped ({cpp_check.get('reason')})")
+            else:
+                print(f"  OK — max |Δ|={cpp_check['max_abs_diff']:.3e}")
 
     text, stats = generator.generate_with_stats(
         prompt=args.prompt,

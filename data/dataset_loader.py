@@ -4,13 +4,14 @@ Provides:
 * ``tiktoken`` GPT-2 BPE encode/decode helpers
 * ``get_wikitext_data()`` — download WikiText-2 / WikiText-103, tokenize,
   and cache as a memory-mapped ``uint16`` ``.bin`` file under ``data/``
-* ``BPEDataset`` — sliding windows of ``block_size`` tokens for causal LM
+* ``BPEDataset`` — **non-overlapping** windows of ``block_size`` tokens
+  (``stride = block_size`` by default; never ``stride = 1``)
 
 Example
 -------
 >>> from data.dataset_loader import get_wikitext_data, BPEDataset
 >>> paths = get_wikitext_data(variant="wikitext-2", block_size=256)
->>> train_ds = BPEDataset(paths["train"], block_size=256)
+>>> train_ds = BPEDataset(paths["train"], block_size=256)  # ~9.3k samples on WT-2
 """
 
 from __future__ import annotations
@@ -437,6 +438,10 @@ def get_wikitext_data(
 class BPEDataset(Dataset):
     """Causal LM windows over a GPT-2 BPE ``uint16`` memory-mapped token file.
 
+    Uses **non-overlapping** chunks by default (``stride = block_size``).
+    For WikiText-2 (~2.39M tokens) with ``block_size=256`` this yields ~9.3k
+    samples instead of ~2.39M overlapping windows (``stride=1``).
+
     Each item:
         ``x``: ``(block_size,)`` LongTensor — input token ids
         ``y``: ``(block_size,)`` LongTensor — next-token targets (``x`` shifted +1)
@@ -448,14 +453,27 @@ class BPEDataset(Dataset):
         :func:`get_wikitext_data`.
     block_size:
         Context length ``T`` (default ``256``).
+    stride:
+        Step between consecutive window starts. Defaults to ``block_size``
+        (non-overlapping). Must be ``>= 1``.
     """
 
-    def __init__(self, bin_path: str | Path, block_size: int = 256) -> None:
+    def __init__(
+        self,
+        bin_path: str | Path,
+        block_size: int = 256,
+        stride: int | None = None,
+    ) -> None:
         if block_size < 1:
             raise ValueError(f"block_size must be >= 1, got {block_size}")
         self.bin_path = Path(bin_path)
         self.block_size = block_size
+        # Non-overlapping chunks: stride == block_size (never stride=1 by default).
+        self.stride = int(block_size if stride is None else stride)
+        if self.stride < 1:
+            raise ValueError(f"stride must be >= 1, got {self.stride}")
         self.data = load_token_array(self.bin_path)
+        # Need block_size + 1 tokens per sample (inputs + next-token target).
         if len(self.data) <= block_size:
             raise ValueError(
                 f"token file {self.bin_path} has {len(self.data)} tokens; "
@@ -463,11 +481,22 @@ class BPEDataset(Dataset):
             )
 
     def __len__(self) -> int:
-        return len(self.data) - self.block_size
+        # Starts at 0, stride, 2*stride, ... while start + block_size < n
+        # (need one extra token for the shifted target).
+        max_start = len(self.data) - self.block_size - 1
+        if max_start < 0:
+            return 0
+        return max_start // self.stride + 1
 
     def __getitem__(self, idx: int) -> tuple[Tensor, Tensor]:
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"index {idx} out of range for length {len(self)}")
+        start = idx * self.stride
         # Copy out of the memmap so the tensor owns contiguous storage.
-        chunk = np.array(self.data[idx : idx + self.block_size + 1], dtype=np.int64)
+        chunk = np.array(
+            self.data[start : start + self.block_size + 1],
+            dtype=np.int64,
+        )
         x = torch.from_numpy(chunk[:-1])
         y = torch.from_numpy(chunk[1:])
         return x, y
@@ -481,12 +510,13 @@ def build_wikitext_datasets(
     variant: WikiVariant = "wikitext-2",
     block_size: int = 256,
     cache_dir: str | Path | None = None,
+    stride: int | None = None,
 ) -> tuple[BPEDataset, BPEDataset, BPEDataset, dict]:
     """Convenience: cache WikiText + return ``(train, val, test, meta)`` datasets."""
     meta = get_wikitext_data(variant=variant, block_size=block_size, cache_dir=cache_dir)
-    train_ds = BPEDataset(meta["train"], block_size=block_size)
-    val_ds = BPEDataset(meta["validation"], block_size=block_size)
-    test_ds = BPEDataset(meta["test"], block_size=block_size)
+    train_ds = BPEDataset(meta["train"], block_size=block_size, stride=stride)
+    val_ds = BPEDataset(meta["validation"], block_size=block_size, stride=stride)
+    test_ds = BPEDataset(meta["test"], block_size=block_size, stride=stride)
     return train_ds, val_ds, test_ds, meta
 
 
@@ -517,7 +547,8 @@ def main() -> None:
     train_ds = BPEDataset(meta["train"], block_size=args.block_size)
     x, y = train_ds[0]
     print(
-        f"OK | vocab={meta['vocab_size']} | train_windows={len(train_ds):,} | "
+        f"OK | vocab={meta['vocab_size']} | tokens={train_ds.num_tokens:,} | "
+        f"train_chunks={len(train_ds):,} (stride={train_ds.stride}) | "
         f"x.shape={tuple(x.shape)} y.shape={tuple(y.shape)} | "
         f"sample decode: {decode_tokens(x[:32].tolist())!r}"
     )

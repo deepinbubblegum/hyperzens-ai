@@ -8,9 +8,12 @@ with dynamic ``λ`` and FFF temperature annealing ``τ: 1.0 → 0.02``.
 Optimisation
 ------------
 * AdamW + **LR warmup + cosine decay** (``lr → min_lr``)
-* **Gradient accumulation** (default 4) for larger effective batch on ~12GB VRAM
-* Mixed precision via ``device_utils.amp_autocast`` / ``GradScaler`` (CUDA)
-* Cross-platform device: CUDA → MPS → CPU
+* Micro-batch ``batch_size=8`` × ``grad_accum_steps=8`` (effective 64) for ~12GB VRAM
+* Mixed precision: CUDA autocast ``float16`` for forward + CE (logits stay fp16)
+* ``torch.compile`` on CUDA with ``mode="default"`` (not ``reduce-overhead`` when
+  ``grad_accum_steps > 1`` — CUDA Graphs would corrupt accumulated grads)
+* DataLoader workers + ``pin_memory`` + ``persistent_workers`` on CUDA
+* Caps: ``max_epochs=5``, ``max_steps=3000``
 """
 
 from __future__ import annotations
@@ -22,6 +25,9 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+# Reduce CUDA allocator fragmentation before importing torch.
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 import torch.nn as nn
@@ -67,15 +73,16 @@ class TrainConfig:
     # Data
     wiki_variant: str = "wikitext-2"  # or wikitext-103
 
-    # Optimisation (12GB-friendly micro-batch + accumulation)
+    # Optimisation (RTX 3060 12GB — small micro-batch, same effective batch 64)
     batch_size: int = 8
-    grad_accum_steps: int = 4  # effective batch = batch_size * grad_accum_steps
+    grad_accum_steps: int = 8  # effective batch = 8 * 8 = 64
     lr: float = 3e-4
     min_lr: float = 3e-5
     weight_decay: float = 0.1
-    max_epochs: int = 3
+    max_epochs: int = 5
     grad_clip: float = 1.0
-    compile_model: bool = False  # safer default for large FFF + AMP
+    compile_model: bool = True  # torch.compile on CUDA only
+    compile_mode: str = "default"  # avoid reduce-overhead with grad accumulation
     lr_warmup_frac: float = 0.05  # fraction of optimizer steps for LR warmup
 
     # FFF routing schedule
@@ -90,13 +97,13 @@ class TrainConfig:
     eval_batches: int = 20
     seed: int = 42
     device: str = "auto"
-    num_workers: int = 0
+    num_workers: int = 4
     checkpoint_path: str = CHECKPOINT_NAME
     wandb: bool = False
     wandb_project: str = "fff-transformer"
     data_dir: str = str(DATA_DIR)
     steps_per_epoch: int | None = None
-    max_steps: int | None = None
+    max_steps: int | None = 3000  # hard cap so training finishes in a reasonable time
 
 
 # ---------------------------------------------------------------------------
@@ -170,19 +177,78 @@ def set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
 # ---------------------------------------------------------------------------
 
 
-def maybe_compile(model: FFFTransformer, enabled: bool, device: torch.device) -> FFFTransformer:
+def maybe_compile(
+    model: FFFTransformer,
+    enabled: bool,
+    device: torch.device,
+    mode: str = "default",
+    grad_accum_steps: int = 1,
+) -> FFFTransformer:
+    """Compile with ``torch.compile`` on CUDA when requested.
+
+    Uses ``mode="default"`` by default. ``reduce-overhead`` enables CUDA Graphs,
+    which overwrite gradient buffers across micro-batches and is **unsafe** when
+    ``grad_accum_steps > 1`` — in that case we force ``"default"``.
+    """
     if not enabled:
+        return model
+    if device.type != "cuda":
+        print(f"torch.compile skipped (device={device.type}; CUDA only)")
         return model
     if not hasattr(torch, "compile"):
         print("torch.compile unavailable — skipping")
         return model
+
+    compile_mode = mode
+    if grad_accum_steps > 1 and compile_mode == "reduce-overhead":
+        print(
+            "torch.compile: refusing mode='reduce-overhead' with "
+            f"grad_accum_steps={grad_accum_steps} (CUDA Graphs vs grad accum); "
+            "using mode='default'"
+        )
+        compile_mode = "default"
+
     try:
-        compiled = torch.compile(model, mode="default")  # type: ignore[assignment]
-        print(f"torch.compile enabled (device={device.type})")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        # Prefer explicit default mode (equivalent to torch.compile(model)).
+        compiled = torch.compile(model, mode=compile_mode)  # type: ignore[assignment]
+        print(
+            f"torch.compile enabled (mode={compile_mode!r}, device={device.type}, "
+            f"grad_accum_steps={grad_accum_steps})"
+        )
         return compiled  # type: ignore[return-value]
     except Exception as exc:  # pragma: no cover
-        print(f"torch.compile skipped ({exc})")
+        print(f"torch.compile mode={compile_mode!r} failed ({exc}); using eager model")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         return model
+
+
+def make_dataloader(
+    dataset: BPEDataset,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    pin_memory: bool,
+    drop_last: bool,
+    device: torch.device,
+) -> DataLoader:
+    """Build a DataLoader with CUDA-friendly worker / pin_memory settings."""
+    kwargs: dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "drop_last": drop_last,
+        "pin_memory": pin_memory,
+    }
+    # persistent_workers requires num_workers > 0; enable on CUDA for throughput.
+    if num_workers > 0 and device.type == "cuda":
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 2
+    return DataLoader(**kwargs)
 
 
 def unwrap_model(model: nn.Module) -> nn.Module:
@@ -196,7 +262,11 @@ def compute_batch_loss(
     lambda_balance: float,
     mode: str,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """``input_ids, targets: (B, T)`` → ``(total, ce, balance)``."""
+    """``input_ids, targets: (B, T)`` → ``(total, ce, balance)``.
+
+    Caller must wrap this in :func:`amp_autocast` so the forward pass and
+    ``F.cross_entropy`` run under CUDA ``float16`` autocast (logits stay fp16).
+    """
     logits, balance_loss = model(input_ids, mode=mode)
     if logits.ndim != 3 or logits.shape[:2] != input_ids.shape:
         raise RuntimeError(
@@ -208,6 +278,7 @@ def compute_batch_loss(
             f"LM head width {logits.size(-1)} != vocab_size "
             f"{unwrap_model(model).config.vocab_size}"  # type: ignore[union-attr]
         )
+    # Keep CE inside the outer autocast context (do not cast logits to fp32 here).
     ce = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
     if mode == "soft":
         total = ce + lambda_balance * balance_loss
@@ -375,12 +446,27 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default=d.device)
     p.add_argument("--num-workers", type=int, default=d.num_workers)
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=d.compile_model)
+    p.add_argument(
+        "--compile-mode",
+        type=str,
+        default=d.compile_mode,
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help=(
+            "torch.compile mode (CUDA). Do not use reduce-overhead with "
+            "grad_accum_steps>1 (CUDA Graphs overwrite accumulated grads)."
+        ),
+    )
     p.add_argument("--checkpoint-path", type=str, default=d.checkpoint_path)
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", type=str, default=d.wandb_project)
     p.add_argument("--data-dir", type=str, default=d.data_dir)
     p.add_argument("--steps-per-epoch", type=int, default=None)
-    p.add_argument("--max-steps", type=int, default=None, help="Cap on optimizer steps")
+    p.add_argument(
+        "--max-steps",
+        type=int,
+        default=d.max_steps,
+        help="Cap on optimizer steps (default 3000; use 0 for no cap)",
+    )
     return p
 
 
@@ -402,6 +488,7 @@ def train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         max_epochs=args.max_epochs,
         grad_clip=args.grad_clip,
         compile_model=args.compile,
+        compile_mode=args.compile_mode,
         init_temp=args.init_temp,
         min_temp=args.min_temp,
         temp_warmup_frac=args.temp_warmup_frac,
@@ -417,7 +504,7 @@ def train_config_from_args(args: argparse.Namespace) -> TrainConfig:
         wandb_project=args.wandb_project,
         data_dir=args.data_dir,
         steps_per_epoch=args.steps_per_epoch,
-        max_steps=args.max_steps,
+        max_steps=None if args.max_steps == 0 else args.max_steps,
     )
 
 
@@ -440,22 +527,24 @@ def main() -> None:
     assert int(meta["vocab_size"]) == cfg.vocab_size == GPT2_VOCAB_SIZE
     _ = get_gpt2_encoding()  # ensure tiktoken is importable early
 
-    pin_memory = pin_memory_for(device)
-    train_loader = DataLoader(
+    pin_memory = bool(pin_memory_for(device) or device.type == "cuda")
+    train_loader = make_dataloader(
         train_ds,
         batch_size=cfg.batch_size,
         shuffle=True,
         num_workers=cfg.num_workers,
-        drop_last=True,
         pin_memory=pin_memory,
+        drop_last=True,
+        device=device,
     )
-    val_loader = DataLoader(
+    val_loader = make_dataloader(
         val_ds,
         batch_size=cfg.batch_size,
         shuffle=False,
         num_workers=cfg.num_workers,
-        drop_last=False,
         pin_memory=pin_memory,
+        drop_last=False,
+        device=device,
     )
 
     model_cfg = FFFConfig(
@@ -471,7 +560,15 @@ def main() -> None:
     )
     model = FFFTransformer(model_cfg).to(device)
     assert_embed_lm_alignment(model)
-    model = maybe_compile(model, enabled=cfg.compile_model, device=device)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    model = maybe_compile(
+        model,
+        enabled=cfg.compile_model,
+        device=device,
+        mode=cfg.compile_mode,
+        grad_accum_steps=cfg.grad_accum_steps,
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -497,7 +594,8 @@ def main() -> None:
         f"D={cfg.n_embd} L={cfg.n_layer} H={cfg.n_head} fff_depth={cfg.fff_depth} | "
         f"batch={cfg.batch_size}×accum={cfg.grad_accum_steps} "
         f"(eff={cfg.batch_size * cfg.grad_accum_steps}) | "
-        f"train_windows={len(train_ds):,} | opt_steps={total_opt_steps} | "
+        f"train_chunks={len(train_ds):,} (stride={train_ds.stride}) | "
+        f"opt_steps={total_opt_steps} | "
         f"τ={cfg.init_temp}→{cfg.min_temp} | lr={cfg.lr}→{cfg.min_lr}"
     )
 
@@ -534,6 +632,10 @@ def main() -> None:
                 break
             if epoch_micro >= micro_per_epoch:
                 break
+
+            # Start of a new accumulation cycle: clear grads before micro-batch 0.
+            if accum_count == 0:
+                optimizer.zero_grad(set_to_none=True)
 
             input_ids = to_device(input_ids, device, non_blocking=pin_memory)
             targets = to_device(targets, device, non_blocking=pin_memory)
@@ -587,6 +689,7 @@ def main() -> None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
+                # End of accumulation cycle — clear before the next cycle begins.
                 optimizer.zero_grad(set_to_none=True)
                 accum_count = 0
                 global_opt_step += 1

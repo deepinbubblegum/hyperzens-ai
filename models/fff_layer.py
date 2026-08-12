@@ -9,12 +9,18 @@ Tree indexing (heap / breadth-first, 0-based):
     - Right child of ``i``: ``2*i + 2``
     - Leaf heap indices: ``[2^d - 1, 2^{d+1} - 2]``
     - Contiguous leaf id: ``heap_index - (2^d - 1)``
+
+Hard routing on CPU can use a JIT-compiled C++ extension
+(``csrc/fff_hard.cpp``) via :meth:`forward_hard_cpp`, with automatic
+fallback to the pure-PyTorch path if the toolchain is unavailable.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Literal
+import warnings
+from pathlib import Path
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -22,7 +28,89 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-RoutingMode = Literal["soft", "hard"]
+RoutingMode = Literal["soft", "hard", "hard_cpp"]
+
+# ---------------------------------------------------------------------------
+# Optional C++ hard-routing extension (JIT via torch.utils.cpp_extension)
+# ---------------------------------------------------------------------------
+
+_CSRC_DIR = Path(__file__).resolve().parent.parent / "csrc"
+_FFF_HARD_SRC = _CSRC_DIR / "fff_hard.cpp"
+
+_fff_hard_ext: Any | None = None
+_fff_hard_load_attempted: bool = False
+_fff_hard_load_error: BaseException | None = None
+
+
+def _load_fff_hard_ext(*, verbose: bool = False) -> Any | None:
+    """JIT-compile ``csrc/fff_hard.cpp`` once; return ``None`` on failure."""
+    global _fff_hard_ext, _fff_hard_load_attempted, _fff_hard_load_error
+    if _fff_hard_ext is not None:
+        return _fff_hard_ext
+    if _fff_hard_load_attempted:
+        return None
+    _fff_hard_load_attempted = True
+
+    if not _FFF_HARD_SRC.is_file():
+        _fff_hard_load_error = FileNotFoundError(_FFF_HARD_SRC)
+        warnings.warn(
+            f"FFF C++ hard kernel source missing: {_FFF_HARD_SRC}",
+            stacklevel=2,
+        )
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load
+    except ImportError as exc:  # pragma: no cover
+        _fff_hard_load_error = exc
+        warnings.warn(
+            f"torch.utils.cpp_extension unavailable ({exc}); "
+            "using PyTorch hard routing",
+            stacklevel=2,
+        )
+        return None
+
+    # Keep build artifacts inside the repo (avoids home-cache permission issues).
+    build_dir = _CSRC_DIR / ".build" / "fff_hard_cpp"
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+    # Ensure venv ``ninja`` is on PATH (PyTorch looks up the binary by name).
+    import os
+    import sys
+
+    venv_bin = str(Path(sys.executable).resolve().parent)
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    if venv_bin not in path_parts:
+        os.environ["PATH"] = venv_bin + os.pathsep + os.environ.get("PATH", "")
+
+    try:
+        _fff_hard_ext = load(
+            name="fff_hard_cpp",
+            sources=[str(_FFF_HARD_SRC)],
+            extra_cflags=["-O3"],
+            build_directory=str(build_dir),
+            verbose=verbose,
+        )
+        return _fff_hard_ext
+    except Exception as exc:  # noqa: BLE001 — toolchain / compile failures
+        _fff_hard_load_error = exc
+        warnings.warn(
+            f"FFF C++ hard kernel failed to compile ({exc.__class__.__name__}: {exc}); "
+            "falling back to PyTorch hard routing",
+            stacklevel=2,
+        )
+        return None
+
+
+def is_fff_cpp_available() -> bool:
+    """Return ``True`` if the C++ hard-routing extension loaded successfully."""
+    return _load_fff_hard_ext() is not None
+
+
+def fff_cpp_load_error() -> BaseException | None:
+    """Last C++ extension load error (if any), else ``None``."""
+    _load_fff_hard_ext()
+    return _fff_hard_load_error
 
 
 class FastFeedforwardLinear(nn.Module):
@@ -190,7 +278,9 @@ class FastFeedforwardLinear(nn.Module):
             Input tensor of shape ``(..., D_in)``.
         mode:
             ``"soft"`` — differentiable path mixture (training).
-            ``"hard"`` — discrete tree walk, single leaf (inference).
+            ``"hard"`` — discrete tree walk, single leaf (PyTorch).
+            ``"hard_cpp"`` — same semantics via CPU C++ kernel (falls back
+            to PyTorch if the extension is unavailable or ``x`` is not CPU).
 
         Returns
         -------
@@ -201,7 +291,11 @@ class FastFeedforwardLinear(nn.Module):
             return self.forward_soft(x)
         if mode == "hard":
             return self.forward_hard(x)
-        raise ValueError(f"mode must be 'soft' or 'hard', got {mode!r}")
+        if mode == "hard_cpp":
+            return self.forward_hard_cpp(x)
+        raise ValueError(
+            f"mode must be 'soft', 'hard', or 'hard_cpp', got {mode!r}"
+        )
 
     # ------------------------------------------------------------------
     # Soft routing (training)
@@ -343,6 +437,35 @@ class FastFeedforwardLinear(nn.Module):
         b_leaf = self.leaf_biases[leaf_ids]
         y = torch.einsum("ni,nio->no", flat, w_leaf) + b_leaf
         return y.view(*leading, self.out_features)
+
+    def forward_hard_cpp(self, x: Tensor) -> Tensor:
+        """Hard routing via the JIT C++ CPU kernel (exact PyTorch semantics).
+
+        Falls back to :meth:`forward_hard` when:
+        * the C++ extension failed to compile / load, or
+        * ``x`` is not on CPU (GPU callers keep the PyTorch path).
+
+        Inputs are forced contiguous float32 for the native kernel.
+        """
+        flat, leading = self._flatten_input(x)
+        if flat.device.type != "cpu":
+            return self.forward_hard(x)
+
+        ext = _load_fff_hard_ext()
+        if ext is None:
+            return self.forward_hard(x)
+
+        # Match C++ contract: float32 contiguous (N, D_in).
+        flat_f = flat.float().contiguous()
+        y = ext.fff_hard_forward_cpu(
+            flat_f,
+            self.router_weights.detach().float().contiguous(),
+            self.router_biases.detach().float().contiguous(),
+            self.leaf_weights.detach().float().contiguous(),
+            self.leaf_biases.detach().float().contiguous(),
+            int(self.depth),
+        )
+        return y.to(dtype=flat.dtype).view(*leading, self.out_features)
 
     def forward_hard_sequential(self, x: Tensor) -> Tensor:
         """Hard routing with explicit Python if-else (single-vector / debug).
@@ -624,16 +747,29 @@ def _demo_shapes() -> None:
     x = torch.randn(8, 16, 32)
     y_soft = layer(x, mode="soft")
     y_hard = layer(x, mode="hard")
+    y_cpp = layer(x, mode="hard_cpp")
     loss = layer.compute_balance_loss()
     assert y_soft.shape == (8, 16, 64)
     assert y_hard.shape == (8, 16, 64)
+    assert y_cpp.shape == (8, 16, 64)
     assert loss.ndim == 0
     # Hard sequential matches batched hard for one vector
     x0 = x[0, 0]
     y_seq = layer.forward_hard_sequential(x0)
     y_b = layer.forward_hard(x0.unsqueeze(0)).squeeze(0)
     assert torch.allclose(y_seq, y_b), (y_seq - y_b).abs().max()
+    # C++ hard must match PyTorch hard (or fall back identically).
+    assert torch.allclose(y_hard, y_cpp, atol=1e-5, rtol=1e-5), (
+        (y_hard - y_cpp).abs().max().item()
+    )
     # Soft → hard agreement at low temperature (near one-hot mixture)
     layer.set_temperature(1e-4)
     y_s = layer.forward_soft(x0.unsqueeze(0)).squeeze(0)
     assert torch.allclose(y_s, y_b, atol=1e-3), (y_s - y_b).abs().max()
+    print(
+        f"OK — soft/hard/cpp shapes agree; cpp_available={is_fff_cpp_available()}"
+    )
+
+
+if __name__ == "__main__":
+    _demo_shapes()
