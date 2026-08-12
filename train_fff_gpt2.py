@@ -27,7 +27,7 @@ grad accumulation. Default ``τ: 1.0 → 0.10`` over ``max_steps=5000`` on WikiT
 Example
 -------
     pip install transformers
-    python fff_distill.py --device cuda --max-steps 5000
+    python train_fff_gpt2.py --device cuda --max-steps 5000
 """
 
 from __future__ import annotations
@@ -47,6 +47,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+from fff_hf import annealed_tau, compute_leaf_entropy_loss
 
 from device_utils import (
     amp_autocast,
@@ -68,7 +70,7 @@ def _require_transformers() -> tuple[Any, Any, Any]:
         from transformers import GPT2Config, GPT2LMHeadModel, GPT2TokenizerFast
     except ImportError as exc:  # pragma: no cover
         raise SystemExit(
-            "fff_distill.py requires HuggingFace transformers:\n"
+            "train_fff_gpt2.py requires HuggingFace transformers:\n"
             "  pip install transformers\n"
             f"(import error: {exc})"
         ) from exc
@@ -390,27 +392,6 @@ def iter_fff_blocks(student: Any) -> Iterator[FFFBlock]:
 # ---------------------------------------------------------------------------
 
 
-def compute_leaf_entropy_loss(
-    routing_probs: Tensor,
-    eps: float = 1e-8,
-) -> Tensor:
-    """Mean-leaf occupancy entropy ``H(p) = -Σ_ℓ p̄_ℓ log p̄_ℓ`` (nats).
-
-    Higher entropy ⇒ more uniform leaf usage. Used as ``−λ H`` in the total
-    loss so the optimizer *maximizes* uniformity.
-
-    Parameters
-    ----------
-    routing_probs:
-        Soft leaf mixture ``(N, L)`` from one or more FFF layers (concat OK).
-    """
-    if routing_probs.ndim != 2:
-        raise ValueError(f"routing_probs must be (N, L), got {tuple(routing_probs.shape)}")
-    p_bar = routing_probs.mean(dim=0).clamp(min=eps)
-    p_bar = p_bar / p_bar.sum().clamp(min=eps)
-    return -(p_bar * p_bar.log()).sum()
-
-
 def gather_student_leaf_probs(student: Any) -> Tensor:
     """Concatenate cached leaf probs from all FFF blocks → ``(Σ N_ℓ, L)``."""
     chunks: list[Tensor] = []
@@ -639,7 +620,7 @@ def _load_wikitext2_text_from_zip(*, split: str = "train") -> str:
             try:
                 print(f"  downloading {url} ...")
                 req = urllib.request.Request(
-                    url, headers={"User-Agent": "hyperzens-ai/fff_distill"}
+                    url, headers={"User-Agent": "hyperzens-ai/train_fff_gpt2"}
                 )
                 with urllib.request.urlopen(req, timeout=120) as resp, open(
                     zip_path, "wb"
@@ -681,19 +662,7 @@ def _load_wikitext2_text_from_zip(*, split: str = "train") -> str:
 # ---------------------------------------------------------------------------
 # Schedules
 # ---------------------------------------------------------------------------
-
-
-def annealed_tau(
-    step: int,
-    total_steps: int,
-    tau_start: float = 1.0,
-    tau_end: float = 0.1,
-) -> float:
-    """Exponential ``τ: tau_start → tau_end`` over optimizer steps."""
-    if total_steps <= 1:
-        return tau_end
-    t = min(max(step, 0), total_steps - 1) / float(total_steps - 1)
-    return float(tau_start * (tau_end / tau_start) ** t)
+# ``annealed_tau`` lives in ``fff_hf`` (shared with train_fff_agent).
 
 
 def build_student_param_groups(

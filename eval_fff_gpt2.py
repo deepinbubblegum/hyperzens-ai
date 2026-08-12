@@ -12,7 +12,7 @@ repetition penalty, no-repeat n-grams) and reports tok/s.
 
 Example
 -------
-    python eval_distilled.py --checkpoint fff_distill_checkpoint.pt --device cuda
+    python eval_fff_gpt2.py --checkpoint fff_distill_checkpoint.pt --device cuda
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from device_utils import (
     print_device_info,
     resolve_device,
 )
-from fff_distill import (
+from train_fff_gpt2 import (
     TokenChunkDataset,
     build_fff_student_from_teacher,
     iter_fff_blocks,

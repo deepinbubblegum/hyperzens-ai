@@ -89,7 +89,7 @@ Leaf weights packed with fused Triton dequant (`models/fff_quant.py`):
 
 ### Hard-Aware Knowledge Distillation (GPT-2 124M → FFF Student)
 
-Pipeline: `fff_distill.py` + `eval_distilled.py` + `standalone_infer.py`
+Pipeline: `train_fff_gpt2.py` + `eval_fff_gpt2.py` + `chat_fff_gpt2.py`
 
 | Technique | Effect |
 | --- | --- |
@@ -208,24 +208,33 @@ STE: forward = argmax leaf               Optional INT8 / INT4 leaf packs
 
 ## Repository Layout
 
+Two main pipelines (names encode the role):
+
+| Script | Role |
+|--------|------|
+| `train_fff_gpt2.py` | Train GPT-2 FFF student |
+| `eval_fff_gpt2.py` | Eval GPT-2 FFF student |
+| `chat_fff_gpt2.py` | Chat with GPT-2 FFF student |
+| `train_fff_agent.py` | Train multi-skill FFF agent (CoT / Thai / code / tools) |
+| `chat_fff_agent.py` | Chat with FFF agent (`<think>` styling) |
+| `fff_swiglu.py` | FFF SwiGLU/GeGLU layer library |
+| `fff_hf.py` | Shared HF helpers (load / Top-K KL / ckpt) |
+
 ```
 hyperzens-ai/
-├── models/
-│   ├── fff_layer.py          # FastFeedforwardLinear (soft / hard / C++ / Triton)
-│   ├── fff_hard_triton.py    # CUDA Triton hard kernels + autotune
-│   ├── fff_quant.py          # INT8 / INT4 leaf quantization
-│   └── transformer.py        # StandardTransformer + FFFTransformer
-├── csrc/
-│   └── fff_hard.cpp          # OpenMP CPU hard-routing extension
-├── data/
-│   └── dataset_loader.py     # WikiText / BPE helpers
-├── train.py                  # Soft-routing LM training (TinyShakespeare / WikiText)
-├── infer.py                  # Hard-routing generation + param stats
-├── benchmark.py              # Dense vs FFF (CPU / CUDA / quant sweeps)
-├── fff_distill.py            # GPT-2 → FFF STE distillation
-├── eval_distilled.py         # Val PPL + sample generation
-├── standalone_infer.py       # Interactive Triton CLI
-├── device_utils.py           # CUDA / MPS / CPU helpers
+├── models/                   # fff_layer, Triton, quant, Transformer
+├── csrc/fff_hard.cpp         # OpenMP CPU hard routing
+├── data/                     # WikiText / BPE helpers
+├── train_fff_gpt2.py         # GPT-2 → FFF distill
+├── eval_fff_gpt2.py          # GPT-2 FFF PPL + samples
+├── chat_fff_gpt2.py          # GPT-2 FFF interactive chat
+├── fff_swiglu.py             # Modern LLM FFF (SwiGLU / GeGLU)
+├── fff_hf.py                 # Shared HF / distill helpers
+├── train_fff_agent.py        # Qwen-Coder FFF agent distill → fff_cot_agent.pt
+├── chat_fff_agent.py         # Agent CoT chat (Triton Hard)
+├── train.py / infer.py       # TinyShakespeare char-LM
+├── benchmark.py
+├── device_utils.py
 └── requirements.txt
 ```
 
@@ -268,18 +277,19 @@ python benchmark.py --n-tokens 50 --warmup 5 --n-embd 256 --n-layer 4
 
 ### 3. Knowledge Distillation
 
-```bash
-# GPT-2 Teacher → FFF Student (STE, differential LR, 5000 steps default)
-python fff_distill.py --device cuda --max-steps 5000
+**A) GPT-2 demo**
 
-# Validation PPL + nucleus sample generation
-python eval_distilled.py --checkpoint fff_distill_checkpoint.pt --device cuda
+```bash
+python train_fff_gpt2.py --device cuda --max-steps 5000
+python eval_fff_gpt2.py --checkpoint fff_distill_checkpoint.pt --device cuda
+python chat_fff_gpt2.py --checkpoint fff_distill_checkpoint.pt --device cuda
 ```
 
-### 4. Interactive Triton CLI
+**B) Multi-skill FFF agent (Thai / code / tools / CoT)**
 
 ```bash
-python standalone_infer.py --checkpoint fff_distill_checkpoint.pt --device cuda
+python train_fff_agent.py --device cuda --max-steps 4000
+python chat_fff_agent.py --checkpoint fff_cot_agent.pt --device cuda
 ```
 
 ```
@@ -306,9 +316,9 @@ python infer.py --checkpoint fff_checkpoint.pt --device cpu --fff-backend cpp
 | Script | Routing | Purpose |
 | --- | --- | --- |
 | `train.py` | Soft + τ anneal + balance loss | Train `FFFTransformer` LM |
-| `fff_distill.py` | **STE hard-aware** soft train | Distill GPT-2 MLP → FFF leaves |
-| `eval_distilled.py` | Soft eval / Hard Triton eval | PPL table + generation |
-| `standalone_infer.py` | Triton Hard | Interactive production-style CLI |
+| `train_fff_gpt2.py` | **STE hard-aware** soft train | Distill GPT-2 MLP → FFF leaves |
+| `eval_fff_gpt2.py` | Soft eval / Hard Triton eval | PPL table + generation |
+| `chat_fff_gpt2.py` | Triton Hard | Interactive production-style CLI |
 
 **Distill defaults (high level):** `lr_leaf=3e-4`, `lr_router=1e-4`, `CosineAnnealingLR`, `max_steps=5000`, checkpoint → `fff_distill_checkpoint.pt`.
 
@@ -318,7 +328,7 @@ python infer.py --checkpoint fff_checkpoint.pt --device cpu --fff-backend cpp
 
 ## Inference CLI
 
-`standalone_infer.py` loads the distilled student, forces **Triton CUDA Hard** when available, warms kernels with a dummy forward, then serves:
+`chat_fff_gpt2.py` loads the distilled student, forces **Triton CUDA Hard** when available, warms kernels with a dummy forward, then serves:
 
 - Nucleus sampling + repetition controls  
 - Precise **`torch.cuda.Event`** timing → tok/s, ms/token, token count  
@@ -418,7 +428,7 @@ If you use HyperZens AI in research or products, please also star / cite this re
 
 ### กลั่นความรู้แบบ Hard-Aware (GPT-2 124M → FFF Student)
 
-ไปป์ไลน์: `fff_distill.py` + `eval_distilled.py` + `standalone_infer.py`
+ไปป์ไลน์: `train_fff_gpt2.py` + `eval_fff_gpt2.py` + `chat_fff_gpt2.py`
 
 | เทคนิค | ผลลัพธ์ |
 | --- | --- |
@@ -518,18 +528,27 @@ STE: ฟอร์เวิร์ด = ใบ argmax               รองร�
 
 ## โครงสร้างรีโพสิทอรี
 
+| สคริปต์ | หน้าที่ |
+|---------|--------|
+| `train_fff_gpt2.py` | ฝึก FFF จาก GPT-2 |
+| `eval_fff_gpt2.py` | ประเมิน FFF (GPT-2) |
+| `chat_fff_gpt2.py` | แชท FFF (GPT-2) |
+| `train_fff_agent.py` | ฝึก FFF agent (CoT / ไทย / โค้ด / เครื่องมือ) |
+| `chat_fff_agent.py` | แชท agent + สไตล์ `<think>` |
+| `fff_swiglu.py` | ไลบรารี FFF SwiGLU/GeGLU |
+| `fff_hf.py` | ตัวช่วยโหลด HF / Top-K KL / checkpoint |
+
 ```
 hyperzens-ai/
-├── models/           # FFF layer, Triton, quant, Transformer
-├── csrc/             # C++ OpenMP hard routing
-├── data/             # WikiText / BPE
-├── train.py          # ฝึก LM แบบ soft routing
-├── infer.py          # อนุมาน hard + สถิติพารามิเตอร์
-├── benchmark.py      # Dense กับ FFF (CPU / CUDA / quant)
-├── fff_distill.py    # กลั่น GPT-2 → FFF (STE)
-├── eval_distilled.py # PPL + สร้างข้อความตัวอย่าง
-├── standalone_infer.py  # CLI อินเทอร์แอ็กทีฟ Triton
-└── requirements.txt
+├── models/                   # FFF core / Triton / quant
+├── train_fff_gpt2.py         # กลั่น GPT-2 → FFF
+├── eval_fff_gpt2.py          # PPL + ตัวอย่างข้อความ (GPT-2)
+├── chat_fff_gpt2.py          # แชท GPT-2 FFF
+├── fff_swiglu.py / fff_hf.py # ไลบรารีโมเดิร์น LLM
+├── train_fff_agent.py        # กลั่น agent → fff_cot_agent.pt
+├── chat_fff_agent.py         # แชท CoT ไทย
+├── train.py / infer.py       # TinyShakespeare
+└── benchmark.py
 ```
 
 ---
@@ -564,15 +583,19 @@ python benchmark.py --device cuda --precision both
 
 ### 3. กลั่นความรู้
 
+**A) เดโม GPT-2**
+
 ```bash
-python fff_distill.py --device cuda --max-steps 5000
-python eval_distilled.py --checkpoint fff_distill_checkpoint.pt --device cuda
+python train_fff_gpt2.py --device cuda --max-steps 5000
+python eval_fff_gpt2.py --checkpoint fff_distill_checkpoint.pt --device cuda
+python chat_fff_gpt2.py --checkpoint fff_distill_checkpoint.pt --device cuda
 ```
 
-### 4. CLI อินเทอร์แอ็กทีฟ Triton
+**B) FFF agent หลายทักษะ (ไทย / โค้ด / เครื่องมือ / CoT)**
 
 ```bash
-python standalone_infer.py --checkpoint fff_distill_checkpoint.pt --device cuda
+python train_fff_agent.py --device cuda --max-steps 4000
+python chat_fff_agent.py --checkpoint fff_cot_agent.pt --device cuda
 ```
 
 พิมพ์ `exit` / `quit` หรือกด `Ctrl+C` เพื่อออก
@@ -591,9 +614,9 @@ python infer.py --checkpoint fff_checkpoint.pt --device cpu --fff-backend cpp
 | สคริปต์ | Routing | วัตถุประสงค์ |
 | --- | --- | --- |
 | `train.py` | Soft + anneal τ + balance loss | ฝึก `FFFTransformer` |
-| `fff_distill.py` | **STE hard-aware** | กลั่น MLP ของ GPT-2 → ใบ FFF |
-| `eval_distilled.py` | Soft eval / Hard Triton | ตาราง PPL + สร้างข้อความ |
-| `standalone_infer.py` | Triton Hard | CLI สไตล์โปรดักชัน |
+| `train_fff_gpt2.py` | **STE hard-aware** | กลั่น MLP ของ GPT-2 → ใบ FFF |
+| `eval_fff_gpt2.py` | Soft eval / Hard Triton | ตาราง PPL + สร้างข้อความ |
+| `chat_fff_gpt2.py` | Triton Hard | CLI สไตล์โปรดักชัน |
 
 **ค่าเริ่มต้นกลั่น (โดยสรุป):** `lr_leaf=3e-4`, `lr_router=1e-4`, `CosineAnnealingLR`, `max_steps=5000`, บันทึกที่ `fff_distill_checkpoint.pt`
 
@@ -603,7 +626,7 @@ python infer.py --checkpoint fff_checkpoint.pt --device cpu --fff-backend cpp
 
 ## CLI อนุมาน
 
-`standalone_infer.py` โหลดสตูเดนต์ที่กลั่นแล้ว บังคับ **Triton CUDA Hard** เมื่อมี วอร์มเคอร์เนลด้วย dummy forward แล้วให้บริการ:
+`chat_fff_gpt2.py` โหลดสตูเดนต์ที่กลั่นแล้ว บังคับ **Triton CUDA Hard** เมื่อมี วอร์มเคอร์เนลด้วย dummy forward แล้วให้บริการ:
 
 - Nucleus sampling + ควบคุมการซ้ำ  
 - จับเวลาด้วย **`torch.cuda.Event`** → tok/s, ms/token, จำนวนโทเคน  

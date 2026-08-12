@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Shared HF / FFF-SwiGLU helpers for ultimate distill + CoT chat.
+"""Shared HuggingFace helpers for FFF-SwiGLU agent training and chat.
 
-Keeps teacher/student loading, Top-K KL, and checkpoint restore in one place
-so legacy ``distill_*.py`` / ``eval_*.py`` scripts can be removed.
+Used by:
+* ``train_fff_agent.py`` — multi-domain CoT / tool / code / Thai distill
+* ``chat_fff_agent.py`` — interactive Triton Hard chat
+
+Includes BF16 autocast, 4-bit teacher load, FFF student patch, Top-K KL,
+temperature annealing, and checkpoint restore.
 """
 
 from __future__ import annotations
@@ -17,14 +21,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from fff_distill import compute_leaf_entropy_loss
-from fff_modern_llm import (
+from fff_swiglu import (
     iter_fff_swiglu_blocks,
     patch_model_with_fff_swiglu,
     set_fff_routing_mode,
     set_fff_temperature,
 )
 from models.fff_hard_triton import is_triton_available
+
+
+def annealed_tau(
+    step: int,
+    total_steps: int,
+    tau_start: float = 1.0,
+    tau_end: float = 0.1,
+) -> float:
+    """Exponential FFF temperature ``τ: tau_start → tau_end`` over steps."""
+    if total_steps <= 1:
+        return tau_end
+    t = min(max(step, 0), total_steps - 1) / float(total_steps - 1)
+    return float(tau_start * (tau_end / tau_start) ** t)
+
+
+def compute_leaf_entropy_loss(
+    routing_probs: Tensor,
+    eps: float = 1e-8,
+) -> Tensor:
+    """Mean-leaf occupancy entropy ``H(p) = -Σ_ℓ p̄_ℓ log p̄_ℓ`` (nats)."""
+    if routing_probs.ndim != 2:
+        raise ValueError(
+            f"routing_probs must be (N, L), got {tuple(routing_probs.shape)}"
+        )
+    p_bar = routing_probs.mean(dim=0).clamp(min=eps)
+    p_bar = p_bar / p_bar.sum().clamp(min=eps)
+    return -(p_bar * p_bar.log()).sum()
 
 
 def _require_transformers() -> tuple[Any, Any]:

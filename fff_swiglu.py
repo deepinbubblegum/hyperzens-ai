@@ -15,10 +15,10 @@ with a gated-GLU Fast Feedforward tree:
 
 Example
 -------
-    python fff_modern_llm.py --model Qwen/Qwen2.5-0.5B --device cuda
-    python fff_modern_llm.py --model HuggingFaceTB/SmolLM2-360M --device cuda
-    python fff_modern_llm.py --smoke-synthetic   # no HF download
-    python fff_modern_llm.py --smoke-synthetic-geglu
+    python fff_swiglu.py --model Qwen/Qwen2.5-0.5B --device cuda
+    python fff_swiglu.py --model HuggingFaceTB/SmolLM2-360M --device cuda
+    python fff_swiglu.py --smoke-synthetic   # no HF download
+    python fff_swiglu.py --smoke-synthetic-geglu
 """
 
 from __future__ import annotations

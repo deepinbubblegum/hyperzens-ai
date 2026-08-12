@@ -42,9 +42,9 @@ Checkpoint
 
 Example
 -------
-    python distill_ultimate_fff.py --device cuda --max-steps 4000
-    python distill_ultimate_fff.py --teacher-name deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-    python distill_ultimate_fff.py --smoke-synthetic-data --max-steps 20
+    python train_fff_agent.py --device cuda --max-steps 4000
+    python train_fff_agent.py --teacher-name deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+    python train_fff_agent.py --smoke-synthetic-data --max-steps 20
 """
 
 from __future__ import annotations
@@ -72,8 +72,8 @@ from device_utils import (
     print_device_info,
     resolve_device,
 )
-from fff_distill import annealed_tau
-from fff_hf_utils import (
+from fff_hf import (
+    annealed_tau,
     bf16_autocast,
     build_fff_student,
     build_student_param_groups,
@@ -84,7 +84,7 @@ from fff_hf_utils import (
     resolve_compute_dtype,
     topk_kl_distill_loss,
 )
-from fff_modern_llm import (
+from fff_swiglu import (
     iter_fff_swiglu_blocks,
     set_fff_temperature,
 )

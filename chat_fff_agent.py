@@ -18,7 +18,7 @@ Commands
 
 Example
 -------
-    python cot_chat_thai.py --checkpoint fff_cot_agent.pt --device cuda
+    python chat_fff_agent.py --checkpoint fff_cot_agent.pt --device cuda
 """
 
 from __future__ import annotations
@@ -40,13 +40,13 @@ from device_utils import (
     print_device_info,
     resolve_device,
 )
-from eval_distilled import (
+from eval_fff_gpt2 import (
     _apply_no_repeat_ngram,
     _apply_repetition_penalty,
     _topk_topp_filter,
 )
-from fff_hf_utils import load_student_from_checkpoint, resolve_compute_dtype
-from fff_modern_llm import iter_fff_swiglu_blocks, warmup_fff_swiglu
+from fff_hf import load_student_from_checkpoint, resolve_compute_dtype
+from fff_swiglu import iter_fff_swiglu_blocks, warmup_fff_swiglu
 from models.fff_hard_triton import is_triton_available
 
 DEFAULT_CHECKPOINT = Path("fff_cot_agent.pt")
