@@ -13,3 +13,5 @@ datasets>=2.18.0
 # Optional: needed to JIT-compile csrc/fff_hard.cpp (torch.utils.cpp_extension)
 setuptools>=68.0.0
 ninja>=1.11.0
+# Optional GPU hard-routing (Linux CUDA / RTX 3060)
+triton>=2.1.0; platform_system=="Linux"

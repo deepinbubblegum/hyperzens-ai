@@ -11,15 +11,17 @@ Execution
     python benchmark.py --device cuda --skip-cpu
     python benchmark.py --device cpu
 
-    # Faster smoke / custom size
-    python benchmark.py --n-tokens 50 --warmup 5 --n-embd 256 --n-layer 4
+    # CUDA batch-size scaling (Dense vs FFF Triton crossover)
+    python benchmark.py --device cuda --skip-cpu --batch-sweep
 
-    # Match a trained checkpoint's config
-    python benchmark.py --checkpoint fff_checkpoint.pt
+    # FP16 Tensor Core sweep (Ampere)
+    python benchmark.py --device cuda --skip-cpu --batch-sweep --precision fp16
 
 Notes
 -----
-* Compares Dense MLP vs FFF PyTorch hard vs FFF C++ hard (CPU).
+* Compares Dense MLP vs FFF PyTorch hard vs FFF C++ hard (CPU) / Triton (CUDA).
+* On CUDA, optionally sweeps batch sizes to find where FFF Triton beats Dense.
+* ``--precision fp16|bf16|fp32|both`` casts models for Tensor Core paths (default: both fp32+fp16 on CUDA sweeps).
 * By default benchmarks the auto-detected accelerator **and** CPU for a
   side-by-side report (skip CPU with ``--skip-cpu``).
 * Peak RAM via ``psutil`` when available, else ``tracemalloc`` fallback.
@@ -48,6 +50,7 @@ from device_utils import (
     resolve_device,
 )
 from models.fff_layer import is_fff_cpp_available
+from models.fff_hard_triton import is_triton_available, warmup_fff_model_triton
 from models.transformer import FFFConfig, FFFTransformer, StandardTransformer
 
 # ---------------------------------------------------------------------------
@@ -176,6 +179,30 @@ def make_fff_cpp_step(model: FFFTransformer) -> Callable[[Tensor], Tensor]:
 
     def step(idx: Tensor) -> Tensor:
         logits, _ = model(idx, mode="hard_cpp")
+        return logits
+
+    return step
+
+
+def make_fff_triton_step(model: FFFTransformer) -> Callable[[Tensor], Tensor]:
+    """Hard routing through the fused Triton CUDA kernel (``mode='triton'``)."""
+
+    def step(idx: Tensor) -> Tensor:
+        logits, _ = model(idx, mode="triton")
+        return logits
+
+    return step
+
+
+def make_fff_triton_quant_step(
+    model: FFFTransformer,
+    quant_mode: str,
+) -> Callable[[Tensor], Tensor]:
+    """Triton hard routing with INT8/INT4 leaf weights (``triton_int8`` / ``triton_int4``)."""
+    mode = "triton_int8" if quant_mode == "int8" else "triton_int4"
+
+    def step(idx: Tensor) -> Tensor:
+        logits, _ = model(idx, mode=mode)  # type: ignore[arg-type]
         return logits
 
     return step
@@ -366,15 +393,16 @@ def _cell(text: str, width: int) -> str:
 def print_comparison_table(
     dense: ModelBenchResult,
     fff: ModelBenchResult,
-    fff_cpp: ModelBenchResult | None = None,
+    fff_alt: ModelBenchResult | None = None,
+    *,
+    alt_name: str = "FFF Alt Hard",
 ) -> None:
-    """ASCII summary: Dense vs FFF PyTorch Hard vs optional FFF C++ Hard."""
-    has_cpp = fff_cpp is not None
+    """ASCII summary: Dense vs FFF PyTorch Hard vs optional third backend."""
     names = ["Standard Dense", "FFF PyTorch Hard"]
-    results = [dense, fff]
-    if has_cpp:
-        names.append("FFF C++ Hard")
-        results.append(fff_cpp)  # type: ignore[arg-type]
+    results: list[ModelBenchResult] = [dense, fff]
+    if fff_alt is not None:
+        names.append(alt_name)
+        results.append(fff_alt)
 
     col0 = 34
     col_w = 20
@@ -456,11 +484,11 @@ def print_comparison_table(
         "Memory backend: "
         + " | ".join(f"{n}={r.memory.backend}" for n, r in zip(names, results))
     )
-    if has_cpp and fff_cpp is not None:
-        cpp_vs_pt = fff_cpp.multi.tokens_per_s / max(fff.multi.tokens_per_s, 1e-12)
+    if fff_alt is not None:
+        alt_vs_pt = fff_alt.multi.tokens_per_s / max(fff.multi.tokens_per_s, 1e-12)
         print(
-            f"FFF C++ vs PyTorch Hard (multi-thread): {cpp_vs_pt:.2f}x "
-            f"({fff_cpp.multi.tokens_per_s:.2f} / {fff.multi.tokens_per_s:.2f} tok/s)"
+            f"{alt_name} vs PyTorch Hard (multi-thread): {alt_vs_pt:.2f}x "
+            f"({fff_alt.multi.tokens_per_s:.2f} / {fff.multi.tokens_per_s:.2f} tok/s)"
         )
     print(
         f"FFF FFN sparsity: hard-active "
@@ -511,6 +539,49 @@ def build_argparser() -> argparse.ArgumentParser:
         "--skip-cpu",
         action="store_true",
         help="Do not also run a CPU baseline when primary device is a GPU",
+    )
+    p.add_argument(
+        "--batch-sweep",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="On CUDA: run Dense vs FFF Triton batch-size scaling (default: on)",
+    )
+    p.add_argument(
+        "--batch-sizes",
+        type=str,
+        default="1,2,4,8,16,32,64,128,256",
+        help=(
+            "Comma-separated batch sizes for CUDA batch sweep "
+            "(FP16 also probes 512 when VRAM allows)"
+        ),
+    )
+    p.add_argument(
+        "--batch-sweep-tokens",
+        type=int,
+        default=100,
+        help="Timed new tokens per sequence in batch sweep (default 100)",
+    )
+    p.add_argument(
+        "--batch-sweep-prompt-len",
+        type=int,
+        default=32,
+        help="Prompt length for batch sweep (default 32)",
+    )
+    p.add_argument(
+        "--precision",
+        type=str,
+        default="both",
+        choices=("fp32", "fp16", "bf16", "both"),
+        help=(
+            "Compute dtype for CUDA batch sweep: fp32, fp16, bf16, or both "
+            "(fp32 then fp16; default both)"
+        ),
+    )
+    p.add_argument(
+        "--quant-sweep",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="On CUDA: run FP16 vs INT8 vs INT4 Triton quant sweep (default: on)",
     )
     return p
 
@@ -625,13 +696,14 @@ def run_pair_on_device(
         f"peak_RAM={fff_mem.peak_generate_mb:.1f} MB"
     )
 
-    fff_cpp_result: ModelBenchResult | None = None
+    fff_alt_result: ModelBenchResult | None = None
+    alt_name = "FFF Alt Hard"
     if device.type == "cpu":
+        alt_name = "FFF C++ Hard"
         print("\n[3/3] Benchmarking FFFTransformer (C++ mode=hard_cpp)...")
         if not is_fff_cpp_available():
             print("  SKIP — C++ extension unavailable (fallback-only)")
         else:
-            # Numerical check: one forward must match PyTorch hard.
             with torch.no_grad():
                 layer = next(iter(fff_model.fff_layers()))
                 probe = torch.randn(8, layer.in_features)
@@ -644,21 +716,20 @@ def run_pair_on_device(
                     )
                 print(f"  numerical match OK (max |Δ|={max_abs:.3e})")
 
-            fff_cpp_step = make_fff_cpp_step(fff_model)
-            # Reuse loaded model; measure a short gen for RAM peak.
+            fff_alt_step = make_fff_cpp_step(fff_model)
             generate_timed(
-                fff_cpp_step,
+                fff_alt_step,
                 prompt.clone(),
                 min(32, n_tokens),
                 config.block_size,
             )
-            cpp_mem = MemoryResult(
+            alt_mem = MemoryResult(
                 baseline_mb=fff_mem.baseline_mb,
                 after_load_mb=fff_mem.after_load_mb,
                 peak_generate_mb=_rss_mb(),
                 backend=fff_mem.backend,
             )
-            cpp_param = ModelParamReport(
+            alt_param = ModelParamReport(
                 name="FFF C++ Hard Routing",
                 total_params=fff_param.total_params,
                 active_params_per_token=fff_param.active_params_per_token,
@@ -666,46 +737,132 @@ def run_pair_on_device(
                 ffn_stored=fff_param.ffn_stored,
                 ffn_active=fff_param.ffn_active,
             )
-            cpp_single = benchmark_speed(
-                fff_cpp_step,
+            alt_single = benchmark_speed(
+                fff_alt_step,
                 prompt,
                 config.block_size,
                 n_tokens,
                 warmup,
                 num_threads=1,
             )
-            cpp_multi = benchmark_speed(
-                fff_cpp_step,
+            alt_multi = benchmark_speed(
+                fff_alt_step,
                 prompt,
                 config.block_size,
                 n_tokens,
                 warmup,
                 num_threads=cpu_count,
             )
-            fff_cpp_result = ModelBenchResult(
-                param=cpp_param,
-                memory=cpp_mem,
-                single=cpp_single,
-                multi=cpp_multi,
+            fff_alt_result = ModelBenchResult(
+                param=alt_param,
+                memory=alt_mem,
+                single=alt_single,
+                multi=alt_multi,
             )
             print(
-                f"  params={cpp_param.total_params:,} | "
-                f"speed={cpp_multi.tokens_per_s:.2f} tok/s | "
-                f"latency={cpp_multi.ms_per_token:.3f} ms | "
-                f"peak_RAM={cpp_mem.peak_generate_mb:.1f} MB"
+                f"  params={alt_param.total_params:,} | "
+                f"speed={alt_multi.tokens_per_s:.2f} tok/s | "
+                f"latency={alt_multi.ms_per_token:.3f} ms | "
+                f"peak_RAM={alt_mem.peak_generate_mb:.1f} MB"
+            )
+    elif device.type == "cuda":
+        alt_name = "FFF Triton CUDA Hard"
+        print("\n[3/3] Benchmarking FFFTransformer (Triton CUDA mode=triton)...")
+        if not is_triton_available():
+            print("  SKIP — Triton not installed (`pip install triton`)")
+        else:
+            with torch.no_grad():
+                layer = next(iter(fff_model.fff_layers()))
+                probe = torch.randn(
+                    8, layer.in_features, device=device, dtype=torch.float32
+                )
+                y_pt = layer.forward_hard(probe)
+                y_tr = layer.forward_hard_triton(probe)
+                max_abs = float((y_pt - y_tr).abs().max().item())
+                if not torch.allclose(y_pt, y_tr, atol=1e-3, rtol=1e-3):
+                    raise AssertionError(
+                        f"Triton hard ≠ PyTorch hard (max |Δ|={max_abs:.3e})"
+                    )
+                print(f"  numerical match OK (max |Δ|={max_abs:.3e})")
+
+            # Autotune + CUDA compile BEFORE timed runs (cost excluded from latency).
+            print(
+                "  warming up Triton autotuner / CUDA compile "
+                "(excluded from benchmark timing)..."
+            )
+            warmup_fff_model_triton(
+                fff_model,
+                sample_tokens=max(prompt.size(1), 32),
+                n_iters=max(5, warmup),
+            )
+            _sync_device(device)
+            print("  Triton warmup done — starting timed runs")
+
+            fff_alt_step = make_fff_triton_step(fff_model)
+            generate_timed(
+                fff_alt_step,
+                prompt.clone(),
+                min(32, n_tokens),
+                config.block_size,
+            )
+            _sync_device(device)
+            alt_mem = MemoryResult(
+                baseline_mb=fff_mem.baseline_mb,
+                after_load_mb=fff_mem.after_load_mb,
+                peak_generate_mb=_rss_mb(),
+                backend=fff_mem.backend,
+            )
+            alt_param = ModelParamReport(
+                name="FFF Triton CUDA Hard",
+                total_params=fff_param.total_params,
+                active_params_per_token=fff_param.active_params_per_token,
+                active_pct=fff_param.active_pct,
+                ffn_stored=fff_param.ffn_stored,
+                ffn_active=fff_param.ffn_active,
+            )
+            # GPU: thread count is less meaningful; still report 1 vs multi for table.
+            alt_single = benchmark_speed(
+                fff_alt_step,
+                prompt,
+                config.block_size,
+                n_tokens,
+                warmup,
+                num_threads=1,
+            )
+            alt_multi = benchmark_speed(
+                fff_alt_step,
+                prompt,
+                config.block_size,
+                n_tokens,
+                warmup,
+                num_threads=cpu_count,
+            )
+            fff_alt_result = ModelBenchResult(
+                param=alt_param,
+                memory=alt_mem,
+                single=alt_single,
+                multi=alt_multi,
+            )
+            print(
+                f"  params={alt_param.total_params:,} | "
+                f"speed={alt_multi.tokens_per_s:.2f} tok/s | "
+                f"latency={alt_multi.ms_per_token:.3f} ms | "
+                f"peak_RAM={alt_mem.peak_generate_mb:.1f} MB"
             )
     else:
-        print("\n[3/3] FFF C++ Hard skipped (CPU-only kernel)")
+        print(f"\n[3/3] Alt FFF backend skipped on device={device.type}")
 
     print(f"\n=== Dense vs FFF on {device.type.upper()} ===")
-    print_comparison_table(dense_result, fff_result, fff_cpp_result)
+    print_comparison_table(
+        dense_result, fff_result, fff_alt_result, alt_name=alt_name
+    )
 
     del fff_model
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    return dense_result, fff_result, fff_cpp_result
+    return dense_result, fff_result, fff_alt_result
 
 
 def print_gpu_vs_cpu_summary(
@@ -726,6 +883,595 @@ def print_gpu_vs_cpu_summary(
     print("=" * 72)
 
 
+# ---------------------------------------------------------------------------
+# CUDA batch-size scaling (Dense vs FFF Triton crossover)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BatchSweepRow:
+    """One row of the CUDA batch-size scaling table."""
+
+    batch_size: int
+    dense_tok_s: float
+    fff_tok_s: float
+    speedup: float
+    dense_peak_ram_mb: float
+    fff_peak_ram_mb: float
+    dense_ms_per_tok: float = float("nan")
+    fff_ms_per_tok: float = float("nan")
+    note: str = ""
+
+
+def _precision_to_dtype(name: str) -> torch.dtype:
+    """Map CLI precision name to a torch.dtype."""
+    key = name.lower().strip()
+    if key in ("fp16", "float16", "half"):
+        return torch.float16
+    if key in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    if key in ("fp32", "float32", "float"):
+        return torch.float32
+    raise ValueError(f"unknown precision {name!r}")
+
+
+def _dtype_label(dtype: torch.dtype) -> str:
+    if dtype == torch.float16:
+        return "FP16"
+    if dtype == torch.bfloat16:
+        return "BF16"
+    return "FP32"
+
+
+def _cast_model_(model: nn.Module, dtype: torch.dtype) -> nn.Module:
+    """In-place cast of floating parameters / buffers to ``dtype``."""
+    if dtype == torch.float32:
+        return model.float()
+    if dtype == torch.float16:
+        return model.half()
+    if dtype == torch.bfloat16:
+        return model.to(dtype=torch.bfloat16)
+    raise TypeError(f"unsupported model dtype {dtype}")
+
+
+def _cuda_peak_ram_mb(device: torch.device, host_rss_mb: float) -> float:
+    """Prefer CUDA allocator peak when on GPU; else host RSS."""
+    if device.type == "cuda" and torch.cuda.is_available():
+        return float(torch.cuda.max_memory_allocated(device)) / (1024.0 * 1024.0)
+    return host_rss_mb
+
+
+@torch.no_grad()
+def _time_batched_generate(
+    forward_step: Callable[[Tensor], Tensor],
+    prompt: Tensor,
+    block_size: int,
+    n_tokens: int,
+    warmup_tokens: int,
+) -> tuple[float, float, float]:
+    """Warmup (untimed) then time greedy generation.
+
+    Returns ``(tokens_per_s, ms_per_token, peak_ram_mb)`` where tokens =
+    ``B * n_tokens``.
+    """
+    device = prompt.device
+    batch_size = int(prompt.size(0))
+
+    if warmup_tokens > 0:
+        generate_timed(forward_step, prompt.clone(), warmup_tokens, block_size)
+        _sync_device(device)
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+
+    rss_before = _rss_mb()
+    _ids, elapsed = generate_timed(
+        forward_step, prompt.clone(), n_tokens, block_size
+    )
+    _sync_device(device)
+    rss_after = _rss_mb()
+    peak_host = max(rss_before, rss_after, _peak_traced_mb() + rss_before)
+    peak_ram = _cuda_peak_ram_mb(device, peak_host)
+
+    total_new_tokens = batch_size * n_tokens
+    tok_s = total_new_tokens / max(elapsed, 1e-12)
+    ms_per_tok = (elapsed * 1000.0) / max(total_new_tokens, 1)
+    return tok_s, ms_per_tok, peak_ram
+
+
+def print_batch_scaling_table(
+    rows: list[BatchSweepRow],
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> None:
+    """Print Dense vs FFF Triton throughput / latency / VRAM across batch sizes."""
+    label = _dtype_label(dtype)
+    headers = [
+        "Batch",
+        "Dense tok/s",
+        "FFF tok/s",
+        "Speedup",
+        "Dense ms/tok",
+        "FFF ms/tok",
+        "Peak VRAM Dense",
+        "Peak VRAM FFF",
+    ]
+    widths = [8, 13, 12, 10, 14, 12, 16, 14]
+
+    def fmt_row(cells: list[str]) -> str:
+        parts = []
+        for cell, w in zip(cells, widths):
+            parts.append(f" {cell:<{w - 1}}")
+        return "|" + "|".join(parts) + "|"
+
+    sep = "+" + "+".join("-" * w for w in widths) + "+"
+    print("\n" + "=" * 100)
+    print(f"CUDA Batch Scaling Summary — Dense MLP vs FFF Triton Hard ({label})")
+    print(
+        "Columns: Throughput (tok/s) | Latency (ms/tok) | "
+        "Speedup (FFF/Dense) | Peak VRAM (MB)"
+    )
+    print("=" * 100)
+    print(sep)
+    print(fmt_row(headers))
+    print(sep)
+
+    crossover: int | None = None
+    max_ok: int | None = None
+    for row in rows:
+        if row.note:
+            cells = [
+                str(row.batch_size),
+                "OOM/SKIP",
+                "OOM/SKIP",
+                "—",
+                "—",
+                "—",
+                "—",
+                "—",
+            ]
+        else:
+            cells = [
+                str(row.batch_size),
+                f"{row.dense_tok_s:.2f}",
+                f"{row.fff_tok_s:.2f}",
+                f"{row.speedup:.2f}x",
+                f"{row.dense_ms_per_tok:.3f}",
+                f"{row.fff_ms_per_tok:.3f}",
+                f"{row.dense_peak_ram_mb:.1f}",
+                f"{row.fff_peak_ram_mb:.1f}",
+            ]
+            max_ok = row.batch_size
+            if crossover is None and row.speedup >= 1.0:
+                crossover = row.batch_size
+        print(fmt_row(cells))
+    print(sep)
+
+    if crossover is not None:
+        print(
+            f"Crossover ({label}): FFF Triton surpasses Dense at "
+            f"batch_size >= {crossover}"
+        )
+    else:
+        ok = [r for r in rows if not r.note]
+        if ok:
+            best = max(ok, key=lambda r: r.speedup)
+            print(
+                f"No crossover in this {label} sweep (FFF best speedup "
+                f"{best.speedup:.2f}x at batch_size={best.batch_size})."
+            )
+        else:
+            print(f"No successful {label} batch-size measurements (all OOM/SKIP).")
+
+    if max_ok is not None:
+        print(f"Max achieved batch_size ({label}): {max_ok}")
+    oom_rows = [r for r in rows if r.note == "OOM"]
+    if oom_rows:
+        first_oom = min(r.batch_size for r in oom_rows)
+        print(
+            f"VRAM limit hit ({label}): OOM at batch_size={first_oom} "
+            f"(larger sizes not attempted)."
+        )
+    print("=" * 100)
+
+
+def run_cuda_batch_scaling_benchmark(
+    device: torch.device,
+    config: FFFConfig,
+    ckpt_path: Path | None,
+    *,
+    batch_sizes: list[int] | None = None,
+    prompt_len: int = 32,
+    n_tokens: int = 100,
+    warmup: int = 10,
+    seed: int = 42,
+    dtype: torch.dtype = torch.float32,
+) -> list[BatchSweepRow]:
+    """Sweep batch sizes on CUDA: Standard Dense vs FFF Triton hard routing.
+
+    Models and activations run in ``dtype`` (``float32`` / ``float16`` /
+    ``bfloat16``). Token ids remain ``int64``; embeddings emit ``dtype``.
+    """
+    if device.type != "cuda":
+        print("Batch-size scaling skipped (CUDA only).")
+        return []
+    if not is_triton_available():
+        print(
+            "Batch-size scaling skipped — Triton unavailable "
+            "(`pip install triton`)."
+        )
+        return []
+    if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        print("Batch-size scaling skipped — BF16 not supported on this GPU.")
+        return []
+
+    batch_sizes = batch_sizes or [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    # FP16/BF16: also probe 512 when VRAM allows (OOM stop below).
+    if dtype in (torch.float16, torch.bfloat16) and 512 not in batch_sizes:
+        batch_sizes = list(batch_sizes) + [512]
+    label = _dtype_label(dtype)
+    apply_hardware_optimizations(device)
+
+    print("\n" + "-" * 72)
+    print(f"CUDA Batch Size Scaling ({label}) — Dense vs FFF Triton")
+    print("-" * 72)
+    print(
+        f"dtype={label} | batch_sizes={batch_sizes} | prompt_len={prompt_len} | "
+        f"timed={n_tokens} | warmup={warmup}"
+    )
+
+    torch.manual_seed(seed)
+
+    def _build_dense() -> StandardTransformer:
+        m = StandardTransformer(config).to(device)
+        _cast_model_(m, dtype)
+        m.eval()
+        return m
+
+    def _build_fff() -> FFFTransformer:
+        m = FFFTransformer(config).to(device)
+        if ckpt_path is not None:
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            m.load_state_dict(ckpt["model_state_dict"])
+        _cast_model_(m, dtype)
+        m.eval()
+        return m
+
+    print(f"Loading StandardTransformer (Dense, {label})...")
+    dense_model = _build_dense()
+    dense_step = make_dense_step(dense_model)
+
+    print(f"Loading FFFTransformer (Triton mode, {label})...")
+    fff_model = _build_fff()
+    fff_step = make_fff_triton_step(fff_model)
+
+    print(
+        f"Warming up Triton autotuner / CUDA compile [{label}] "
+        "(excluded from batch-sweep timing)..."
+    )
+    warmup_fff_model_triton(
+        fff_model,
+        sample_tokens=max(prompt_len, 32),
+        n_iters=max(5, warmup),
+    )
+    _sync_device(device)
+    warm_prompt = torch.randint(
+        0, config.vocab_size, (1, prompt_len), device=device, dtype=torch.long
+    )
+    generate_timed(fff_step, warm_prompt, min(8, n_tokens), config.block_size)
+    generate_timed(dense_step, warm_prompt.clone(), min(8, n_tokens), config.block_size)
+    _sync_device(device)
+    print(f"Warmup done — starting {label} batch-size sweep")
+
+    rows: list[BatchSweepRow] = []
+    max_achieved: int | None = None
+    for bsz in batch_sizes:
+        print(f"\n  [{label}] batch_size={bsz} ...")
+        try:
+            prompt = torch.randint(
+                0,
+                config.vocab_size,
+                (bsz, prompt_len),
+                device=device,
+                dtype=torch.long,
+            )
+            dense_tok_s, dense_ms, dense_ram = _time_batched_generate(
+                dense_step,
+                prompt,
+                config.block_size,
+                n_tokens,
+                warmup_tokens=warmup,
+            )
+            fff_tok_s, fff_ms, fff_ram = _time_batched_generate(
+                fff_step,
+                prompt,
+                config.block_size,
+                n_tokens,
+                warmup_tokens=warmup,
+            )
+            speedup = fff_tok_s / max(dense_tok_s, 1e-12)
+            row = BatchSweepRow(
+                batch_size=bsz,
+                dense_tok_s=dense_tok_s,
+                fff_tok_s=fff_tok_s,
+                speedup=speedup,
+                dense_peak_ram_mb=dense_ram,
+                fff_peak_ram_mb=fff_ram,
+                dense_ms_per_tok=dense_ms,
+                fff_ms_per_tok=fff_ms,
+            )
+            max_achieved = bsz
+            print(
+                f"    Dense={dense_tok_s:.2f} tok/s ({dense_ms:.3f} ms/tok) | "
+                f"FFF Triton={fff_tok_s:.2f} tok/s ({fff_ms:.3f} ms/tok) | "
+                f"speedup={speedup:.2f}x | "
+                f"Peak VRAM D/F={dense_ram:.1f}/{fff_ram:.1f} MB"
+            )
+            rows.append(row)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            row = BatchSweepRow(
+                batch_size=bsz,
+                dense_tok_s=float("nan"),
+                fff_tok_s=float("nan"),
+                speedup=float("nan"),
+                dense_peak_ram_mb=float("nan"),
+                fff_peak_ram_mb=float("nan"),
+                note="OOM",
+            )
+            rows.append(row)
+            if max_achieved is not None:
+                print(
+                    f"    OOM at batch_size={bsz} — stopping sweep "
+                    f"(max achieved batch_size={max_achieved})."
+                )
+            else:
+                print(
+                    f"    OOM at batch_size={bsz} — stopping sweep "
+                    "(no successful batch sizes)."
+                )
+            break
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    print_batch_scaling_table(rows, dtype=dtype)
+
+    del dense_model, fff_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    return rows
+
+
+@dataclass
+class QuantSweepRow:
+    """One row of the FP16 vs INT8 vs INT4 comparison table."""
+
+    batch_size: int
+    mode: str
+    tok_s: float
+    ms_per_tok: float
+    max_abs_err: float
+    leaf_vram_mb: float
+    peak_vram_mb: float
+    note: str = ""
+
+
+def run_cuda_quant_sweep_benchmark(
+    device: torch.device,
+    config: FFFConfig,
+    ckpt_path: Path | None,
+    *,
+    batch_sizes: list[int] | None = None,
+    prompt_len: int = 32,
+    n_tokens: int = 50,
+    warmup: int = 5,
+    seed: int = 42,
+) -> list[QuantSweepRow]:
+    """Compare FP16 vs INT8 vs INT4 Triton FFF across selected batch sizes."""
+    from models.fff_quant import (
+        attach_leaf_qstates,
+        clear_leaf_qstates,
+        estimate_leaf_vram_mb,
+        quantize_fff_model_leaves,
+        total_quant_leaf_vram_mb,
+    )
+
+    if device.type != "cuda":
+        print("Quant sweep skipped (CUDA only).")
+        return []
+    if not is_triton_available():
+        print("Quant sweep skipped — Triton unavailable.")
+        return []
+
+    batch_sizes = batch_sizes or [1, 16, 64, 256, 512]
+    apply_hardware_optimizations(device)
+    torch.manual_seed(seed)
+
+    print("\n" + "-" * 72)
+    print("CUDA Quant Sweep — FP16 vs INT8 vs INT4 (FFF Triton)")
+    print("-" * 72)
+    print(f"batch_sizes={batch_sizes} | prompt_len={prompt_len} | timed={n_tokens}")
+
+    model = FFFTransformer(config).to(device)
+    if ckpt_path is not None:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+    model.half().eval()
+
+    # Leaf VRAM footprint (all layers) for reporting.
+    leaf_fp16_mb = 0.0
+    for layer in model.fff_layers():
+        leaf_fp16_mb += estimate_leaf_vram_mb(layer.leaf_weights.data, "fp16")
+
+    int8_states = quantize_fff_model_leaves(model, "int8")
+    int4_states = quantize_fff_model_leaves(model, "int4")
+    leaf_int8_mb = total_quant_leaf_vram_mb(int8_states)
+    leaf_int4_mb = total_quant_leaf_vram_mb(int4_states)
+
+    print(
+        f"Leaf weight storage: FP16={leaf_fp16_mb:.2f} MB | "
+        f"INT8={leaf_int8_mb:.2f} MB | INT4={leaf_int4_mb:.2f} MB"
+    )
+
+    fp16_step = make_fff_triton_step(model)
+    warmup_fff_model_triton(model, sample_tokens=max(prompt_len, 32), n_iters=3)
+
+    # Probe tensors for max |Δ| vs FP16 (single forward, not timed).
+    probe = torch.randint(
+        0, config.vocab_size, (1, min(prompt_len, 16)), device=device, dtype=torch.long
+    )
+    with torch.no_grad():
+        ref_logits, _ = model(probe, mode="triton")
+
+    attach_leaf_qstates(model, int8_states)
+    with torch.no_grad():
+        int8_logits, _ = model(probe, mode="triton_int8")  # type: ignore[arg-type]
+    max_err_int8 = float((int8_logits.float() - ref_logits.float()).abs().max().item())
+    clear_leaf_qstates(model)
+
+    attach_leaf_qstates(model, int4_states)
+    with torch.no_grad():
+        int4_logits, _ = model(probe, mode="triton_int4")  # type: ignore[arg-type]
+    max_err_int4 = float((int4_logits.float() - ref_logits.float()).abs().max().item())
+    clear_leaf_qstates(model)
+
+    print(
+        f"Max |Δ| vs FP16 (probe): INT8={max_err_int8:.4e} | INT4={max_err_int4:.4e}"
+    )
+
+    modes = [
+        ("fp16", fp16_step, leaf_fp16_mb, 0.0),
+        ("int8", None, leaf_int8_mb, max_err_int8),
+        ("int4", None, leaf_int4_mb, max_err_int4),
+    ]
+
+    rows: list[QuantSweepRow] = []
+    for bsz in batch_sizes:
+        print(f"\n  [quant] batch_size={bsz} ...")
+        prompt = torch.randint(
+            0, config.vocab_size, (bsz, prompt_len), device=device, dtype=torch.long
+        )
+        for mode_name, step, leaf_mb, max_err in modes:
+            try:
+                if mode_name == "fp16":
+                    clear_leaf_qstates(model)
+                    run_step = fp16_step
+                elif mode_name == "int8":
+                    attach_leaf_qstates(model, int8_states)
+                    run_step = make_fff_triton_quant_step(model, "int8")
+                else:
+                    attach_leaf_qstates(model, int4_states)
+                    run_step = make_fff_triton_quant_step(model, "int4")
+
+                tok_s, ms, peak = _time_batched_generate(
+                    run_step,
+                    prompt,
+                    config.block_size,
+                    n_tokens,
+                    warmup_tokens=warmup,
+                )
+                rows.append(
+                    QuantSweepRow(
+                        batch_size=bsz,
+                        mode=mode_name,
+                        tok_s=tok_s,
+                        ms_per_tok=ms,
+                        max_abs_err=max_err if mode_name != "fp16" else 0.0,
+                        leaf_vram_mb=leaf_mb,
+                        peak_vram_mb=peak,
+                    )
+                )
+                print(
+                    f"    {mode_name.upper():4s}: {tok_s:.2f} tok/s | "
+                    f"{ms:.3f} ms/tok | Δ={max_err if mode_name != 'fp16' else 0.0:.3e} | "
+                    f"leaf={leaf_mb:.2f} MB | peak={peak:.1f} MB"
+                )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                rows.append(
+                    QuantSweepRow(
+                        batch_size=bsz,
+                        mode=mode_name,
+                        tok_s=float("nan"),
+                        ms_per_tok=float("nan"),
+                        max_abs_err=max_err,
+                        leaf_vram_mb=leaf_mb,
+                        peak_vram_mb=float("nan"),
+                        note="OOM",
+                    )
+                )
+                print(f"    {mode_name.upper():4s}: OOM — stopping larger batches")
+                clear_leaf_qstates(model)
+                print_quant_sweep_table(rows)
+                del model
+                gc.collect()
+                torch.cuda.empty_cache()
+                return rows
+        clear_leaf_qstates(model)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    print_quant_sweep_table(rows)
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    return rows
+
+
+def print_quant_sweep_table(rows: list[QuantSweepRow]) -> None:
+    """Print FP16 / INT8 / INT4 throughput, error, and VRAM summary."""
+    headers = [
+        "Batch",
+        "Mode",
+        "tok/s",
+        "ms/tok",
+        "Max|Δ|",
+        "Leaf VRAM",
+        "Peak VRAM",
+    ]
+    widths = [8, 8, 12, 10, 12, 12, 12]
+
+    def fmt_row(cells: list[str]) -> str:
+        parts = [f" {c:<{w - 1}}" for c, w in zip(cells, widths)]
+        return "|" + "|".join(parts) + "|"
+
+    sep = "+" + "+".join("-" * w for w in widths) + "+"
+    print("\n" + "=" * 88)
+    print("Quant Sweep Summary — FP16 vs INT8 vs INT4 (FFF Triton)")
+    print("=" * 88)
+    print(sep)
+    print(fmt_row(headers))
+    print(sep)
+    for row in rows:
+        if row.note:
+            cells = [
+                str(row.batch_size),
+                row.mode.upper(),
+                "OOM",
+                "—",
+                f"{row.max_abs_err:.2e}",
+                f"{row.leaf_vram_mb:.2f}",
+                "—",
+            ]
+        else:
+            cells = [
+                str(row.batch_size),
+                row.mode.upper(),
+                f"{row.tok_s:.2f}",
+                f"{row.ms_per_tok:.3f}",
+                f"{row.max_abs_err:.2e}",
+                f"{row.leaf_vram_mb:.2f}",
+                f"{row.peak_vram_mb:.1f}",
+            ]
+        print(fmt_row(cells))
+    print(sep)
+    print("=" * 88)
+
+
 def main() -> None:
     args = build_argparser().parse_args()
     torch.set_grad_enabled(False)
@@ -739,6 +1485,7 @@ def main() -> None:
     print_device_info(primary)
     print(f"logical_cpus={cpu_count} | psutil={'yes' if _HAS_PSUTIL else 'NO (tracemalloc fallback)'}")
     print(f"FFF C++ hard extension: {'available' if is_fff_cpp_available() else 'UNAVAILABLE (PyTorch fallback)'}")
+    print(f"FFF Triton CUDA kernel: {'available' if is_triton_available() else 'UNAVAILABLE (pip install triton)'}")
     if not _HAS_PSUTIL:
         print(
             "WARNING: install psutil for accurate RSS peak memory "
@@ -806,6 +1553,49 @@ def main() -> None:
             cpu_count,
         )
         print_gpu_vs_cpu_summary(primary, fff_primary, fff_cpu)
+
+    # CUDA batch-size scaling: find Dense → FFF Triton crossover
+    if primary.type == "cuda" and args.batch_sweep:
+        try:
+            batch_sizes = [
+                int(x.strip())
+                for x in str(args.batch_sizes).split(",")
+                if x.strip()
+            ]
+        except ValueError:
+            print(
+                f"ERROR: invalid --batch-sizes {args.batch_sizes!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.precision == "both":
+            sweep_dtypes = [torch.float32, torch.float16]
+        else:
+            sweep_dtypes = [_precision_to_dtype(args.precision)]
+        for sweep_dtype in sweep_dtypes:
+            run_cuda_batch_scaling_benchmark(
+                primary,
+                config,
+                ckpt_path,
+                batch_sizes=batch_sizes,
+                prompt_len=args.batch_sweep_prompt_len,
+                n_tokens=args.batch_sweep_tokens,
+                warmup=args.warmup,
+                seed=args.seed,
+                dtype=sweep_dtype,
+            )
+
+    if primary.type == "cuda" and args.quant_sweep:
+        run_cuda_quant_sweep_benchmark(
+            primary,
+            config,
+            ckpt_path,
+            batch_sizes=[1, 16, 64, 256, 512],
+            prompt_len=args.batch_sweep_prompt_len,
+            n_tokens=min(50, args.batch_sweep_tokens),
+            warmup=max(3, args.warmup // 2),
+            seed=args.seed,
+        )
 
     torch.set_num_threads(cpu_count)
 

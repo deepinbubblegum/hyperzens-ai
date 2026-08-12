@@ -1,9 +1,15 @@
-// Fast Feedforward hard-routing CPU kernel.
+// Fast Feedforward hard-routing CPU kernel (cache-friendly + portable SIMD).
 //
-// For each token, walk the binary decision tree with threshold
-//   go_right = (w_router[i] · x + b_router[i]) > 0
-// then evaluate a single leaf affine map.
-// Parallelism: at::parallel_for over the flattened token axis.
+// Cross-platform:
+//   * macOS Apple Silicon (Apple Clang) — CPU local dev / benchmarks
+//   * Linux x86_64 GCC/Clang — production host (RTX 3060 box)
+//
+// Parallelism: at::parallel_for (works without -fopenmp on both platforms).
+// SIMD hints: OpenMP simd when _OPENMP is defined, else Clang/GCC loop pragmas.
+// GIL: released via py::gil_scoped_release so worker threads are not blocked.
+//
+// Leaf GEMV uses outer-D_in / inner-D_out so each W row is streamed
+// contiguously (L1/L2 friendly, auto-vectorizable).
 
 #include <torch/extension.h>
 #include <ATen/Parallel.h>
@@ -11,7 +17,22 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
-#include <vector>
+
+// Portable SIMD loop hints — compile cleanly on Apple Clang and GCC.
+#if defined(_OPENMP)
+#define FFF_PRAGMA_SIMD _Pragma("omp simd")
+#define FFF_PRAGMA_SIMD_REDUCTION_SCORE _Pragma("omp simd reduction(+ : score)")
+#elif defined(__clang__)
+#define FFF_PRAGMA_SIMD _Pragma("clang loop vectorize(enable) interleave(enable)")
+#define FFF_PRAGMA_SIMD_REDUCTION_SCORE \
+  _Pragma("clang loop vectorize(enable) interleave(enable)")
+#elif defined(__GNUC__)
+#define FFF_PRAGMA_SIMD _Pragma("GCC ivdep")
+#define FFF_PRAGMA_SIMD_REDUCTION_SCORE _Pragma("GCC ivdep")
+#else
+#define FFF_PRAGMA_SIMD
+#define FFF_PRAGMA_SIMD_REDUCTION_SCORE
+#endif
 
 namespace {
 
@@ -94,8 +115,9 @@ torch::Tensor fff_hard_forward_cpu(
   const int64_t leaf_base = num_leaves - 1;  // heap leaf index offset
   const int64_t leaf_stride = D_in * D_out;
 
-  // Grain size 0 → ATen picks a sensible split for the thread pool.
-  at::parallel_for(0, N, /*grain_size=*/0, [&](int64_t begin, int64_t end) {
+  // grain_size=1: fine-grained splits for small N (token gen / micro-batches).
+  // Uses PyTorch's intra-op thread pool (no hard dependency on -fopenmp).
+  at::parallel_for(0, N, /*grain_size=*/1, [&](int64_t begin, int64_t end) {
     for (int64_t n = begin; n < end; ++n) {
       const float* xn = x_ptr + n * D_in;
       float* yn = y_ptr + n * D_out;
@@ -105,7 +127,8 @@ torch::Tensor fff_hard_forward_cpu(
       for (int64_t d = 0; d < depth; ++d) {
         const float* wr = wr_ptr + node * D_in;
         float score = br_ptr[node];
-        // s = w · x + b  (naive gemv; depth is small, D_in dominates cost at leaf)
+        // s = w · x + b
+        FFF_PRAGMA_SIMD_REDUCTION_SCORE
         for (int64_t i = 0; i < D_in; ++i) {
           score += wr[i] * xn[i];
         }
@@ -125,13 +148,20 @@ torch::Tensor fff_hard_forward_cpu(
       const float* wl = wl_ptr + leaf_id * leaf_stride;
       const float* bl = bl_ptr + leaf_id * D_out;
 
-      // y = x @ W_leaf[leaf] + b   with W shaped (D_in, D_out), row-major
+      // y = x @ W_leaf[leaf] + b, W shaped (D_in, D_out) row-major.
+      // 1) seed yn with bias (contiguous stream)
+      FFF_PRAGMA_SIMD
       for (int64_t o = 0; o < D_out; ++o) {
-        float acc = bl[o];
-        for (int64_t i = 0; i < D_in; ++i) {
-          acc += xn[i] * wl[i * D_out + o];
+        yn[o] = bl[o];
+      }
+      // 2) outer i (D_in), inner o (D_out): each W row is contiguous.
+      for (int64_t i = 0; i < D_in; ++i) {
+        const float xi = xn[i];
+        const float* __restrict__ wl_row = wl + i * D_out;
+        FFF_PRAGMA_SIMD
+        for (int64_t o = 0; o < D_out; ++o) {
+          yn[o] += xi * wl_row[o];
         }
-        yn[o] = acc;
       }
     }
   });
@@ -149,5 +179,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("b_router"),
       py::arg("w_leaf"),
       py::arg("b_leaf"),
-      py::arg("depth"));
+      py::arg("depth"),
+      // Allow ATen worker threads to run without holding the GIL.
+      py::call_guard<py::gil_scoped_release>());
 }

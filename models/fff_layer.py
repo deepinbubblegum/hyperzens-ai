@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-RoutingMode = Literal["soft", "hard", "hard_cpp"]
+RoutingMode = Literal["soft", "hard", "hard_cpp", "triton", "triton_int8", "triton_int4"]
 
 # ---------------------------------------------------------------------------
 # Optional C++ hard-routing extension (JIT via torch.utils.cpp_extension)
@@ -43,13 +43,27 @@ _fff_hard_load_error: BaseException | None = None
 
 
 def _load_fff_hard_ext(*, verbose: bool = False) -> Any | None:
-    """JIT-compile ``csrc/fff_hard.cpp`` once; return ``None`` on failure."""
+    """Load ``fff_hard_cpp`` — prefer an installed wheel, else JIT-compile.
+
+    Compile flags come from ``csrc/compiler_flags.py`` (same as ``setup.py``):
+    macOS → ``-O3 -std=c++17`` (optional OpenMP); Linux → ``-O3 -march=native
+    -fopenmp -funroll-loops``. Retries without OpenMP if needed.
+    """
     global _fff_hard_ext, _fff_hard_load_attempted, _fff_hard_load_error
     if _fff_hard_ext is not None:
         return _fff_hard_ext
     if _fff_hard_load_attempted:
         return None
     _fff_hard_load_attempted = True
+
+    # 1) Prefer a setuptools-built extension (`pip install -e .` / setup.py).
+    try:
+        import fff_hard_cpp as installed  # type: ignore[import-not-found]
+
+        _fff_hard_ext = installed
+        return _fff_hard_ext
+    except ImportError:
+        pass
 
     if not _FFF_HARD_SRC.is_file():
         _fff_hard_load_error = FileNotFoundError(_FFF_HARD_SRC)
@@ -70,6 +84,27 @@ def _load_fff_hard_ext(*, verbose: bool = False) -> Any | None:
         )
         return None
 
+    # Shared aggressive flags with setup.py
+    try:
+        import sys as _sys
+
+        csrc_path = str(_CSRC_DIR)
+        if csrc_path not in _sys.path:
+            _sys.path.insert(0, csrc_path)
+        from compiler_flags import (  # type: ignore[import-not-found]
+            fff_hard_jit_cflags,
+            fff_hard_jit_cflags_no_openmp,
+            fff_hard_jit_ldflags,
+        )
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(
+            f"Could not import csrc/compiler_flags ({exc}); using -O3 only",
+            stacklevel=2,
+        )
+        fff_hard_jit_cflags = lambda: ["-O3"]  # type: ignore[assignment,misc]
+        fff_hard_jit_cflags_no_openmp = lambda: ["-O3"]  # type: ignore[assignment,misc]
+        fff_hard_jit_ldflags = lambda: []  # type: ignore[assignment,misc]
+
     # Keep build artifacts inside the repo (avoids home-cache permission issues).
     build_dir = _CSRC_DIR / ".build" / "fff_hard_cpp"
     build_dir.mkdir(parents=True, exist_ok=True)
@@ -83,23 +118,40 @@ def _load_fff_hard_ext(*, verbose: bool = False) -> Any | None:
     if venv_bin not in path_parts:
         os.environ["PATH"] = venv_bin + os.pathsep + os.environ.get("PATH", "")
 
-    try:
-        _fff_hard_ext = load(
-            name="fff_hard_cpp",
-            sources=[str(_FFF_HARD_SRC)],
-            extra_cflags=["-O3"],
-            build_directory=str(build_dir),
-            verbose=verbose,
-        )
-        return _fff_hard_ext
-    except Exception as exc:  # noqa: BLE001 — toolchain / compile failures
-        _fff_hard_load_error = exc
-        warnings.warn(
-            f"FFF C++ hard kernel failed to compile ({exc.__class__.__name__}: {exc}); "
-            "falling back to PyTorch hard routing",
-            stacklevel=2,
-        )
-        return None
+    # Avoid hard-abort when both torch and the extension see an OpenMP runtime.
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+    flag_sets: list[tuple[str, list[str], list[str]]] = [
+        ("openmp", fff_hard_jit_cflags(), fff_hard_jit_ldflags()),
+        ("no-openmp", fff_hard_jit_cflags_no_openmp(), []),
+    ]
+    last_exc: BaseException | None = None
+    for label, cflags, ldflags in flag_sets:
+        try:
+            if verbose:
+                print(f"[fff_hard] JIT compile attempt ({label}): cflags={cflags} ldflags={ldflags}")
+            _fff_hard_ext = load(
+                name="fff_hard_cpp",
+                sources=[str(_FFF_HARD_SRC)],
+                extra_cflags=cflags,
+                extra_ldflags=ldflags,
+                build_directory=str(build_dir),
+                verbose=verbose,
+            )
+            return _fff_hard_ext
+        except Exception as exc:  # noqa: BLE001 — toolchain / compile failures
+            last_exc = exc
+            if verbose:
+                print(f"[fff_hard] JIT attempt ({label}) failed: {exc}")
+            continue
+
+    _fff_hard_load_error = last_exc
+    warnings.warn(
+        f"FFF C++ hard kernel failed to compile ({type(last_exc).__name__}: {last_exc}); "
+        "falling back to PyTorch hard routing",
+        stacklevel=2,
+    )
+    return None
 
 
 def is_fff_cpp_available() -> bool:
@@ -281,6 +333,10 @@ class FastFeedforwardLinear(nn.Module):
             ``"hard"`` — discrete tree walk, single leaf (PyTorch).
             ``"hard_cpp"`` — same semantics via CPU C++ kernel (falls back
             to PyTorch if the extension is unavailable or ``x`` is not CPU).
+            ``"triton"`` — fused CUDA Triton kernel (falls back to PyTorch hard
+            if Triton/CUDA is unavailable).
+            ``"triton_int8"`` / ``"triton_int4"`` — Triton hard routing with
+            quantized leaf weights (requires ``leaf_qstate`` attached).
 
         Returns
         -------
@@ -293,8 +349,15 @@ class FastFeedforwardLinear(nn.Module):
             return self.forward_hard(x)
         if mode == "hard_cpp":
             return self.forward_hard_cpp(x)
+        if mode == "triton":
+            return self.forward_hard_triton(x)
+        if mode == "triton_int8":
+            return self.forward_hard_triton_quant(x, expect_mode="int8")
+        if mode == "triton_int4":
+            return self.forward_hard_triton_quant(x, expect_mode="int4")
         raise ValueError(
-            f"mode must be 'soft', 'hard', or 'hard_cpp', got {mode!r}"
+            "mode must be 'soft', 'hard', 'hard_cpp', 'triton', "
+            f"'triton_int8', or 'triton_int4', got {mode!r}"
         )
 
     # ------------------------------------------------------------------
@@ -466,6 +529,136 @@ class FastFeedforwardLinear(nn.Module):
             int(self.depth),
         )
         return y.to(dtype=flat.dtype).view(*leading, self.out_features)
+
+    def forward_hard_triton(self, x: Tensor) -> Tensor:
+        """Hard routing via hybrid Triton CUDA kernels (fused or leaf-sorted).
+
+        Falls back to :meth:`forward_hard` when Triton is missing or ``x`` is
+        not on CUDA. Hybrid dispatch uses the leading batch size when ``x`` is
+        ``(B, T, D)`` so small batches stay on the fused kernel even if
+        ``N = B·T > 4``.
+        """
+        flat, leading = self._flatten_input(x)
+        if flat.device.type != "cuda":
+            return self.forward_hard(x)
+
+        try:
+            from models.fff_hard_triton import (
+                _as_compute_tensor,
+                fff_hard_forward_triton,
+                is_triton_available,
+            )
+        except ImportError:
+            return self.forward_hard(x)
+
+        if not is_triton_available():
+            return self.forward_hard(x)
+
+        # Match activation dtype without re-casting when already half/BF16.
+        # On Triton failure, fall back to PyTorch hard in the same dtype.
+        dt = flat.dtype
+        dispatch_n = int(x.shape[0]) if x.ndim >= 2 else int(flat.shape[0])
+        try:
+            y = fff_hard_forward_triton(
+                flat if flat.is_contiguous() else flat.contiguous(),
+                _as_compute_tensor(self.router_weights.detach(), dt),
+                _as_compute_tensor(self.router_biases.detach(), dt),
+                _as_compute_tensor(self.leaf_weights.detach(), dt),
+                _as_compute_tensor(self.leaf_biases.detach(), dt),
+                int(self.depth),
+                dispatch_n=dispatch_n,
+            )
+        except (RuntimeError, TypeError, ValueError):
+            return self.forward_hard(x)
+        return y.view(*leading, self.out_features)
+
+    def forward_hard_triton_quant(
+        self,
+        x: Tensor,
+        *,
+        expect_mode: str | None = None,
+    ) -> Tensor:
+        """Hard routing via Triton with INT8/INT4 leaf dequant (``leaf_qstate``).
+
+        Attach a :class:`~models.fff_quant.QuantizedLeafWeights` as
+        ``self.leaf_qstate`` before calling. Falls back to FP16 dequant +
+        :meth:`forward_hard` when Triton/CUDA is unavailable.
+        """
+        qstate = getattr(self, "leaf_qstate", None)
+        if qstate is None:
+            raise RuntimeError(
+                "forward_hard_triton_quant requires self.leaf_qstate "
+                "(run quantize_fff_model_leaves / attach_leaf_qstates)"
+            )
+        if expect_mode is not None and qstate.mode != expect_mode:
+            raise ValueError(
+                f"leaf_qstate.mode={qstate.mode!r} but mode expects {expect_mode!r}"
+            )
+
+        flat, leading = self._flatten_input(x)
+        if flat.device.type != "cuda":
+            from models.fff_quant import dequantize_leaf_weights
+
+            w_fp = dequantize_leaf_weights(qstate).to(device=flat.device, dtype=flat.dtype)
+            # Temporary weight swap for PyTorch hard fallback.
+            saved = self.leaf_weights.data
+            try:
+                self.leaf_weights.data = w_fp
+                return self.forward_hard(x)
+            finally:
+                self.leaf_weights.data = saved
+
+        try:
+            from models.fff_hard_triton import (
+                _as_compute_tensor,
+                fff_hard_forward_triton_quant,
+                is_triton_available,
+            )
+        except ImportError:
+            from models.fff_quant import dequantize_leaf_weights
+
+            w_fp = dequantize_leaf_weights(qstate).to(dtype=flat.dtype)
+            saved = self.leaf_weights.data
+            try:
+                self.leaf_weights.data = w_fp
+                return self.forward_hard(x)
+            finally:
+                self.leaf_weights.data = saved
+
+        if not is_triton_available():
+            from models.fff_quant import dequantize_leaf_weights
+
+            w_fp = dequantize_leaf_weights(qstate).to(dtype=flat.dtype)
+            saved = self.leaf_weights.data
+            try:
+                self.leaf_weights.data = w_fp
+                return self.forward_hard(x)
+            finally:
+                self.leaf_weights.data = saved
+
+        dt = flat.dtype
+        dispatch_n = int(x.shape[0]) if x.ndim >= 2 else int(flat.shape[0])
+        try:
+            y = fff_hard_forward_triton_quant(
+                flat if flat.is_contiguous() else flat.contiguous(),
+                _as_compute_tensor(self.router_weights.detach(), dt),
+                _as_compute_tensor(self.router_biases.detach(), dt),
+                qstate,
+                _as_compute_tensor(self.leaf_biases.detach(), dt),
+                int(self.depth),
+                dispatch_n=dispatch_n,
+            )
+        except (RuntimeError, TypeError, ValueError):
+            from models.fff_quant import dequantize_leaf_weights
+
+            w_fp = dequantize_leaf_weights(qstate).to(dtype=flat.dtype)
+            saved = self.leaf_weights.data
+            try:
+                self.leaf_weights.data = w_fp
+                return self.forward_hard(x)
+            finally:
+                self.leaf_weights.data = saved
+        return y.view(*leading, self.out_features)
 
     def forward_hard_sequential(self, x: Tensor) -> Tensor:
         """Hard routing with explicit Python if-else (single-vector / debug).
