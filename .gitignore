@@ -1,3 +1,6 @@
 /.venv
 *.pt
 __pycache__
+csrc/.build/
+*.so
+*.dylib

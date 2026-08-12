@@ -10,3 +10,6 @@ numpy>=1.24.0
 psutil>=5.9.0
 tiktoken>=0.7.0
 datasets>=2.18.0
+# Optional: needed to JIT-compile csrc/fff_hard.cpp (torch.utils.cpp_extension)
+setuptools>=68.0.0
+ninja>=1.11.0
