@@ -58,7 +58,7 @@ from fff_swiglu import iter_fff_swiglu_blocks, warmup_fff_swiglu
 from models.fff_hard_triton import is_triton_available
 
 DEFAULT_CHECKPOINT = Path("fff_cot_agent.pt")
-DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
+DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
 DEFAULT_TEMPERATURE = 0.6
 DEFAULT_TOP_P = 0.95

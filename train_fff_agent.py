@@ -3,9 +3,9 @@
 
 Student
 -------
-``Qwen/Qwen3.5-9B`` patched with :class:`FFFSwiGLUBlock`
+``Qwen/Qwen3.5-4B`` patched with :class:`FFFSwiGLUBlock`
 (depth=4 → 16 leaves). FP32 smart-init → BF16. STE hard-aware soft routing
-matches Triton Hard inference.
+matches Triton Hard inference. Fits RTX 3060 12GB with a 4-bit 9B teacher.
 
 Teacher
 -------
@@ -14,8 +14,8 @@ Default ``Qwen/Qwen3.5-9B`` in bitsandbytes 4-bit
 
 VRAM note
 ---------
-Teacher (9B 4-bit) + Student (9B BF16) needs roughly ≥24GB. On a 12GB card use
-a smaller student, e.g. ``--student-name Qwen/Qwen3.5-4B`` or ``Qwen/Qwen3.5-2B``.
+Default: teacher 9B 4-bit + student 4B BF16 targets ~12GB cards.
+For more capacity use ``--student-name Qwen/Qwen3.5-9B`` (≥24GB).
 
 Data mixture (20% each)
 -----------------------
@@ -48,8 +48,8 @@ Checkpoint
 Example
 -------
     python train_fff_agent.py --device cuda --max-steps 4000
-    # 12GB VRAM: smaller FFF student, keep 9B teacher
-    python train_fff_agent.py --student-name Qwen/Qwen3.5-4B --device cuda
+    # More capacity (≥24GB): larger FFF student
+    python train_fff_agent.py --student-name Qwen/Qwen3.5-9B --device cuda
     python train_fff_agent.py --smoke-synthetic-data --max-steps 20
 """
 
@@ -101,9 +101,10 @@ from fff_swiglu import (
 )
 
 CHECKPOINT_NAME = "fff_cot_agent.pt"
-DEFAULT_STUDENT = "Qwen/Qwen3.5-9B"
+DEFAULT_STUDENT = "Qwen/Qwen3.5-4B"
 DEFAULT_TEACHER = "Qwen/Qwen3.5-9B"
-# Smaller FFF students for 12GB: Qwen/Qwen3.5-4B or Qwen/Qwen3.5-2B
+# Larger FFF student if VRAM ≥24GB: Qwen/Qwen3.5-9B
+# Tighter 12GB fallback: Qwen/Qwen3.5-2B
 
 DOMAIN_COT = "cot"
 DOMAIN_AGENT = "agent"
@@ -868,7 +869,7 @@ def main() -> None:
     if "Qwen3.5-9B" in cfg.student_name and "Qwen3.5-9B" in cfg.teacher_name:
         print(
             "VRAM tip: 9B teacher (4-bit) + 9B student (BF16) usually needs ≥24GB. "
-            "On 12GB try --student-name Qwen/Qwen3.5-4B (or Qwen/Qwen3.5-2B)."
+            "Default student is Qwen/Qwen3.5-4B for ~12GB cards."
         )
     _warn_vocab_mismatch(cfg.teacher_name, cfg.student_name)
 
