@@ -30,10 +30,11 @@ import argparse
 import math
 import os
 import time
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -45,9 +46,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from device_utils import (
-    amp_autocast,
     apply_hardware_optimizations,
-    make_grad_scaler,
     pin_memory_for,
     print_device_info,
     resolve_device,
@@ -69,6 +68,27 @@ CHECKPOINT_NAME = "qwen_fff_distill.pt"
 DEFAULT_TEACHER = "Qwen/Qwen2.5-0.5B"
 
 
+@contextmanager
+def bf16_autocast(device: torch.device) -> Iterator[None]:
+    """CUDA autocast in bfloat16 (Ampere+); no-op elsewhere.
+
+    BF16 does not need GradScaler — backward/step are unscaled.
+    """
+    if device.type == "cuda":
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            yield
+        return
+    with nullcontext():
+        yield
+
+
+def resolve_compute_dtype(device: torch.device, *, use_bf16: bool) -> torch.dtype:
+    """Pick parameter dtype: BF16 on CUDA when supported, else FP32."""
+    if use_bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float32
+
+
 # ---------------------------------------------------------------------------
 # Teacher / Student construction
 # ---------------------------------------------------------------------------
@@ -85,7 +105,7 @@ def _require_transformers() -> tuple[Any, Any]:
 
 
 def load_qwen_teacher(model_name: str, device: torch.device) -> Any:
-    """Load Qwen CausalLM in FP32, freeze, eval, then move (caller may half)."""
+    """Load Qwen CausalLM in FP32, freeze, eval (caller casts dtype/device)."""
     AutoModelForCausalLM, _ = _require_transformers()
     print(f"Loading teacher `{model_name}` (float32, frozen) ...")
     teacher = AutoModelForCausalLM.from_pretrained(
@@ -108,7 +128,7 @@ def build_fff_student_from_qwen(
     """Deep-copy Teacher, unfreeze, replace every ``mlp`` with FFF SwiGLU.
 
     Patching / smart-init run in **float32** (safe ``orthogonal_``). Caller
-    casts to FP16 after this returns when training on CUDA.
+    casts to BF16 after this returns when training on CUDA.
     """
     print("Cloning teacher → student + FFF SwiGLU injection ...")
     student = deepcopy(teacher)
@@ -324,7 +344,7 @@ class DistillConfig:
     max_train_chars: int = 1_500_000
     device: str = "cuda"
     checkpoint: str = CHECKPOINT_NAME
-    fp16: bool = True
+    use_bf16: bool = True
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -353,7 +373,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-train-chars", type=int, default=d.max_train_chars)
     p.add_argument("--device", type=str, default=d.device)
     p.add_argument("--checkpoint", type=str, default=d.checkpoint)
-    p.add_argument("--fp32", action="store_true", help="Disable FP16 cast")
+    p.add_argument(
+        "--fp32",
+        action="store_true",
+        help="Disable BF16 (train in float32)",
+    )
     return p
 
 
@@ -386,12 +410,13 @@ def main() -> None:
         max_train_chars=args.max_train_chars,
         device=args.device,
         checkpoint=args.checkpoint,
-        fp16=not args.fp32,
+        use_bf16=not args.fp32,
     )
 
     torch.manual_seed(cfg.seed)
     device = resolve_device(cfg.device)
     apply_hardware_optimizations(device)
+    compute_dtype = resolve_compute_dtype(device, use_bf16=cfg.use_bf16)
 
     n_leaves = 1 << cfg.fff_depth
     h_uniform = math.log(float(n_leaves))
@@ -400,6 +425,7 @@ def main() -> None:
     print("=" * 72)
     print_device_info(device)
     print(f"config: {asdict(cfg)}")
+    print(f"compute_dtype={compute_dtype} (no GradScaler)")
     print(f"target leaf entropy H_uniform=log({n_leaves})={h_uniform:.4f}")
 
     _, AutoTokenizer = _require_transformers()
@@ -431,11 +457,11 @@ def main() -> None:
         init_temp=cfg.init_tau,
     )
 
-    # Cast AFTER FFF FP32 init (avoids Half geqrf during orthogonal_).
-    if cfg.fp16 and device.type == "cuda":
-        print("Casting teacher/student → float16 ...")
-        teacher = teacher.half()
-        student = student.half()
+    # Cast AFTER FFF FP32 init (avoids Half/BF16 geqrf during orthogonal_).
+    if compute_dtype != torch.float32:
+        print(f"Casting teacher/student → {compute_dtype} ...")
+        teacher = teacher.to(dtype=compute_dtype)
+        student = student.to(dtype=compute_dtype)
     teacher = teacher.to(device)
     student = student.to(device)
     teacher.eval()
@@ -461,12 +487,15 @@ def main() -> None:
         weight_decay=cfg.weight_decay,
         betas=(0.9, 0.95),
     )
+    # One scheduler tick per optimizer update (not per micro-batch).
+    n_opt_steps = max(
+        (cfg.max_steps + cfg.grad_accum_steps - 1) // cfg.grad_accum_steps, 1
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=max(cfg.max_steps, 1),
+        T_max=n_opt_steps,
         eta_min=cfg.min_lr,
     )
-    scaler = make_grad_scaler(device) if cfg.fp16 and device.type == "cuda" else None
 
     ckpt_path = Path(cfg.checkpoint)
     data_iter = iter(loader)
@@ -483,7 +512,7 @@ def main() -> None:
     print(
         f"optimizer: AdamW leaf/other lr={cfg.lr_leaf:.2e} "
         f"router lr={cfg.lr_router:.2e} | "
-        f"CosineAnnealingLR T_max={cfg.max_steps} eta_min={cfg.min_lr:.2e}"
+        f"CosineAnnealingLR T_max={n_opt_steps} (opt steps) eta_min={cfg.min_lr:.2e}"
     )
 
     pbar = tqdm(range(cfg.max_steps), desc="distill-qwen", dynamic_ncols=True)
@@ -504,7 +533,7 @@ def main() -> None:
         vocab = int(student.config.vocab_size)
         input_ids = input_ids.clamp(0, vocab - 1)
 
-        with amp_autocast(device):
+        with bf16_autocast(device):
             teacher_logits, teacher_rms = teacher_forward_capture(
                 teacher, input_ids, teacher_cap
             )
@@ -522,23 +551,13 @@ def main() -> None:
             )
             loss = loss / float(cfg.grad_accum_steps)
 
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        loss.backward()
 
         if (step + 1) % cfg.grad_accum_steps == 0:
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-                optimizer.step()
+            torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-
-        scheduler.step()
 
         for k in running:
             running[k] += float(parts[k].detach().item())
@@ -573,6 +592,7 @@ def main() -> None:
                 "fff_depth": cfg.fff_depth,
                 "model_name": cfg.model_name,
                 "architecture": "fff_swiglu_qwen",
+                "compute_dtype": str(compute_dtype),
             }
             torch.save(payload, ckpt_path)
             tqdm.write(f"saved checkpoint → {ckpt_path}")
