@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Knowledge distillation: GPT-2 Small (Dense MLP) → FFF Soft-Routing Student.
+"""Knowledge distillation: GPT-2 Small (Dense MLP) → FFF STE Hard-Aware Student.
 
 Teacher
 -------
@@ -8,10 +8,14 @@ HuggingFace ``gpt2`` (124M), frozen ``.eval()``.
 Student
 -------
 Same GPT-2 stack (token embed, attention, LayerNorm, LM head) with each
-block's ``mlp`` replaced by :class:`FFFBlock` (``FastFeedforwardLinear`` soft
-routing + temperature ``τ``). Attention / LayerNorm / embeddings are copied
-from the teacher. FFF **leaves are smart-initialized** from each Teacher MLP
-(``c_fc`` / ``c_proj`` intermediate slices); routers use small orthogonal init.
+block's ``mlp`` replaced by :class:`FFFBlock` (``FastFeedforwardLinear``).
+During training, :class:`FFFBlock` uses a **Straight-Through Estimator (STE)**
+so the forward pass activates only the winning leaf (Hard / Triton semantics)
+while gradients flow through soft leaf probabilities. Eval soft PPL still uses
+the soft mixture; hard eval uses Triton. Attention / LayerNorm / embeddings are
+copied from the teacher. FFF **leaves are smart-initialized** from each Teacher
+MLP (``c_fc`` / ``c_proj`` intermediate slices) and scaled by ``√N_leaves``;
+routers use small orthogonal init.
 
 Loss
 ----
@@ -84,11 +88,20 @@ GPT2TokenizerFast = Any  # type: ignore[misc, assignment]
 
 
 class FFFBlock(nn.Module):
-    """GPT-2 MLP replacement: soft-routing FFF ``D → D`` with dropout.
+    """GPT-2 MLP replacement: STE hard-aware FFF ``D → D`` with dropout.
 
     Matches the HuggingFace GPT-2 MLP calling convention:
     ``hidden_states (B, T, D) → (B, T, D)`` (no residual add here; the
     Transformer block adds the residual outside).
+
+    Training (``routing_mode="soft"``)
+    ----------------------------------
+    Uses Straight-Through Estimator (:meth:`FastFeedforwardLinear.forward_soft_ste`):
+    forward activates only the argmax leaf (Hard / Triton-aligned); backward
+    routes gradients through soft leaf probabilities.
+
+    Eval soft still uses the full soft mixture; ``hard`` / ``triton`` use
+    discrete tree walk.
 
     Parameters
     ----------
@@ -121,13 +134,18 @@ class FFFBlock(nn.Module):
         self.routing_mode: str = "soft"
 
     def forward(self, hidden_states: Tensor) -> Tensor:
-        """FFF forward using ``self.routing_mode`` (soft / hard / triton)."""
+        """FFF forward using ``self.routing_mode`` (soft STE / hard / triton)."""
         mode = self.routing_mode
         if mode not in ("soft", "hard", "hard_cpp", "triton", "triton_int8", "triton_int4"):
             mode = "soft"
-        y = self.fff(hidden_states, mode=mode)  # type: ignore[arg-type]
         if mode == "soft":
+            # Train: STE hard-aware forward; eval: soft mixture for soft PPL.
+            if self.training:
+                y = self.fff.forward_soft_ste(hidden_states)
+            else:
+                y = self.fff(hidden_states, mode="soft")
             return self.dropout(y)
+        y = self.fff(hidden_states, mode=mode)  # type: ignore[arg-type]
         # Eval / generation: no dropout on hard / triton paths.
         return y
 
@@ -175,6 +193,11 @@ def init_fff_from_dense_mlp(
 
         ``W_leaf[i] = c_fc[:, i·s:(i+1)·s] @ c_proj[i·s:(i+1)·s, :]``
         ``b_leaf[i] = b_fc[i·s:(i+1)·s] @ c_proj[i·s:(i+1)·s, :] + b_proj``
+
+    Because STE / Hard / Triton activate **one** leaf per token (not a soft
+    mixture of ``L`` slices), leaf weights and biases are scaled by
+    ``√L`` so the output tensor norm matches LayerNorm expectations
+    (e.g. ``√16 = 4`` for depth 4).
 
     A tiny Gaussian ``N(0, noise_std²)`` breaks exact leaf symmetry. Router
     weights are small **orthogonal** matrices (QR / ``nn.init.orthogonal_``).
@@ -256,6 +279,11 @@ def init_fff_from_dense_mlp(
         leaf_w[i] = w_in @ w_out
         leaf_b[i] = b_fc[start:end] @ w_out + b_proj
 
+    # Single-leaf STE / Hard / Triton: scale so ‖y‖ matches dense mixture of L slices.
+    leaf_scale = math.sqrt(float(n_leaves))
+    leaf_w = leaf_w * leaf_scale
+    leaf_b = leaf_b * leaf_scale
+
     if noise_std > 0.0:
         leaf_w = leaf_w + noise_std * torch.randn_like(leaf_w)
         leaf_b = leaf_b + noise_std * torch.randn_like(leaf_b)
@@ -310,9 +338,12 @@ def build_fff_student_from_teacher(
     d_model = int(config.n_embd)
     dropout = float(config.resid_pdrop)
     n_leaves = 1 << int(fff_depth)
+    leaf_scale = math.sqrt(float(n_leaves))
     print(
         f"Smart FFF init from Teacher MLP: depth={fff_depth} "
-        f"leaves={n_leaves} leaf_noise={leaf_noise_std} router_gain={router_gain}"
+        f"leaves={n_leaves} leaf_scale=√L={leaf_scale:.4f} "
+        f"leaf_noise={leaf_noise_std} router_gain={router_gain} "
+        f"(STE hard-aware training)"
     )
 
     for layer_idx, (s_block, t_block) in enumerate(
