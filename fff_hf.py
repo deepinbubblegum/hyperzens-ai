@@ -22,12 +22,17 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from fff_swiglu import (
+    get_text_config,
     iter_fff_swiglu_blocks,
     patch_model_with_fff_swiglu,
     set_fff_routing_mode,
     set_fff_temperature,
 )
 from models.fff_hard_triton import is_triton_available
+
+# Qwen3.5 native context (256K tokens). Train micro-batches stay short;
+# this only configures model / tokenizer capacity for long-context inference.
+CONTEXT_LENGTH_256K: int = 262_144
 
 
 def annealed_tau(
@@ -41,6 +46,52 @@ def annealed_tau(
         return tau_end
     t = min(max(step, 0), total_steps - 1) / float(total_steps - 1)
     return float(tau_start * (tau_end / tau_start) ** t)
+
+
+def encode_truncate_left(
+    tokenizer: Any,
+    text: str,
+    *,
+    max_length: int,
+    add_special_tokens: bool = False,
+) -> list[int]:
+    """Tokenize ``text`` keeping the **tail** (left-truncation), no length warnings.
+
+    Long ChatML / tool traces often exceed a tokenizer's advertised
+    ``model_max_length``. Calling bare ``tokenizer.encode`` then slicing still
+    triggers HF's warning. Truncating inside the tokenizer call avoids that
+    and keeps the assistant end.
+    """
+    max_length = max(int(max_length), 1)
+    # Prefer the HF call API (supports truncation_side); fall back safely.
+    try:
+        enc = tokenizer(
+            text,
+            add_special_tokens=add_special_tokens,
+            truncation=True,
+            max_length=max_length,
+            truncation_side="left",
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        ids = enc["input_ids"]
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return list(ids)
+    except TypeError:
+        prev = getattr(tokenizer, "truncation_side", "right")
+        try:
+            tokenizer.truncation_side = "left"
+            return list(
+                tokenizer.encode(
+                    text,
+                    add_special_tokens=add_special_tokens,
+                    truncation=True,
+                    max_length=max_length,
+                )
+            )
+        finally:
+            tokenizer.truncation_side = prev
 
 
 def compute_leaf_entropy_loss(
@@ -62,9 +113,49 @@ def _require_transformers() -> tuple[Any, Any]:
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         raise SystemExit(
-            "transformers is required: pip install transformers"
+            "transformers is required: pip install 'transformers>=4.57'"
         ) from exc
     return AutoModelForCausalLM, AutoTokenizer
+
+
+def load_hf_causal_lm(
+    model_name: str,
+    *,
+    dtype: torch.dtype = torch.float32,
+    quantization_config: Any | None = None,
+    device_map: Any | None = None,
+) -> Any:
+    """Load a HF CausalLM (Qwen2 / Qwen3.5 text or multimodal text trunk)."""
+    AutoModelForCausalLM, _ = _require_transformers()
+    kwargs: dict[str, Any] = {
+        "trust_remote_code": True,
+        "dtype": dtype,
+    }
+    if quantization_config is not None:
+        kwargs["quantization_config"] = quantization_config
+        kwargs.pop("dtype", None)
+    if device_map is not None:
+        kwargs["device_map"] = device_map
+
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    except Exception as first_exc:  # noqa: BLE001
+        # Qwen3.5 multimodal repos sometimes register under image-text loaders.
+        try:
+            from transformers import AutoModelForImageTextToText
+
+            print(
+                f"  AutoModelForCausalLM failed ({first_exc.__class__.__name__}); "
+                "retrying AutoModelForImageTextToText ..."
+            )
+            return AutoModelForImageTextToText.from_pretrained(model_name, **kwargs)
+        except Exception as second_exc:  # noqa: BLE001
+            raise SystemExit(
+                f"Failed to load `{model_name}`.\n"
+                f"  CausalLM error: {first_exc}\n"
+                f"  ImageText error: {second_exc}\n"
+                "Tip: pip install -U 'transformers>=4.57' (required for Qwen3.5)."
+            ) from second_exc
 
 
 @contextmanager
@@ -131,7 +222,6 @@ def build_student_param_groups(
 
 def load_4bit_teacher(model_name: str, device: torch.device) -> Any:
     """Load CausalLM teacher in bitsandbytes 4-bit (BF16 compute)."""
-    AutoModelForCausalLM, _ = _require_transformers()
     try:
         from transformers import BitsAndBytesConfig
     except ImportError as exc:
@@ -163,11 +253,10 @@ def load_4bit_teacher(model_name: str, device: torch.device) -> Any:
         f"Loading 4-bit teacher `{model_name}` "
         f"(bnb_4bit_compute_dtype=bfloat16) ..."
     )
-    teacher = AutoModelForCausalLM.from_pretrained(
+    teacher = load_hf_causal_lm(
         model_name,
         quantization_config=bnb_cfg,
         device_map={"": device.index if device.index is not None else 0},
-        trust_remote_code=True,
     )
     teacher.eval()
     for p in teacher.parameters():
@@ -177,13 +266,8 @@ def load_4bit_teacher(model_name: str, device: torch.device) -> Any:
 
 def load_dense_teacher(model_name: str, device: torch.device) -> Any:
     """FP32 dense teacher (caller may cast dtype)."""
-    AutoModelForCausalLM, _ = _require_transformers()
     print(f"Loading dense teacher `{model_name}` (float32) ...")
-    teacher = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        dtype=torch.float32,
-        trust_remote_code=True,
-    )
+    teacher = load_hf_causal_lm(model_name, dtype=torch.float32)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
@@ -199,13 +283,8 @@ def build_fff_student(
     compute_dtype: torch.dtype = torch.bfloat16,
 ) -> Any:
     """Load Instruct student, inject FFF SwiGLU (FP32 init), cast dtype."""
-    AutoModelForCausalLM, _ = _require_transformers()
     print(f"Loading student `{student_name}` (float32 for FFF init) ...")
-    student = AutoModelForCausalLM.from_pretrained(
-        student_name,
-        dtype=torch.float32,
-        trust_remote_code=True,
-    )
+    student = load_hf_causal_lm(student_name, dtype=torch.float32)
     for p in student.parameters():
         p.requires_grad_(True)
 
@@ -340,7 +419,8 @@ def load_student_from_checkpoint(
     *,
     model_name: str | None = None,
     routing_mode: str = "triton",
-    default_model: str = "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+    default_model: str = "Qwen/Qwen3.5-9B",
+    max_context_length: int = CONTEXT_LENGTH_256K,
 ) -> tuple[Any, dict[str, Any]]:
     """Scaffold HF CausalLM → inject FFF SwiGLU → load ``student_state_dict``."""
     if not ckpt_path.exists():
@@ -351,14 +431,12 @@ def load_student_from_checkpoint(
     fff_depth = int(ckpt.get("fff_depth", 4))
     cfg = ckpt.get("config") or {}
     init_tau = float(cfg.get("init_tau", 1.0))
+    n_ctx = int(ckpt.get("max_context_length", max_context_length))
 
-    AutoModelForCausalLM, _ = _require_transformers()
     print(f"Loading student scaffold `{name}` (float32 init) ...")
-    student = AutoModelForCausalLM.from_pretrained(
-        name,
-        dtype=torch.float32,
-        trust_remote_code=True,
-    )
+    student = load_hf_causal_lm(name, dtype=torch.float32)
+    apply_context_length(student, n_ctx=n_ctx)
+    print(f"  context_length={model_context_length(student):,}")
     print(f"Injecting FFF SwiGLU (depth={fff_depth}) ...")
     n = patch_model_with_fff_swiglu(
         student, fff_depth=fff_depth, init_temp=init_tau
@@ -386,3 +464,79 @@ def load_student_from_checkpoint(
     set_fff_temperature(student, float(cfg.get("min_tau", 0.10)))
     print(f"Patched {n} MLPs | routing_mode={routing_mode} | dtype={dtype}")
     return student, ckpt
+
+
+def model_vocab_size(model: Any) -> int:
+    """Resolve vocab size from top-level or nested ``text_config``."""
+    cfg = model.config
+    for obj in (cfg, getattr(cfg, "text_config", None)):
+        if obj is None:
+            continue
+        v = getattr(obj, "vocab_size", None)
+        if v is not None:
+            return int(v)
+    raise AttributeError("model config has no vocab_size")
+
+
+def model_context_length(model: Any) -> int:
+    """Resolve ``max_position_embeddings`` from top-level or nested ``text_config``.
+
+    Returns
+    -------
+    int
+        Context window in tokens (Qwen3.5 default is ``262144`` / 256K).
+    """
+    text_cfg = get_text_config(model)
+    for obj in (text_cfg, model.config):
+        v = getattr(obj, "max_position_embeddings", None)
+        if v is not None:
+            return int(v)
+    return CONTEXT_LENGTH_256K
+
+
+def apply_context_length(
+    model: Any | None = None,
+    tokenizer: Any | None = None,
+    *,
+    n_ctx: int = CONTEXT_LENGTH_256K,
+) -> int:
+    """Force model (+ optional tokenizer) context window to ``n_ctx`` tokens.
+
+    Writes ``max_position_embeddings`` on both the outer config and nested
+    ``text_config`` (Qwen3.5 multimodal wrappers). Sets
+    ``tokenizer.model_max_length`` when a tokenizer is provided.
+
+    Parameters
+    ----------
+    model:
+        Optional HF CausalLM / image-text model with ``.config``.
+    tokenizer:
+        Optional HF tokenizer to align ``model_max_length``.
+    n_ctx:
+        Target context length (default ``262144`` = 256K).
+
+    Returns
+    -------
+    int
+        The applied context length.
+    """
+    n_ctx = max(int(n_ctx), 1)
+    if model is not None:
+        cfg = model.config
+        cfg.max_position_embeddings = n_ctx
+        text_cfg = getattr(cfg, "text_config", None)
+        if text_cfg is not None:
+            text_cfg.max_position_embeddings = n_ctx
+        # Some Qwen builds also expose generation / sliding-window caps.
+        for attr in ("max_sequence_length", "seq_length"):
+            if hasattr(cfg, attr):
+                setattr(cfg, attr, n_ctx)
+            if text_cfg is not None and hasattr(text_cfg, attr):
+                setattr(text_cfg, attr, n_ctx)
+
+    if tokenizer is not None:
+        tokenizer.model_max_length = n_ctx
+        # Prefer left truncation for long chat prompts (keep recent turns).
+        if hasattr(tokenizer, "truncation_side"):
+            tokenizer.truncation_side = "left"
+    return n_ctx

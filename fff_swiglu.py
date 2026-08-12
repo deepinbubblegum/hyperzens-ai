@@ -563,14 +563,34 @@ def init_fff_from_swiglu(
 # ---------------------------------------------------------------------------
 
 
+def get_text_config(model: Any) -> Any:
+    """Return the text transformer config (handles Qwen3.5 multimodal wrappers)."""
+    cfg = model.config
+    text_cfg = getattr(cfg, "text_config", None)
+    return text_cfg if text_cfg is not None else cfg
+
+
 def iter_decoder_layers(model: Any) -> Iterator[Any]:
-    """Yield decoder layers from HF CausalLM (``model.model.layers``)."""
+    """Yield decoder layers from HF CausalLM / Qwen3.5 text trunks.
+
+    Supported layouts
+    ----------------
+    * ``model.model.layers`` — Llama / Qwen2 / Qwen3.5 text CausalLM
+    * ``model.model.language_model.layers`` — Qwen3.5 multimodal wrapper
+    """
     inner = getattr(model, "model", None)
     if inner is None:
         raise TypeError("expected AutoModelForCausalLM with `.model` trunk")
+
     layers = getattr(inner, "layers", None)
     if layers is None:
-        raise TypeError("expected `.model.layers` ModuleList")
+        lang = getattr(inner, "language_model", None)
+        layers = getattr(lang, "layers", None) if lang is not None else None
+    if layers is None:
+        raise TypeError(
+            "could not find decoder layers at `.model.layers` or "
+            "`.model.language_model.layers` (unexpected HF layout)"
+        )
     yield from layers
 
 
@@ -615,9 +635,9 @@ def patch_model_with_fff_swiglu(
 
     Returns the number of patched layers.
     """
-    config = model.config
-    d_model = int(config.hidden_size)
-    intermediate = int(config.intermediate_size)
+    text_cfg = get_text_config(model)
+    d_model = int(text_cfg.hidden_size)
+    intermediate = int(text_cfg.intermediate_size)
     n_leaves = 1 << int(fff_depth)
     if intermediate % n_leaves != 0:
         raise ValueError(
@@ -632,7 +652,9 @@ def patch_model_with_fff_swiglu(
 
     n_patched = 0
     for layer_idx, layer in enumerate(iter_decoder_layers(model)):
-        dense_mlp = layer.mlp
+        dense_mlp = getattr(layer, "mlp", None)
+        if dense_mlp is None:
+            continue
         block = block_cls(
             d_model=d_model,
             intermediate_size=intermediate,
@@ -648,12 +670,14 @@ def patch_model_with_fff_swiglu(
         )
         layer.mlp = block
         n_patched += 1
-        if layer_idx == 0:
+        if n_patched == 1:
             print(
-                f"  layer 0: FFF {act} depth={fff_depth} leaves={n_leaves} "
+                f"  layer {layer_idx}: FFF {act} depth={fff_depth} leaves={n_leaves} "
                 f"slice={intermediate // n_leaves} D={d_model} I={intermediate} "
                 f"(init dtype=float32)"
             )
+    if n_patched == 0:
+        raise RuntimeError("no decoder layers with `.mlp` found to patch")
     return n_patched
 
 
@@ -877,7 +901,13 @@ def measure_generation_throughput(
     model.eval()
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
     generated = input_ids
-    n_ctx = int(getattr(model.config, "max_position_embeddings", 2048))
+    n_ctx = int(
+        getattr(
+            get_text_config(model),
+            "max_position_embeddings",
+            getattr(model.config, "max_position_embeddings", 262_144),
+        )
+    )
 
     use_cuda = device.type == "cuda"
     if use_cuda:
@@ -917,8 +947,9 @@ def measure_generation_throughput(
 
 def warmup_fff_swiglu(model: Any, device: torch.device, *, seq_len: int = 16) -> None:
     """Dummy forward to warm CUDA / Triton-related paths."""
-    vocab = int(model.config.vocab_size)
-    dummy = torch.randint(0, vocab, (1, seq_len), device=device)
+    text_cfg = get_text_config(model)
+    vocab = int(getattr(text_cfg, "vocab_size", getattr(model.config, "vocab_size", 1)))
+    dummy = torch.randint(0, max(vocab, 1), (1, seq_len), device=device)
     with amp_autocast(device):
         _ = model(input_ids=dummy)
     if device.type == "cuda":

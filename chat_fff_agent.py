@@ -45,12 +45,20 @@ from eval_fff_gpt2 import (
     _apply_repetition_penalty,
     _topk_topp_filter,
 )
-from fff_hf import load_student_from_checkpoint, resolve_compute_dtype
+from fff_hf import (
+    CONTEXT_LENGTH_256K,
+    apply_context_length,
+    encode_truncate_left,
+    load_student_from_checkpoint,
+    model_context_length,
+    model_vocab_size,
+    resolve_compute_dtype,
+)
 from fff_swiglu import iter_fff_swiglu_blocks, warmup_fff_swiglu
 from models.fff_hard_triton import is_triton_available
 
 DEFAULT_CHECKPOINT = Path("fff_cot_agent.pt")
-DEFAULT_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 
 DEFAULT_TEMPERATURE = 0.6
 DEFAULT_TOP_P = 0.95
@@ -186,13 +194,17 @@ def generate_reply(
 ) -> tuple[str, float, float, int]:
     """Nucleus sample; return ``(text, tok/s, ms/token, n_new)``."""
     model.eval()
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-    vocab = int(model.config.vocab_size)
-    input_ids = input_ids.clamp(0, vocab - 1)
-    n_ctx = int(getattr(model.config, "max_position_embeddings", 2048))
+    n_ctx = model_context_length(model)
     max_prompt = max(n_ctx - max_new_tokens, 64)
-    if input_ids.size(1) > max_prompt:
-        input_ids = input_ids[:, -max_prompt:]
+    # Truncate prompt tokens at encode time (avoids HF length warnings).
+    prompt_ids = encode_truncate_left(
+        tokenizer, prompt, max_length=max_prompt, add_special_tokens=False
+    )
+    if not prompt_ids:
+        prompt_ids = [int(tokenizer.eos_token_id or 0)]
+    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    vocab = model_vocab_size(model)
+    input_ids = input_ids.clamp(0, vocab - 1)
 
     generated: Tensor = input_ids
     sample = temperature > 0
@@ -351,6 +363,12 @@ def build_argparser() -> argparse.ArgumentParser:
         "--repetition-penalty", type=float, default=DEFAULT_REPETITION_PENALTY
     )
     p.add_argument("--max-history-turns", type=int, default=6)
+    p.add_argument(
+        "--max-context-length",
+        type=int,
+        default=CONTEXT_LENGTH_256K,
+        help="Override context window (default 262144 = 256K)",
+    )
     p.add_argument("--fp32", action="store_true")
     p.add_argument(
         "--force-hard",
@@ -396,6 +414,9 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    n_ctx = int(ckpt.get("max_context_length", args.max_context_length))
+    apply_context_length(student, tokenizer, n_ctx=n_ctx)
+    print(f"context_length={model_context_length(student):,}")
 
     print("Dummy forward warmup ...")
     warmup_fff_swiglu(student, device)
