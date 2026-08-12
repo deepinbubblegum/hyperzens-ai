@@ -7,7 +7,8 @@ Loads ``fff_distill_checkpoint.pt``, reports validation CE / perplexity for:
 * Student FFF Soft Routing (``τ = 0.10``)
 * Student FFF Hard Triton CUDA (falls back to PyTorch hard if Triton missing)
 
-Then generates sample completions with Hard Triton and reports tok/s.
+Then generates sample completions with Hard Triton (nucleus sampling,
+repetition penalty, no-repeat n-grams) and reports tok/s.
 
 Example
 -------
@@ -159,6 +160,44 @@ def _topk_topp_filter(
     return filtered
 
 
+def _apply_repetition_penalty(
+    logits: Tensor,
+    prev_ids: Tensor,
+    penalty: float,
+) -> Tensor:
+    """HF-style repetition penalty on tokens already present in ``prev_ids``.
+
+    For each seen token id ``t``: if ``logits[t] < 0`` multiply by ``penalty``,
+    else divide by ``penalty`` (``penalty > 1`` down-weights repeats).
+    """
+    if penalty == 1.0 or prev_ids.numel() == 0:
+        return logits
+    # Unique ids — scatter is last-write-wins; uniqueness avoids redundant ops.
+    uniq = torch.unique(prev_ids)
+    score = logits[:, uniq]
+    score = torch.where(score < 0, score * penalty, score / penalty)
+    return logits.scatter(1, uniq.unsqueeze(0).expand(logits.size(0), -1), score)
+
+
+def _apply_no_repeat_ngram(
+    logits: Tensor,
+    prev_ids: Tensor,
+    ngram_size: int,
+) -> Tensor:
+    """Ban tokens that would recreate an already-seen ``ngram_size``-gram."""
+    if ngram_size <= 0 or prev_ids.size(1) < ngram_size:
+        return logits
+    seq = prev_ids[0].tolist()
+    prefix = tuple(seq[-(ngram_size - 1) :])
+    banned: set[int] = set()
+    for i in range(len(seq) - ngram_size + 1):
+        if tuple(seq[i : i + ngram_size - 1]) == prefix:
+            banned.add(int(seq[i + ngram_size - 1]))
+    for tid in banned:
+        logits[0, tid] = float("-inf")
+    return logits
+
+
 @torch.no_grad()
 def generate_text(
     model: Any,
@@ -166,18 +205,34 @@ def generate_text(
     prompt: str,
     device: torch.device,
     *,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 60,
     temperature: float = 0.8,
-    top_k: int = 50,
-    top_p: float = 0.95,
+    top_k: int = 0,
+    top_p: float = 0.9,
+    repetition_penalty: float = 1.3,
+    no_repeat_ngram_size: int = 3,
+    do_sample: bool = True,
     greedy: bool = False,
 ) -> tuple[str, float]:
-    """Autoregressive generation; returns ``(text, tokens_per_second)``."""
+    """Autoregressive generation with nucleus sampling + anti-repetition.
+
+    Parameters match common HF ``generate`` knobs: ``do_sample``, ``temperature``,
+    ``top_p``, ``repetition_penalty``, ``no_repeat_ngram_size``, ``max_new_tokens``.
+
+    Returns
+    -------
+    generated_text:
+        Continuation only (prompt stripped), whitespace-trimmed.
+    tokens_per_second:
+        New tokens / wall time (CUDA synchronized when applicable).
+    """
     model.eval()
+    prompt = prompt.strip()
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
     # Cap context to model block size.
     n_ctx = int(getattr(model.config, "n_positions", 1024))
     generated = input_ids
+    sample = bool(do_sample) and not greedy
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -186,8 +241,12 @@ def generate_text(
     for _ in range(max_new_tokens):
         cond = generated if generated.size(1) <= n_ctx else generated[:, -n_ctx:]
         with amp_autocast(device):
-            logits = model(input_ids=cond).logits[:, -1, :]
-        if greedy or temperature <= 0:
+            logits = model(input_ids=cond).logits[:, -1, :].float()
+
+        logits = _apply_repetition_penalty(logits, generated, repetition_penalty)
+        logits = _apply_no_repeat_ngram(logits, generated, no_repeat_ngram_size)
+
+        if not sample or temperature <= 0:
             next_id = torch.argmax(logits, dim=-1, keepdim=True)
         else:
             logits = logits / max(temperature, 1e-8)
@@ -195,16 +254,30 @@ def generate_text(
             probs = F.softmax(logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
         generated = torch.cat([generated, next_id], dim=1)
-        if int(next_id.item()) == int(tokenizer.eos_token_id):
+        eos_id = tokenizer.eos_token_id
+        if eos_id is not None and int(next_id.item()) == int(eos_id):
             break
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elapsed = max(time.perf_counter() - t0, 1e-12)
-    n_new = int(generated.size(1) - input_ids.size(1))
+    prompt_len = int(input_ids.size(1))
+    n_new = int(generated.size(1) - prompt_len)
     tok_s = n_new / elapsed
-    text = tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
-    return text, tok_s
+    gen_ids = generated[0, prompt_len:].tolist()
+    generated_text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+    return generated_text, tok_s
+
+
+def print_generation_result(
+    prompt: str,
+    generated_text: str,
+    tok_s: float,
+) -> None:
+    """Print speed / prompt / continuation without blank-line padding."""
+    print(f"Speed (tok/s): {tok_s:.2f}")
+    print(f"Prompt: {prompt.strip()}")
+    print(f"Generated Text: {generated_text}")
 
 
 def print_ppl_table(rows: list[tuple[str, float, float]]) -> None:
@@ -268,11 +341,17 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--max-eval-batches", type=int, default=100)
     p.add_argument("--tau", type=float, default=0.10, help="Soft-routing temperature")
-    p.add_argument("--max-new-tokens", type=int, default=64)
+    p.add_argument("--max-new-tokens", type=int, default=60)
     p.add_argument("--temperature", type=float, default=0.8)
-    p.add_argument("--top-k", type=int, default=50)
-    p.add_argument("--top-p", type=float, default=0.95)
-    p.add_argument("--greedy", action="store_true", help="Greedy decoding for generation")
+    p.add_argument("--top-k", type=int, default=0, help="0 disables top-k (nucleus-only)")
+    p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--repetition-penalty", type=float, default=1.3)
+    p.add_argument("--no-repeat-ngram-size", type=int, default=3)
+    p.add_argument(
+        "--greedy",
+        action="store_true",
+        help="Greedy decoding (disables do_sample)",
+    )
     p.add_argument(
         "--prompt",
         action="append",
@@ -377,10 +456,18 @@ def main() -> None:
     prompts = args.prompt if args.prompt else list(DEFAULT_PROMPTS)
     print("\n" + "=" * 72)
     print(f"Text Generation — {hard_label}")
+    print(
+        f"do_sample=True temperature={args.temperature} top_p={args.top_p} "
+        f"repetition_penalty={args.repetition_penalty} "
+        f"no_repeat_ngram_size={args.no_repeat_ngram_size} "
+        f"max_new_tokens={args.max_new_tokens}"
+    )
     print("=" * 72)
 
-    for prompt in prompts:
-        text, tok_s = generate_text(
+    for i, prompt in enumerate(prompts):
+        if i > 0:
+            print("---")
+        generated_text, tok_s = generate_text(
             student,
             tokenizer,
             prompt,
@@ -389,12 +476,13 @@ def main() -> None:
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+            do_sample=not args.greedy,
             greedy=args.greedy,
         )
-        print(f"\nPrompt: {prompt!r}")
-        print(f"Speed:  {tok_s:.2f} tok/s")
-        print(f"Output: {text}")
-    print("\n" + "=" * 72)
+        print_generation_result(prompt, generated_text, tok_s)
+    print("=" * 72)
 
 
 if __name__ == "__main__":
