@@ -332,6 +332,12 @@ class FFFSwiGLUBlock(nn.Module):
     Calling convention: ``hidden_states (B, T, D) → (B, T, D)``.
     Training soft path uses STE; eval soft uses full mixture; ``hard`` /
     ``triton`` use discrete one-leaf SwiGLU.
+
+    Output scale
+    ------------
+    Single-leaf STE / Hard / Triton activates one of ``L`` intermediate slices.
+    A learnable scalar ``output_scale`` (initialized to ``√L``) restores
+    activation magnitude toward the teacher's full-width SwiGLU / RMSNorm range.
     """
 
     def __init__(
@@ -340,6 +346,9 @@ class FFFSwiGLUBlock(nn.Module):
         intermediate_size: int,
         fff_depth: int = 4,
         init_temp: float = 1.0,
+        *,
+        leaf_out_scale: float | None = None,
+        learnable_scale: bool = True,
     ) -> None:
         super().__init__()
         self.fff = FastFeedforwardSwiGLU(
@@ -349,19 +358,36 @@ class FFFSwiGLUBlock(nn.Module):
             init_temp=init_temp,
         )
         self.routing_mode: str = "soft"
+        scale0 = (
+            float(leaf_out_scale)
+            if leaf_out_scale is not None
+            else math.sqrt(float(self.fff.num_leaves))
+        )
+        if learnable_scale:
+            self.output_scale = nn.Parameter(torch.tensor(scale0, dtype=torch.float32))
+        else:
+            self.register_buffer(
+                "output_scale",
+                torch.tensor(scale0, dtype=torch.float32),
+                persistent=True,
+            )
 
     def forward(self, hidden_states: Tensor) -> Tensor:
-        """FFF SwiGLU forward using ``self.routing_mode``."""
+        """FFF SwiGLU forward using ``self.routing_mode``, then ``× output_scale``."""
         mode = self.routing_mode
         if mode not in ("soft", "hard", "triton"):
             mode = "soft"
         if mode == "soft":
             if self.training:
-                return self.fff.forward_soft_ste(hidden_states)
-            return self.fff.forward_soft(hidden_states)
-        if mode == "triton":
-            return self.fff.forward_hard_triton(hidden_states)
-        return self.fff.forward_hard(hidden_states)
+                y = self.fff.forward_soft_ste(hidden_states)
+            else:
+                y = self.fff.forward_soft(hidden_states)
+        elif mode == "triton":
+            y = self.fff.forward_hard_triton(hidden_states)
+        else:
+            y = self.fff.forward_hard(hidden_states)
+        # Broadcast scalar scale to activation dtype/device.
+        return y * self.output_scale.to(dtype=y.dtype, device=y.device)
 
     def set_temperature(self, tau: float) -> None:
         self.fff.set_temperature(tau)
