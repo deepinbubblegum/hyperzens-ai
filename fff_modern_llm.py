@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Adapt HyperZens FFF to modern SwiGLU LLMs (Qwen2.5 / SmolLM2).
+"""Adapt HyperZens FFF to modern gated-GLU LLMs (Qwen / SmolLM / Gemma).
 
 Replaces each Transformer ``MLP`` (``gate_proj`` / ``up_proj`` / ``down_proj``)
-with a SwiGLU-compatible Fast Feedforward tree:
+with a gated-GLU Fast Feedforward tree:
 
+* **SwiGLU** (Qwen/SmolLM) — ``SiLU(gate) ⊙ up`` then ``down``.
+* **GeGLU** (Gemma) — ``GELU_tanh(gate) ⊙ up`` then ``down`` via
+  :class:`FFFGemmaBlock`.
 * **Soft / STE training** — differentiable path mixture; STE forward activates
   only the winning leaf (Hard / Triton semantics).
-* **Hard inference** — discrete tree walk + one SwiGLU leaf.
+* **Hard inference** — discrete tree walk + one gated-GLU leaf.
 * **Triton mode** — same hard leaf selection on CUDA (router policy matches
-  FFF Triton Hard); SwiGLU leaf GEMMs run as efficient PyTorch CUDA matmuls
-  (fused SwiGLU-leaf Triton kernel is not required for correctness).
+  FFF Triton Hard); leaf GEMMs run as efficient PyTorch CUDA matmuls.
 
 Example
 -------
     python fff_modern_llm.py --model Qwen/Qwen2.5-0.5B --device cuda
     python fff_modern_llm.py --model HuggingFaceTB/SmolLM2-360M --device cuda
     python fff_modern_llm.py --smoke-synthetic   # no HF download
+    python fff_modern_llm.py --smoke-synthetic-geglu
 """
 
 from __future__ import annotations
@@ -84,7 +87,8 @@ class FastFeedforwardSwiGLU(nn.Module):
 
     with slice width ``S = intermediate_size / num_leaves``. Leaf output:
 
-        ``y_ℓ = (SiLU(x W_gate) ⊙ (x W_up)) W_down``
+        SwiGLU:  ``y_ℓ = (SiLU(x W_gate) ⊙ (x W_up)) W_down``
+        GeGLU:   ``y_ℓ = (GELU_tanh(x W_gate) ⊙ (x W_up)) W_down``
 
     Soft mixture: ``y = Σ_ℓ P(ℓ|x) · y_ℓ``. Hard / Triton: single winning leaf.
 
@@ -100,6 +104,7 @@ class FastFeedforwardSwiGLU(nn.Module):
         intermediate_size: int,
         depth: int = 4,
         init_temp: float = 1.0,
+        gate_activation: Literal["silu", "gelu_tanh"] = "silu",
     ) -> None:
         super().__init__()
         if depth < 1:
@@ -108,12 +113,17 @@ class FastFeedforwardSwiGLU(nn.Module):
             raise ValueError("d_model and intermediate_size must be >= 1")
         if init_temp <= 0.0:
             raise ValueError(f"init_temp must be > 0, got {init_temp}")
+        if gate_activation not in ("silu", "gelu_tanh"):
+            raise ValueError(
+                f"gate_activation must be 'silu' or 'gelu_tanh', got {gate_activation!r}"
+            )
 
         self.d_model: int = int(d_model)
         self.intermediate_size: int = int(intermediate_size)
         self.depth: int = int(depth)
         self.num_leaves: int = 1 << self.depth
         self.num_routers: int = self.num_leaves - 1
+        self.gate_activation: str = gate_activation
         if intermediate_size % self.num_leaves != 0:
             raise ValueError(
                 f"intermediate_size={intermediate_size} not divisible by "
@@ -184,8 +194,14 @@ class FastFeedforwardSwiGLU(nn.Module):
         leading = tuple(x.shape[:-1])
         return x.reshape(-1, self.d_model), leading
 
+    def _apply_gate(self, gate: Tensor) -> Tensor:
+        """Gate nonlinearity: SiLU (LLaMA/Qwen) or GELU-tanh (Gemma GeGLU)."""
+        if self.gate_activation == "gelu_tanh":
+            return F.gelu(gate, approximate="tanh")
+        return F.silu(gate)
+
     def _swiglu_all_leaves(self, flat: Tensor) -> Tensor:
-        """Evaluate every SwiGLU leaf.
+        """Evaluate every gated-GLU leaf.
 
         Parameters
         ----------
@@ -200,11 +216,11 @@ class FastFeedforwardSwiGLU(nn.Module):
         # gate/up: (N, L, S); down: (N, L, D)
         gate = torch.einsum("nd,lds->nls", flat, self.w_gate_leaf)
         up = torch.einsum("nd,lds->nls", flat, self.w_up_leaf)
-        hidden = F.silu(gate) * up
+        hidden = self._apply_gate(gate) * up
         return torch.einsum("nls,lsd->nld", hidden, self.w_down_leaf)
 
     def _swiglu_selected(self, flat: Tensor, leaf_ids: Tensor) -> Tensor:
-        """Evaluate one SwiGLU leaf per token.
+        """Evaluate one gated-GLU leaf per token.
 
         Parameters
         ----------
@@ -223,7 +239,7 @@ class FastFeedforwardSwiGLU(nn.Module):
         w_d = self.w_down_leaf[leaf_ids]  # (N, S, D)
         gate = torch.einsum("nd,nds->ns", flat, w_g)
         up = torch.einsum("nd,nds->ns", flat, w_u)
-        hidden = F.silu(gate) * up
+        hidden = self._apply_gate(gate) * up
         return torch.einsum("ns,nsd->nd", hidden, w_d)
 
     def _soft_leaf_logits(self, flat: Tensor) -> tuple[Tensor, Tensor]:
@@ -279,7 +295,7 @@ class FastFeedforwardSwiGLU(nn.Module):
         masked_in = flat.unsqueeze(1) * mask.unsqueeze(-1)  # (N, L, D)
         gate = torch.einsum("nld,lds->nls", masked_in, self.w_gate_leaf)
         up = torch.einsum("nld,lds->nls", masked_in, self.w_up_leaf)
-        hidden = F.silu(gate) * up
+        hidden = self._apply_gate(gate) * up
         leaf_out = torch.einsum("nls,lsd->nld", hidden, self.w_down_leaf)
         leaf_out = leaf_out * mask.unsqueeze(-1)
         y = leaf_out.sum(dim=1)
@@ -349,6 +365,7 @@ class FFFSwiGLUBlock(nn.Module):
         *,
         leaf_out_scale: float | None = None,
         learnable_scale: bool = True,
+        gate_activation: Literal["silu", "gelu_tanh"] = "silu",
     ) -> None:
         super().__init__()
         self.fff = FastFeedforwardSwiGLU(
@@ -356,6 +373,7 @@ class FFFSwiGLUBlock(nn.Module):
             intermediate_size=intermediate_size,
             depth=fff_depth,
             init_temp=init_temp,
+            gate_activation=gate_activation,
         )
         self.routing_mode: str = "soft"
         scale0 = (
@@ -373,7 +391,7 @@ class FFFSwiGLUBlock(nn.Module):
             )
 
     def forward(self, hidden_states: Tensor) -> Tensor:
-        """FFF SwiGLU forward using ``self.routing_mode``, then ``× output_scale``."""
+        """FFF gated-GLU forward using ``self.routing_mode``, then ``× output_scale``."""
         mode = self.routing_mode
         if mode not in ("soft", "hard", "triton"):
             mode = "soft"
@@ -397,6 +415,37 @@ class FFFSwiGLUBlock(nn.Module):
 
     def leaf_probs(self) -> Tensor | None:
         return self.fff._last_leaf_probs
+
+
+class FFFGemmaBlock(FFFSwiGLUBlock):
+    """Drop-in replacement for HF Gemma GeGLU ``MLP``.
+
+    Leaf math (Gemma ``gelu_pytorch_tanh``)::
+
+        ``y = (GELU_tanh(x W_gate) ⊙ (x W_up)) W_down``
+
+    Same STE / hard / Triton routing contract as :class:`FFFSwiGLUBlock`.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        intermediate_size: int,
+        fff_depth: int = 4,
+        init_temp: float = 1.0,
+        *,
+        leaf_out_scale: float | None = None,
+        learnable_scale: bool = True,
+    ) -> None:
+        super().__init__(
+            d_model=d_model,
+            intermediate_size=intermediate_size,
+            fff_depth=fff_depth,
+            init_temp=init_temp,
+            leaf_out_scale=leaf_out_scale,
+            learnable_scale=learnable_scale,
+            gate_activation="gelu_tanh",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -552,11 +601,17 @@ def patch_model_with_fff_swiglu(
     init_temp: float = 1.0,
     noise_std: float = 1e-3,
     router_gain: float = 0.1,
+    block_cls: type[FFFSwiGLUBlock] = FFFSwiGLUBlock,
 ) -> int:
-    """Replace each ``layer.mlp`` with :class:`FFFSwiGLUBlock` (in-place).
+    """Replace each ``layer.mlp`` with a gated-GLU FFF block (in-place).
 
     Blocks are constructed and smart-initialized in **float32**. Callers that
-    want FP16 inference should cast the full model **after** this returns.
+    want BF16/FP16 inference should cast the full model **after** this returns.
+
+    Parameters
+    ----------
+    block_cls:
+        ``FFFSwiGLUBlock`` (SiLU) or ``FFFGemmaBlock`` (GELU-tanh GeGLU).
 
     Returns the number of patched layers.
     """
@@ -573,11 +628,12 @@ def patch_model_with_fff_swiglu(
     # Keep patching on the model's current device, but force FP32 params for init.
     ref = next(model.parameters())
     patch_device = ref.device
+    act = "GeGLU" if block_cls is FFFGemmaBlock else "SwiGLU"
 
     n_patched = 0
     for layer_idx, layer in enumerate(iter_decoder_layers(model)):
         dense_mlp = layer.mlp
-        block = FFFSwiGLUBlock(
+        block = block_cls(
             d_model=d_model,
             intermediate_size=intermediate,
             fff_depth=fff_depth,
@@ -594,11 +650,34 @@ def patch_model_with_fff_swiglu(
         n_patched += 1
         if layer_idx == 0:
             print(
-                f"  layer 0: FFF SwiGLU depth={fff_depth} leaves={n_leaves} "
+                f"  layer 0: FFF {act} depth={fff_depth} leaves={n_leaves} "
                 f"slice={intermediate // n_leaves} D={d_model} I={intermediate} "
                 f"(init dtype=float32)"
             )
     return n_patched
+
+
+def patch_model_with_fff_gemma(
+    model: Any,
+    *,
+    fff_depth: int = 4,
+    init_temp: float = 1.0,
+    noise_std: float = 1e-3,
+    router_gain: float = 0.1,
+) -> int:
+    """Replace each ``layer.mlp`` with :class:`FFFGemmaBlock` (GeGLU, FP32 init)."""
+    return patch_model_with_fff_swiglu(
+        model,
+        fff_depth=fff_depth,
+        init_temp=init_temp,
+        noise_std=noise_std,
+        router_gain=router_gain,
+        block_cls=FFFGemmaBlock,
+    )
+
+
+# Alias — Gemma uses the same gate/up/down slice projection as SwiGLU HF MLPs.
+init_fff_from_geglu = init_fff_from_swiglu
 
 
 def load_and_patch_modern_llm(
@@ -608,14 +687,15 @@ def load_and_patch_modern_llm(
     fff_depth: int = 4,
     dtype: torch.dtype | None = None,
     routing_mode: str = "triton",
+    block_cls: type[FFFSwiGLUBlock] = FFFSwiGLUBlock,
 ) -> tuple[Any, Any]:
-    """Load HF CausalLM in FP32, inject FFF SwiGLU, then cast to ``dtype``.
+    """Load HF CausalLM in FP32, inject gated-GLU FFF, then cast to ``dtype``.
 
     Order (required to avoid Half ``geqrf`` failures)
     -------------------------------------------------
     1. Load pretrained weights in **float32**.
-    2. Inject / smart-init all FFF SwiGLU blocks in **float32**.
-    3. Cast patched model to FP16 (CUDA default) and ``.to(device)``.
+    2. Inject / smart-init all FFF blocks in **float32**.
+    3. Cast patched model to BF16/FP16 and ``.to(device)``.
 
     Returns ``(model, tokenizer)``.
     """
@@ -632,6 +712,7 @@ def load_and_patch_modern_llm(
         else:
             dtype = torch.float32
 
+    act = "GeGLU" if block_cls is FFFGemmaBlock else "SwiGLU"
     print(f"Loading `{model_name}` in float32 for safe FFF init ...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -642,8 +723,10 @@ def load_and_patch_modern_llm(
         dtype=torch.float32,
         trust_remote_code=True,
     )
-    print("Injecting FFF SwiGLU blocks (smart-init FP32) ...")
-    n = patch_model_with_fff_swiglu(model, fff_depth=fff_depth)
+    print(f"Injecting FFF {act} blocks (smart-init FP32) ...")
+    n = patch_model_with_fff_swiglu(
+        model, fff_depth=fff_depth, block_cls=block_cls
+    )
 
     if dtype != torch.float32:
         print(f"Casting patched model → {dtype} and moving to {device} ...")
@@ -681,19 +764,50 @@ class _ToySwiGLUMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-def run_synthetic_smoke(device: torch.device, *, fff_depth: int = 4) -> None:
-    """Verify SwiGLU FFF soft / STE / hard shapes and STE≈hard forward."""
+class _ToyGeGLUMLP(nn.Module):
+    """Minimal HF-like Gemma GeGLU MLP for offline tests."""
+
+    def __init__(self, d_model: int, intermediate: int) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(d_model, intermediate, bias=False)
+        self.up_proj = nn.Linear(d_model, intermediate, bias=False)
+        self.down_proj = nn.Linear(intermediate, d_model, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        gate = F.gelu(self.gate_proj(x), approximate="tanh")
+        return self.down_proj(gate * self.up_proj(x))
+
+
+def run_synthetic_smoke(
+    device: torch.device,
+    *,
+    fff_depth: int = 4,
+    gate_activation: Literal["silu", "gelu_tanh"] = "silu",
+) -> None:
+    """Verify gated-GLU FFF soft / STE / hard shapes and STE≈argmax leaf."""
+    is_geglu = gate_activation == "gelu_tanh"
+    label = "GeGLU" if is_geglu else "SwiGLU"
     print("=" * 72)
-    print("Synthetic SwiGLU FFF smoke (no HF weights)")
+    print(f"Synthetic {label} FFF smoke (no HF weights)")
     print("=" * 72)
     d_model, intermediate = 64, 256
     assert intermediate % (1 << fff_depth) == 0
-    mlp = _ToySwiGLUMLP(d_model, intermediate).to(device)
-    block = FFFSwiGLUBlock(
-        d_model, intermediate, fff_depth=fff_depth, init_temp=0.5
-    ).to(device)
-    init_fff_from_swiglu(block, mlp, noise_std=0.0)
+    mlp: nn.Module
+    block: FFFSwiGLUBlock
+    if is_geglu:
+        mlp = _ToyGeGLUMLP(d_model, intermediate).to(device)
+        block = FFFGemmaBlock(
+            d_model, intermediate, fff_depth=fff_depth, init_temp=0.5
+        ).to(device)
+        init_fff_from_geglu(block, mlp, noise_std=0.0)
+    else:
+        mlp = _ToySwiGLUMLP(d_model, intermediate).to(device)
+        block = FFFSwiGLUBlock(
+            d_model, intermediate, fff_depth=fff_depth, init_temp=0.5
+        ).to(device)
+        init_fff_from_swiglu(block, mlp, noise_std=0.0)
 
+    assert block.fff.gate_activation == gate_activation
     x = torch.randn(2, 8, d_model, device=device)
     block.train()
     block.set_routing_mode("soft")
@@ -710,10 +824,27 @@ def run_synthetic_smoke(device: torch.device, *, fff_depth: int = 4) -> None:
     assert y_hard.shape == x.shape
     assert torch.allclose(y_hard, y_triton, atol=1e-5)
 
+    # Direct GeGLU leaf math check (tanh-approx GELU).
     flat, _ = block.fff._flatten_input(x)
+    leaf_ids = torch.zeros(flat.shape[0], dtype=torch.long, device=device)
+    y_leaf = block.fff._swiglu_selected(flat, leaf_ids)
+    w_g = block.fff.w_gate_leaf[0]
+    w_u = block.fff.w_up_leaf[0]
+    w_d = block.fff.w_down_leaf[0]
+    if is_geglu:
+        y_ref = (
+            F.gelu(flat @ w_g, approximate="tanh") * (flat @ w_u)
+        ) @ w_d
+    else:
+        y_ref = (F.silu(flat @ w_g) * (flat @ w_u)) @ w_d
+    leaf_delta = (y_leaf - y_ref).abs().max().item()
+    print(f"  leaf math vs ref max|Δ|={leaf_delta:.3e}")
+    assert leaf_delta < 1e-5
+
     log_leaf, _ = block.fff._soft_leaf_logits(flat)
     leaf_ids = log_leaf.argmax(dim=-1)
     y_argmax = block.fff._swiglu_selected(flat, leaf_ids).view_as(x)
+    y_argmax = y_argmax * block.output_scale.to(dtype=y_argmax.dtype)
     block.train()
     block.set_routing_mode("soft")
     y_ste2 = block(x)
@@ -725,7 +856,7 @@ def run_synthetic_smoke(device: torch.device, *, fff_depth: int = 4) -> None:
     y_ste2.sum().backward()
     assert block.fff.router_weights.grad is not None
     print(f"  router grad norm={block.fff.router_weights.grad.norm().item():.4f}")
-    print("Synthetic smoke OK")
+    print(f"Synthetic {label} smoke OK")
 
 
 # ---------------------------------------------------------------------------
@@ -828,6 +959,16 @@ def build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run offline SwiGLU FFF unit smoke (skip HF download)",
     )
+    p.add_argument(
+        "--smoke-synthetic-geglu",
+        action="store_true",
+        help="Run offline Gemma GeGLU FFF unit smoke (skip HF download)",
+    )
+    p.add_argument(
+        "--gemma",
+        action="store_true",
+        help="Inject FFFGemmaBlock (GeGLU) instead of SwiGLU",
+    )
     return p
 
 
@@ -838,20 +979,32 @@ def main() -> None:
     print_device_info(device)
     print(f"Triton available: {is_triton_available()}")
 
-    if args.smoke_synthetic:
-        run_synthetic_smoke(device, fff_depth=args.fff_depth)
+    if args.smoke_synthetic or args.smoke_synthetic_geglu:
+        act: Literal["silu", "gelu_tanh"] = (
+            "gelu_tanh" if args.smoke_synthetic_geglu else "silu"
+        )
+        run_synthetic_smoke(
+            device, fff_depth=args.fff_depth, gate_activation=act
+        )
         return
 
+    block_cls: type[FFFSwiGLUBlock] = (
+        FFFGemmaBlock if args.gemma else FFFSwiGLUBlock
+    )
     try:
         model, tokenizer = load_and_patch_modern_llm(
             args.model,
             device,
             fff_depth=args.fff_depth,
             routing_mode=args.routing,
+            block_cls=block_cls,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"Failed to load/patch `{args.model}`: {exc}", file=sys.stderr)
-        print("Tip: try --smoke-synthetic or check HF network / disk space.")
+        print(
+            "Tip: try --smoke-synthetic / --smoke-synthetic-geglu, "
+            "HF login for gated Gemma, or check network / disk."
+        )
         raise SystemExit(1) from exc
 
     print("Warmup forward ...")
