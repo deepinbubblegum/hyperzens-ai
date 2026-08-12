@@ -116,15 +116,27 @@ class FFFBlock(nn.Module):
             init_temp=init_temp,
         )
         self.dropout = nn.Dropout(dropout)
+        # Inference switch: "soft" | "hard" | "triton" (see set_routing_mode).
+        self.routing_mode: str = "soft"
 
     def forward(self, hidden_states: Tensor) -> Tensor:
-        """Soft FFF forward; caches leaf probs on ``self.fff`` for entropy loss."""
-        y = self.fff(hidden_states, mode="soft")
-        return self.dropout(y)
+        """FFF forward using ``self.routing_mode`` (soft / hard / triton)."""
+        mode = self.routing_mode
+        if mode not in ("soft", "hard", "hard_cpp", "triton", "triton_int8", "triton_int4"):
+            mode = "soft"
+        y = self.fff(hidden_states, mode=mode)  # type: ignore[arg-type]
+        if mode == "soft":
+            return self.dropout(y)
+        # Eval / generation: no dropout on hard / triton paths.
+        return y
 
     def set_temperature(self, tau: float) -> None:
         """Update soft-routing temperature ``τ`` (annealing)."""
         self.fff.set_temperature(tau)
+
+    def set_routing_mode(self, mode: str) -> None:
+        """Set FFF routing path: ``soft``, ``hard``, or ``triton``."""
+        self.routing_mode = str(mode)
 
     def leaf_probs(self) -> Tensor | None:
         """Last soft leaf mixture ``(N, L)`` or ``None`` if no soft forward yet."""
@@ -195,6 +207,12 @@ def set_student_temperature(student: Any, tau: float) -> None:
         mlp = block.mlp
         if isinstance(mlp, FFFBlock):
             mlp.set_temperature(tau)
+
+
+def set_student_routing_mode(student: Any, mode: str) -> None:
+    """Broadcast FFF routing mode (``soft`` / ``hard`` / ``triton``) to all blocks."""
+    for block in iter_fff_blocks(student):
+        block.set_routing_mode(mode)
 
 
 def iter_fff_blocks(student: Any) -> Iterator[FFFBlock]:
