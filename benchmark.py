@@ -194,6 +194,20 @@ def make_fff_triton_step(model: FFFTransformer) -> Callable[[Tensor], Tensor]:
     return step
 
 
+def make_fff_triton_quant_step(
+    model: FFFTransformer,
+    quant_mode: str,
+) -> Callable[[Tensor], Tensor]:
+    """Triton hard routing with INT8/INT4 leaf weights (``triton_int8`` / ``triton_int4``)."""
+    mode = "triton_int8" if quant_mode == "int8" else "triton_int4"
+
+    def step(idx: Tensor) -> Tensor:
+        logits, _ = model(idx, mode=mode)  # type: ignore[arg-type]
+        return logits
+
+    return step
+
+
 def make_dense_step(model: StandardTransformer) -> Callable[[Tensor], Tensor]:
     def step(idx: Tensor) -> Tensor:
         return model(idx)
@@ -562,6 +576,12 @@ def build_argparser() -> argparse.ArgumentParser:
             "Compute dtype for CUDA batch sweep: fp32, fp16, bf16, or both "
             "(fp32 then fp16; default both)"
         ),
+    )
+    p.add_argument(
+        "--quant-sweep",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="On CUDA: run FP16 vs INT8 vs INT4 Triton quant sweep (default: on)",
     )
     return p
 
@@ -1226,6 +1246,232 @@ def run_cuda_batch_scaling_benchmark(
     return rows
 
 
+@dataclass
+class QuantSweepRow:
+    """One row of the FP16 vs INT8 vs INT4 comparison table."""
+
+    batch_size: int
+    mode: str
+    tok_s: float
+    ms_per_tok: float
+    max_abs_err: float
+    leaf_vram_mb: float
+    peak_vram_mb: float
+    note: str = ""
+
+
+def run_cuda_quant_sweep_benchmark(
+    device: torch.device,
+    config: FFFConfig,
+    ckpt_path: Path | None,
+    *,
+    batch_sizes: list[int] | None = None,
+    prompt_len: int = 32,
+    n_tokens: int = 50,
+    warmup: int = 5,
+    seed: int = 42,
+) -> list[QuantSweepRow]:
+    """Compare FP16 vs INT8 vs INT4 Triton FFF across selected batch sizes."""
+    from models.fff_quant import (
+        attach_leaf_qstates,
+        clear_leaf_qstates,
+        estimate_leaf_vram_mb,
+        quantize_fff_model_leaves,
+        total_quant_leaf_vram_mb,
+    )
+
+    if device.type != "cuda":
+        print("Quant sweep skipped (CUDA only).")
+        return []
+    if not is_triton_available():
+        print("Quant sweep skipped — Triton unavailable.")
+        return []
+
+    batch_sizes = batch_sizes or [1, 16, 64, 256, 512]
+    apply_hardware_optimizations(device)
+    torch.manual_seed(seed)
+
+    print("\n" + "-" * 72)
+    print("CUDA Quant Sweep — FP16 vs INT8 vs INT4 (FFF Triton)")
+    print("-" * 72)
+    print(f"batch_sizes={batch_sizes} | prompt_len={prompt_len} | timed={n_tokens}")
+
+    model = FFFTransformer(config).to(device)
+    if ckpt_path is not None:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+    model.half().eval()
+
+    # Leaf VRAM footprint (all layers) for reporting.
+    leaf_fp16_mb = 0.0
+    for layer in model.fff_layers():
+        leaf_fp16_mb += estimate_leaf_vram_mb(layer.leaf_weights.data, "fp16")
+
+    int8_states = quantize_fff_model_leaves(model, "int8")
+    int4_states = quantize_fff_model_leaves(model, "int4")
+    leaf_int8_mb = total_quant_leaf_vram_mb(int8_states)
+    leaf_int4_mb = total_quant_leaf_vram_mb(int4_states)
+
+    print(
+        f"Leaf weight storage: FP16={leaf_fp16_mb:.2f} MB | "
+        f"INT8={leaf_int8_mb:.2f} MB | INT4={leaf_int4_mb:.2f} MB"
+    )
+
+    fp16_step = make_fff_triton_step(model)
+    warmup_fff_model_triton(model, sample_tokens=max(prompt_len, 32), n_iters=3)
+
+    # Probe tensors for max |Δ| vs FP16 (single forward, not timed).
+    probe = torch.randint(
+        0, config.vocab_size, (1, min(prompt_len, 16)), device=device, dtype=torch.long
+    )
+    with torch.no_grad():
+        ref_logits, _ = model(probe, mode="triton")
+
+    attach_leaf_qstates(model, int8_states)
+    with torch.no_grad():
+        int8_logits, _ = model(probe, mode="triton_int8")  # type: ignore[arg-type]
+    max_err_int8 = float((int8_logits.float() - ref_logits.float()).abs().max().item())
+    clear_leaf_qstates(model)
+
+    attach_leaf_qstates(model, int4_states)
+    with torch.no_grad():
+        int4_logits, _ = model(probe, mode="triton_int4")  # type: ignore[arg-type]
+    max_err_int4 = float((int4_logits.float() - ref_logits.float()).abs().max().item())
+    clear_leaf_qstates(model)
+
+    print(
+        f"Max |Δ| vs FP16 (probe): INT8={max_err_int8:.4e} | INT4={max_err_int4:.4e}"
+    )
+
+    modes = [
+        ("fp16", fp16_step, leaf_fp16_mb, 0.0),
+        ("int8", None, leaf_int8_mb, max_err_int8),
+        ("int4", None, leaf_int4_mb, max_err_int4),
+    ]
+
+    rows: list[QuantSweepRow] = []
+    for bsz in batch_sizes:
+        print(f"\n  [quant] batch_size={bsz} ...")
+        prompt = torch.randint(
+            0, config.vocab_size, (bsz, prompt_len), device=device, dtype=torch.long
+        )
+        for mode_name, step, leaf_mb, max_err in modes:
+            try:
+                if mode_name == "fp16":
+                    clear_leaf_qstates(model)
+                    run_step = fp16_step
+                elif mode_name == "int8":
+                    attach_leaf_qstates(model, int8_states)
+                    run_step = make_fff_triton_quant_step(model, "int8")
+                else:
+                    attach_leaf_qstates(model, int4_states)
+                    run_step = make_fff_triton_quant_step(model, "int4")
+
+                tok_s, ms, peak = _time_batched_generate(
+                    run_step,
+                    prompt,
+                    config.block_size,
+                    n_tokens,
+                    warmup_tokens=warmup,
+                )
+                rows.append(
+                    QuantSweepRow(
+                        batch_size=bsz,
+                        mode=mode_name,
+                        tok_s=tok_s,
+                        ms_per_tok=ms,
+                        max_abs_err=max_err if mode_name != "fp16" else 0.0,
+                        leaf_vram_mb=leaf_mb,
+                        peak_vram_mb=peak,
+                    )
+                )
+                print(
+                    f"    {mode_name.upper():4s}: {tok_s:.2f} tok/s | "
+                    f"{ms:.3f} ms/tok | Δ={max_err if mode_name != 'fp16' else 0.0:.3e} | "
+                    f"leaf={leaf_mb:.2f} MB | peak={peak:.1f} MB"
+                )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                rows.append(
+                    QuantSweepRow(
+                        batch_size=bsz,
+                        mode=mode_name,
+                        tok_s=float("nan"),
+                        ms_per_tok=float("nan"),
+                        max_abs_err=max_err,
+                        leaf_vram_mb=leaf_mb,
+                        peak_vram_mb=float("nan"),
+                        note="OOM",
+                    )
+                )
+                print(f"    {mode_name.upper():4s}: OOM — stopping larger batches")
+                clear_leaf_qstates(model)
+                print_quant_sweep_table(rows)
+                del model
+                gc.collect()
+                torch.cuda.empty_cache()
+                return rows
+        clear_leaf_qstates(model)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    print_quant_sweep_table(rows)
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    return rows
+
+
+def print_quant_sweep_table(rows: list[QuantSweepRow]) -> None:
+    """Print FP16 / INT8 / INT4 throughput, error, and VRAM summary."""
+    headers = [
+        "Batch",
+        "Mode",
+        "tok/s",
+        "ms/tok",
+        "Max|Δ|",
+        "Leaf VRAM",
+        "Peak VRAM",
+    ]
+    widths = [8, 8, 12, 10, 12, 12, 12]
+
+    def fmt_row(cells: list[str]) -> str:
+        parts = [f" {c:<{w - 1}}" for c, w in zip(cells, widths)]
+        return "|" + "|".join(parts) + "|"
+
+    sep = "+" + "+".join("-" * w for w in widths) + "+"
+    print("\n" + "=" * 88)
+    print("Quant Sweep Summary — FP16 vs INT8 vs INT4 (FFF Triton)")
+    print("=" * 88)
+    print(sep)
+    print(fmt_row(headers))
+    print(sep)
+    for row in rows:
+        if row.note:
+            cells = [
+                str(row.batch_size),
+                row.mode.upper(),
+                "OOM",
+                "—",
+                f"{row.max_abs_err:.2e}",
+                f"{row.leaf_vram_mb:.2f}",
+                "—",
+            ]
+        else:
+            cells = [
+                str(row.batch_size),
+                row.mode.upper(),
+                f"{row.tok_s:.2f}",
+                f"{row.ms_per_tok:.3f}",
+                f"{row.max_abs_err:.2e}",
+                f"{row.leaf_vram_mb:.2f}",
+                f"{row.peak_vram_mb:.1f}",
+            ]
+        print(fmt_row(cells))
+    print(sep)
+    print("=" * 88)
+
+
 def main() -> None:
     args = build_argparser().parse_args()
     torch.set_grad_enabled(False)
@@ -1338,6 +1584,18 @@ def main() -> None:
                 seed=args.seed,
                 dtype=sweep_dtype,
             )
+
+    if primary.type == "cuda" and args.quant_sweep:
+        run_cuda_quant_sweep_benchmark(
+            primary,
+            config,
+            ckpt_path,
+            batch_sizes=[1, 16, 64, 256, 512],
+            prompt_len=args.batch_sweep_prompt_len,
+            n_tokens=min(50, args.batch_sweep_tokens),
+            warmup=max(3, args.warmup // 2),
+            seed=args.seed,
+        )
 
     torch.set_num_threads(cpu_count)
 

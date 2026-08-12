@@ -23,6 +23,8 @@ Precision (Ampere / sm_86 Tensor Cores)
 * Autotune uses a 3-config Ampere (sm_86) shortlist with power-of-two
   tiles ``>= 64`` so FP16 warmup stays fast and Tensor Core–aligned.
 * Neither hybrid path upcasts tensors to FP32 for the whole forward.
+* INT8 / INT4 leaf weights: fused kernels dequantize on-the-fly
+  (``fff_hard_forward_triton_quant``); see ``models/fff_quant.py``.
 """
 
 from __future__ import annotations
@@ -394,6 +396,217 @@ if _HAS_TRITON:
             mask=o_mask,
         )
 
+    # ------------------------------------------------------------------
+    # Fused INT8: tree walk + on-the-fly dequant leaf GEMV
+    # ------------------------------------------------------------------
+
+    @_decorate_autotune(
+        _fused_autotune_configs(),
+        ["D_in", "D_out", "DEPTH", "MAX_DIN"],
+    )
+    @triton.jit
+    def fff_hard_forward_int8_kernel(
+        x_ptr,
+        wr_ptr,
+        br_ptr,
+        wl_q_ptr,
+        scale_ptr,
+        bl_ptr,
+        y_ptr,
+        N,
+        D_in,
+        D_out,
+        num_leaves,
+        stride_x_n,
+        stride_x_d,
+        stride_wr_r,
+        stride_wr_d,
+        stride_wl_l,
+        stride_wl_i,
+        stride_wl_o,
+        stride_bl_l,
+        stride_bl_o,
+        stride_y_n,
+        stride_y_o,
+        DEPTH: tl.constexpr,
+        MAX_DIN: tl.constexpr,
+        BLOCK_SIZE_O: tl.constexpr,
+        BLOCK_SIZE_I: tl.constexpr,
+    ):
+        """Fused hard routing with INT8 leaf weights dequantized in-register."""
+        n = tl.program_id(0)
+        o_tile = tl.program_id(1)
+        if n >= N:
+            return
+
+        o_offsets = o_tile * BLOCK_SIZE_O + tl.arange(0, BLOCK_SIZE_O)
+        o_mask = o_offsets < D_out
+
+        node = tl.zeros((), dtype=tl.int32)
+        for _d in tl.static_range(DEPTH):
+            score = tl.zeros((), dtype=tl.float32)
+            for i_start in tl.static_range(0, MAX_DIN, BLOCK_SIZE_I):
+                i_offsets = i_start + tl.arange(0, BLOCK_SIZE_I)
+                i_mask = i_offsets < D_in
+                x_tile = tl.load(
+                    x_ptr + n * stride_x_n + i_offsets * stride_x_d,
+                    mask=i_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                w_tile = tl.load(
+                    wr_ptr + node * stride_wr_r + i_offsets * stride_wr_d,
+                    mask=i_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                score += tl.sum(x_tile * w_tile)
+            score += tl.load(br_ptr + node).to(tl.float32)
+            node = tl.where(score > 0.0, 2 * node + 2, 2 * node + 1)
+
+        leaf_id = node - (num_leaves - 1)
+        leaf_id = tl.maximum(tl.minimum(leaf_id, num_leaves - 1), 0)
+        scale = tl.load(scale_ptr + leaf_id).to(tl.float32)
+
+        acc = tl.load(
+            bl_ptr + leaf_id * stride_bl_l + o_offsets * stride_bl_o,
+            mask=o_mask,
+            other=0.0,
+        ).to(tl.float32)
+        for i_start in tl.static_range(0, MAX_DIN, BLOCK_SIZE_I):
+            i_offsets = i_start + tl.arange(0, BLOCK_SIZE_I)
+            i_mask = i_offsets < D_in
+            x_tile = tl.load(
+                x_ptr + n * stride_x_n + i_offsets * stride_x_d,
+                mask=i_mask,
+                other=0.0,
+            ).to(tl.float32)
+            w_ptrs = (
+                wl_q_ptr
+                + leaf_id * stride_wl_l
+                + i_offsets[:, None] * stride_wl_i
+                + o_offsets[None, :] * stride_wl_o
+            )
+            # Load INT8 → FP32, multiply by per-leaf scale (on-the-fly dequant).
+            w_q = tl.load(
+                w_ptrs,
+                mask=i_mask[:, None] & o_mask[None, :],
+                other=0,
+            ).to(tl.float32)
+            w_tile = w_q * scale
+            acc += tl.sum(x_tile[:, None] * w_tile, axis=0)
+
+        tl.store(
+            y_ptr + n * stride_y_n + o_offsets * stride_y_o,
+            acc.to(y_ptr.dtype.element_ty),
+            mask=o_mask,
+        )
+
+    # ------------------------------------------------------------------
+    # Fused INT4: tree walk + nibble unpack + dequant leaf GEMV
+    # ------------------------------------------------------------------
+
+    @_decorate_autotune(
+        _fused_autotune_configs(),
+        ["D_in", "D_out", "DEPTH", "MAX_DIN"],
+    )
+    @triton.jit
+    def fff_hard_forward_int4_kernel(
+        x_ptr,
+        wr_ptr,
+        br_ptr,
+        wl_pack_ptr,
+        scale_ptr,
+        bl_ptr,
+        y_ptr,
+        N,
+        D_in,
+        D_out,
+        num_leaves,
+        packed_width,
+        stride_x_n,
+        stride_x_d,
+        stride_wr_r,
+        stride_wr_d,
+        stride_pack_l,
+        stride_pack_b,
+        stride_bl_l,
+        stride_bl_o,
+        stride_y_n,
+        stride_y_o,
+        DEPTH: tl.constexpr,
+        MAX_DIN: tl.constexpr,
+        BLOCK_SIZE_O: tl.constexpr,
+        BLOCK_SIZE_I: tl.constexpr,
+    ):
+        """Fused hard routing with packed INT4 leaf weights (SRAM nibble unpack)."""
+        n = tl.program_id(0)
+        o_tile = tl.program_id(1)
+        if n >= N:
+            return
+
+        o_offsets = o_tile * BLOCK_SIZE_O + tl.arange(0, BLOCK_SIZE_O)
+        o_mask = o_offsets < D_out
+
+        node = tl.zeros((), dtype=tl.int32)
+        for _d in tl.static_range(DEPTH):
+            score = tl.zeros((), dtype=tl.float32)
+            for i_start in tl.static_range(0, MAX_DIN, BLOCK_SIZE_I):
+                i_offsets = i_start + tl.arange(0, BLOCK_SIZE_I)
+                i_mask = i_offsets < D_in
+                x_tile = tl.load(
+                    x_ptr + n * stride_x_n + i_offsets * stride_x_d,
+                    mask=i_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                w_tile = tl.load(
+                    wr_ptr + node * stride_wr_r + i_offsets * stride_wr_d,
+                    mask=i_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                score += tl.sum(x_tile * w_tile)
+            score += tl.load(br_ptr + node).to(tl.float32)
+            node = tl.where(score > 0.0, 2 * node + 2, 2 * node + 1)
+
+        leaf_id = node - (num_leaves - 1)
+        leaf_id = tl.maximum(tl.minimum(leaf_id, num_leaves - 1), 0)
+        scale = tl.load(scale_ptr + leaf_id).to(tl.float32)
+
+        acc = tl.load(
+            bl_ptr + leaf_id * stride_bl_l + o_offsets * stride_bl_o,
+            mask=o_mask,
+            other=0.0,
+        ).to(tl.float32)
+        for i_start in tl.static_range(0, MAX_DIN, BLOCK_SIZE_I):
+            i_offsets = i_start + tl.arange(0, BLOCK_SIZE_I)
+            i_mask = i_offsets < D_in
+            x_tile = tl.load(
+                x_ptr + n * stride_x_n + i_offsets * stride_x_d,
+                mask=i_mask,
+                other=0.0,
+            ).to(tl.float32)
+            # Flat index into (D_in, D_out); unpack low/high nibble from uint8.
+            flat_idx = i_offsets[:, None] * D_out + o_offsets[None, :]
+            byte_idx = flat_idx // 2
+            is_high = flat_idx % 2
+            pack_mask = i_mask[:, None] & o_mask[None, :] & (byte_idx < packed_width)
+            byte = tl.load(
+                wl_pack_ptr
+                + leaf_id * stride_pack_l
+                + byte_idx * stride_pack_b,
+                mask=pack_mask,
+                other=0,
+            ).to(tl.int32)
+            nibble = tl.where(is_high == 1, (byte >> 4) & 0x0F, byte & 0x0F)
+            # Sign-extend 4-bit two's complement → [-8, 7].
+            signed = tl.where(nibble >= 8, nibble - 16, nibble).to(tl.float32)
+            w_tile = signed * scale
+            acc += tl.sum(x_tile[:, None] * w_tile, axis=0)
+
+        tl.store(
+            y_ptr + n * stride_y_n + o_offsets * stride_y_o,
+            acc.to(y_ptr.dtype.element_ty),
+            mask=o_mask,
+        )
+
 
 def _launch_route_leaf_ids(
     x: Tensor,
@@ -473,6 +686,101 @@ def _launch_fused(
         DEPTH=depth,
         MAX_DIN=max_din,
         DTYPE_CODE=dtype_code,
+    )
+
+
+def _launch_fused_int8(
+    x: Tensor,
+    w_router: Tensor,
+    b_router: Tensor,
+    w_leaf_q: Tensor,
+    scale: Tensor,
+    b_leaf: Tensor,
+    depth: int,
+    y: Tensor,
+) -> None:
+    assert _HAS_TRITON
+    n, d_in = x.shape
+    d_out = w_leaf_q.shape[-1]
+    num_leaves = 1 << depth
+    max_din = triton.next_power_of_2(max(d_in, 1))
+
+    def grid(meta: dict[str, Any]) -> tuple[int, int]:
+        return (n, triton.cdiv(d_out, meta["BLOCK_SIZE_O"]))
+
+    fff_hard_forward_int8_kernel[grid](
+        x,
+        w_router,
+        b_router,
+        w_leaf_q,
+        scale,
+        b_leaf,
+        y,
+        n,
+        d_in,
+        d_out,
+        num_leaves,
+        x.stride(0),
+        x.stride(1),
+        w_router.stride(0),
+        w_router.stride(1),
+        w_leaf_q.stride(0),
+        w_leaf_q.stride(1),
+        w_leaf_q.stride(2),
+        b_leaf.stride(0),
+        b_leaf.stride(1),
+        y.stride(0),
+        y.stride(1),
+        DEPTH=depth,
+        MAX_DIN=max_din,
+    )
+
+
+def _launch_fused_int4(
+    x: Tensor,
+    w_router: Tensor,
+    b_router: Tensor,
+    w_packed: Tensor,
+    scale: Tensor,
+    b_leaf: Tensor,
+    depth: int,
+    y: Tensor,
+) -> None:
+    assert _HAS_TRITON
+    n, d_in = x.shape
+    d_out = b_leaf.shape[-1]
+    num_leaves = 1 << depth
+    packed_width = int(w_packed.shape[1])
+    max_din = triton.next_power_of_2(max(d_in, 1))
+
+    def grid(meta: dict[str, Any]) -> tuple[int, int]:
+        return (n, triton.cdiv(d_out, meta["BLOCK_SIZE_O"]))
+
+    fff_hard_forward_int4_kernel[grid](
+        x,
+        w_router,
+        b_router,
+        w_packed,
+        scale,
+        b_leaf,
+        y,
+        n,
+        d_in,
+        d_out,
+        num_leaves,
+        packed_width,
+        x.stride(0),
+        x.stride(1),
+        w_router.stride(0),
+        w_router.stride(1),
+        w_packed.stride(0),
+        w_packed.stride(1),
+        b_leaf.stride(0),
+        b_leaf.stride(1),
+        y.stride(0),
+        y.stride(1),
+        DEPTH=depth,
+        MAX_DIN=max_din,
     )
 
 
@@ -622,6 +930,134 @@ def fff_hard_forward_triton(
         _launch_route_leaf_ids(x, wr, br, buf.leaf_ids[:n], depth)
         return _coalesced_leaf_gemm(x, wl, bl, buf.leaf_ids, y, buf)
 
+    except torch.cuda.OutOfMemoryError:
+        clear_triton_buffer_pool(empty_cache=True)
+        raise
+
+
+def _coalesced_leaf_gemm_quant(
+    x: Tensor,
+    qstate: Any,
+    b_leaf: Tensor,
+    leaf_ids: Tensor,
+    y: Tensor,
+    buf: _FFFTritonBuffers,
+) -> Tensor:
+    """Sorted leaf GEMM after dequantizing each occupied leaf to compute dtype."""
+    from models.fff_quant import dequantize_fff_leaf_int4
+
+    n = x.shape[0]
+    leaf_view = leaf_ids[:n]
+    leaf_sorted = buf.leaf_sorted[:n]
+    order = buf.order[:n]
+    x_sorted = buf.x_sorted[:n]
+    y_sorted = buf.y_sorted[:n]
+
+    torch.sort(leaf_view, stable=True, out=(leaf_sorted, order))
+    x_sorted.copy_(x.index_select(0, order))
+
+    uniq, counts = torch.unique_consecutive(leaf_sorted, return_counts=True)
+    uniq_list = uniq.tolist()
+    counts_list = counts.tolist()
+
+    offset = 0
+    for leaf_k, cnt in zip(uniq_list, counts_list):
+        sl = slice(offset, offset + cnt)
+        if qstate.mode == "int8":
+            w_fp = qstate.weight_q[leaf_k].to(dtype=torch.float16) * qstate.scale[
+                leaf_k
+            ].to(dtype=torch.float16)
+        else:
+            w_fp = dequantize_fff_leaf_int4(
+                qstate.weight_q[leaf_k : leaf_k + 1],
+                qstate.scale[leaf_k : leaf_k + 1],
+                qstate.d_in,
+                qstate.d_out,
+            )[0]
+        if w_fp.dtype != x_sorted.dtype:
+            w_fp = w_fp.to(dtype=x_sorted.dtype)
+        torch.mm(x_sorted[sl], w_fp, out=y_sorted[sl])
+        y_sorted[sl].add_(b_leaf[leaf_k])
+        offset += cnt
+
+    y_out = y[:n]
+    y_out.index_copy_(0, order, y_sorted)
+    return y_out
+
+
+def fff_hard_forward_triton_quant(
+    x: Tensor,
+    w_router: Tensor,
+    b_router: Tensor,
+    qstate: Any,
+    b_leaf: Tensor,
+    depth: int,
+    *,
+    out: Tensor | None = None,
+    dispatch_n: int | None = None,
+) -> Tensor:
+    """Hard-routing forward with INT8/INT4 leaf weights (on-the-fly dequant).
+
+    Routers stay in activation dtype (typically FP16). Leaf matrices are stored
+    as INT8 or packed INT4 + FP16 scales and dequantized inside the fused Triton
+    kernel (small batch) or just-in-time before ``torch.mm`` (large batch).
+    """
+    from models.fff_quant import QuantizedLeafWeights
+
+    if not isinstance(qstate, QuantizedLeafWeights):
+        raise TypeError("qstate must be a QuantizedLeafWeights instance")
+    if not _HAS_TRITON:
+        raise RuntimeError(
+            "triton is not installed. pip install triton  "
+            f"(import error: {_TRITON_IMPORT_ERROR})"
+        )
+    if x.device.type != "cuda":
+        raise RuntimeError("fff_hard_forward_triton_quant requires CUDA tensors")
+    if depth < 1 or depth > 12:
+        raise ValueError(f"depth must be in [1, 12], got {depth}")
+
+    x = x.contiguous()
+    compute_dtype = x.dtype
+    if compute_dtype not in SUPPORTED_DTYPES:
+        raise TypeError(f"unsupported x.dtype={compute_dtype}")
+    wr = _as_compute_tensor(w_router, compute_dtype)
+    br = _as_compute_tensor(b_router, compute_dtype)
+    bl = _as_compute_tensor(b_leaf, compute_dtype)
+    w_q = qstate.weight_q
+    scale = qstate.scale.to(dtype=torch.float16).contiguous()
+    if w_q.device != x.device:
+        w_q = w_q.to(device=x.device)
+        scale = scale.to(device=x.device)
+
+    if x.ndim != 2:
+        raise ValueError(f"x must be (N, D_in), got {tuple(x.shape)}")
+    n, d_in = x.shape
+    if d_in != qstate.d_in:
+        raise ValueError(f"D_in mismatch: x={d_in}, qstate={qstate.d_in}")
+    d_out = qstate.d_out
+    route_n = int(dispatch_n) if dispatch_n is not None else n
+    fused_limit = fused_dispatch_limit(compute_dtype)
+    num_leaves = 1 << depth
+    if w_q.shape[0] != num_leaves or scale.shape != (num_leaves,):
+        raise ValueError("quantized leaf / scale shape incompatible with depth")
+    if bl.shape != (num_leaves, d_out):
+        raise ValueError(f"b_leaf shape {tuple(bl.shape)} != ({num_leaves}, {d_out})")
+
+    try:
+        buf = _get_buffers(n, d_in, d_out, x.device, compute_dtype)
+        y = buf.y if out is None else out.contiguous()
+        if y.shape != (n, d_out):
+            raise ValueError(f"out must be ({n}, {d_out})")
+
+        if route_n <= fused_limit:
+            if qstate.mode == "int8":
+                _launch_fused_int8(x, wr, br, w_q, scale, bl, depth, y[:n])
+            else:
+                _launch_fused_int4(x, wr, br, w_q, scale, bl, depth, y[:n])
+            return y[:n]
+
+        _launch_route_leaf_ids(x, wr, br, buf.leaf_ids[:n], depth)
+        return _coalesced_leaf_gemm_quant(x, qstate, bl, buf.leaf_ids, y, buf)
     except torch.cuda.OutOfMemoryError:
         clear_triton_buffer_pool(empty_cache=True)
         raise

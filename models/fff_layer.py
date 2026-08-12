@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-RoutingMode = Literal["soft", "hard", "hard_cpp", "triton"]
+RoutingMode = Literal["soft", "hard", "hard_cpp", "triton", "triton_int8", "triton_int4"]
 
 # ---------------------------------------------------------------------------
 # Optional C++ hard-routing extension (JIT via torch.utils.cpp_extension)
@@ -335,6 +335,8 @@ class FastFeedforwardLinear(nn.Module):
             to PyTorch if the extension is unavailable or ``x`` is not CPU).
             ``"triton"`` — fused CUDA Triton kernel (falls back to PyTorch hard
             if Triton/CUDA is unavailable).
+            ``"triton_int8"`` / ``"triton_int4"`` — Triton hard routing with
+            quantized leaf weights (requires ``leaf_qstate`` attached).
 
         Returns
         -------
@@ -349,8 +351,13 @@ class FastFeedforwardLinear(nn.Module):
             return self.forward_hard_cpp(x)
         if mode == "triton":
             return self.forward_hard_triton(x)
+        if mode == "triton_int8":
+            return self.forward_hard_triton_quant(x, expect_mode="int8")
+        if mode == "triton_int4":
+            return self.forward_hard_triton_quant(x, expect_mode="int4")
         raise ValueError(
-            f"mode must be 'soft', 'hard', 'hard_cpp', or 'triton', got {mode!r}"
+            "mode must be 'soft', 'hard', 'hard_cpp', 'triton', "
+            f"'triton_int8', or 'triton_int4', got {mode!r}"
         )
 
     # ------------------------------------------------------------------
@@ -563,6 +570,94 @@ class FastFeedforwardLinear(nn.Module):
             )
         except (RuntimeError, TypeError, ValueError):
             return self.forward_hard(x)
+        return y.view(*leading, self.out_features)
+
+    def forward_hard_triton_quant(
+        self,
+        x: Tensor,
+        *,
+        expect_mode: str | None = None,
+    ) -> Tensor:
+        """Hard routing via Triton with INT8/INT4 leaf dequant (``leaf_qstate``).
+
+        Attach a :class:`~models.fff_quant.QuantizedLeafWeights` as
+        ``self.leaf_qstate`` before calling. Falls back to FP16 dequant +
+        :meth:`forward_hard` when Triton/CUDA is unavailable.
+        """
+        qstate = getattr(self, "leaf_qstate", None)
+        if qstate is None:
+            raise RuntimeError(
+                "forward_hard_triton_quant requires self.leaf_qstate "
+                "(run quantize_fff_model_leaves / attach_leaf_qstates)"
+            )
+        if expect_mode is not None and qstate.mode != expect_mode:
+            raise ValueError(
+                f"leaf_qstate.mode={qstate.mode!r} but mode expects {expect_mode!r}"
+            )
+
+        flat, leading = self._flatten_input(x)
+        if flat.device.type != "cuda":
+            from models.fff_quant import dequantize_leaf_weights
+
+            w_fp = dequantize_leaf_weights(qstate).to(device=flat.device, dtype=flat.dtype)
+            # Temporary weight swap for PyTorch hard fallback.
+            saved = self.leaf_weights.data
+            try:
+                self.leaf_weights.data = w_fp
+                return self.forward_hard(x)
+            finally:
+                self.leaf_weights.data = saved
+
+        try:
+            from models.fff_hard_triton import (
+                _as_compute_tensor,
+                fff_hard_forward_triton_quant,
+                is_triton_available,
+            )
+        except ImportError:
+            from models.fff_quant import dequantize_leaf_weights
+
+            w_fp = dequantize_leaf_weights(qstate).to(dtype=flat.dtype)
+            saved = self.leaf_weights.data
+            try:
+                self.leaf_weights.data = w_fp
+                return self.forward_hard(x)
+            finally:
+                self.leaf_weights.data = saved
+
+        if not is_triton_available():
+            from models.fff_quant import dequantize_leaf_weights
+
+            w_fp = dequantize_leaf_weights(qstate).to(dtype=flat.dtype)
+            saved = self.leaf_weights.data
+            try:
+                self.leaf_weights.data = w_fp
+                return self.forward_hard(x)
+            finally:
+                self.leaf_weights.data = saved
+
+        dt = flat.dtype
+        dispatch_n = int(x.shape[0]) if x.ndim >= 2 else int(flat.shape[0])
+        try:
+            y = fff_hard_forward_triton_quant(
+                flat if flat.is_contiguous() else flat.contiguous(),
+                _as_compute_tensor(self.router_weights.detach(), dt),
+                _as_compute_tensor(self.router_biases.detach(), dt),
+                qstate,
+                _as_compute_tensor(self.leaf_biases.detach(), dt),
+                int(self.depth),
+                dispatch_n=dispatch_n,
+            )
+        except (RuntimeError, TypeError, ValueError):
+            from models.fff_quant import dequantize_leaf_weights
+
+            w_fp = dequantize_leaf_weights(qstate).to(dtype=flat.dtype)
+            saved = self.leaf_weights.data
+            try:
+                self.leaf_weights.data = w_fp
+                return self.forward_hard(x)
+            finally:
+                self.leaf_weights.data = saved
         return y.view(*leading, self.out_features)
 
     def forward_hard_sequential(self, x: Tensor) -> Tensor:
