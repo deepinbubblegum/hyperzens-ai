@@ -43,13 +43,27 @@ _fff_hard_load_error: BaseException | None = None
 
 
 def _load_fff_hard_ext(*, verbose: bool = False) -> Any | None:
-    """JIT-compile ``csrc/fff_hard.cpp`` once; return ``None`` on failure."""
+    """Load ``fff_hard_cpp`` — prefer an installed wheel, else JIT-compile.
+
+    Compile flags come from ``csrc/compiler_flags.py`` (same as ``setup.py``):
+    macOS → ``-O3 -std=c++17`` (optional OpenMP); Linux → ``-O3 -march=native
+    -fopenmp -funroll-loops``. Retries without OpenMP if needed.
+    """
     global _fff_hard_ext, _fff_hard_load_attempted, _fff_hard_load_error
     if _fff_hard_ext is not None:
         return _fff_hard_ext
     if _fff_hard_load_attempted:
         return None
     _fff_hard_load_attempted = True
+
+    # 1) Prefer a setuptools-built extension (`pip install -e .` / setup.py).
+    try:
+        import fff_hard_cpp as installed  # type: ignore[import-not-found]
+
+        _fff_hard_ext = installed
+        return _fff_hard_ext
+    except ImportError:
+        pass
 
     if not _FFF_HARD_SRC.is_file():
         _fff_hard_load_error = FileNotFoundError(_FFF_HARD_SRC)
@@ -70,6 +84,27 @@ def _load_fff_hard_ext(*, verbose: bool = False) -> Any | None:
         )
         return None
 
+    # Shared aggressive flags with setup.py
+    try:
+        import sys as _sys
+
+        csrc_path = str(_CSRC_DIR)
+        if csrc_path not in _sys.path:
+            _sys.path.insert(0, csrc_path)
+        from compiler_flags import (  # type: ignore[import-not-found]
+            fff_hard_jit_cflags,
+            fff_hard_jit_cflags_no_openmp,
+            fff_hard_jit_ldflags,
+        )
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(
+            f"Could not import csrc/compiler_flags ({exc}); using -O3 only",
+            stacklevel=2,
+        )
+        fff_hard_jit_cflags = lambda: ["-O3"]  # type: ignore[assignment,misc]
+        fff_hard_jit_cflags_no_openmp = lambda: ["-O3"]  # type: ignore[assignment,misc]
+        fff_hard_jit_ldflags = lambda: []  # type: ignore[assignment,misc]
+
     # Keep build artifacts inside the repo (avoids home-cache permission issues).
     build_dir = _CSRC_DIR / ".build" / "fff_hard_cpp"
     build_dir.mkdir(parents=True, exist_ok=True)
@@ -83,23 +118,40 @@ def _load_fff_hard_ext(*, verbose: bool = False) -> Any | None:
     if venv_bin not in path_parts:
         os.environ["PATH"] = venv_bin + os.pathsep + os.environ.get("PATH", "")
 
-    try:
-        _fff_hard_ext = load(
-            name="fff_hard_cpp",
-            sources=[str(_FFF_HARD_SRC)],
-            extra_cflags=["-O3"],
-            build_directory=str(build_dir),
-            verbose=verbose,
-        )
-        return _fff_hard_ext
-    except Exception as exc:  # noqa: BLE001 — toolchain / compile failures
-        _fff_hard_load_error = exc
-        warnings.warn(
-            f"FFF C++ hard kernel failed to compile ({exc.__class__.__name__}: {exc}); "
-            "falling back to PyTorch hard routing",
-            stacklevel=2,
-        )
-        return None
+    # Avoid hard-abort when both torch and the extension see an OpenMP runtime.
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+    flag_sets: list[tuple[str, list[str], list[str]]] = [
+        ("openmp", fff_hard_jit_cflags(), fff_hard_jit_ldflags()),
+        ("no-openmp", fff_hard_jit_cflags_no_openmp(), []),
+    ]
+    last_exc: BaseException | None = None
+    for label, cflags, ldflags in flag_sets:
+        try:
+            if verbose:
+                print(f"[fff_hard] JIT compile attempt ({label}): cflags={cflags} ldflags={ldflags}")
+            _fff_hard_ext = load(
+                name="fff_hard_cpp",
+                sources=[str(_FFF_HARD_SRC)],
+                extra_cflags=cflags,
+                extra_ldflags=ldflags,
+                build_directory=str(build_dir),
+                verbose=verbose,
+            )
+            return _fff_hard_ext
+        except Exception as exc:  # noqa: BLE001 — toolchain / compile failures
+            last_exc = exc
+            if verbose:
+                print(f"[fff_hard] JIT attempt ({label}) failed: {exc}")
+            continue
+
+    _fff_hard_load_error = last_exc
+    warnings.warn(
+        f"FFF C++ hard kernel failed to compile ({type(last_exc).__name__}: {last_exc}); "
+        "falling back to PyTorch hard routing",
+        stacklevel=2,
+    )
+    return None
 
 
 def is_fff_cpp_available() -> bool:

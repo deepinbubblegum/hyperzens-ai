@@ -2,5 +2,7 @@
 *.pt
 __pycache__
 csrc/.build/
+build/
 *.so
 *.dylib
+*.pyd
