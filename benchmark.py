@@ -48,6 +48,7 @@ from device_utils import (
     resolve_device,
 )
 from models.fff_layer import is_fff_cpp_available
+from models.fff_hard_triton import is_triton_available
 from models.transformer import FFFConfig, FFFTransformer, StandardTransformer
 
 # ---------------------------------------------------------------------------
@@ -176,6 +177,16 @@ def make_fff_cpp_step(model: FFFTransformer) -> Callable[[Tensor], Tensor]:
 
     def step(idx: Tensor) -> Tensor:
         logits, _ = model(idx, mode="hard_cpp")
+        return logits
+
+    return step
+
+
+def make_fff_triton_step(model: FFFTransformer) -> Callable[[Tensor], Tensor]:
+    """Hard routing through the fused Triton CUDA kernel (``mode='triton'``)."""
+
+    def step(idx: Tensor) -> Tensor:
+        logits, _ = model(idx, mode="triton")
         return logits
 
     return step
@@ -366,15 +377,16 @@ def _cell(text: str, width: int) -> str:
 def print_comparison_table(
     dense: ModelBenchResult,
     fff: ModelBenchResult,
-    fff_cpp: ModelBenchResult | None = None,
+    fff_alt: ModelBenchResult | None = None,
+    *,
+    alt_name: str = "FFF Alt Hard",
 ) -> None:
-    """ASCII summary: Dense vs FFF PyTorch Hard vs optional FFF C++ Hard."""
-    has_cpp = fff_cpp is not None
+    """ASCII summary: Dense vs FFF PyTorch Hard vs optional third backend."""
     names = ["Standard Dense", "FFF PyTorch Hard"]
-    results = [dense, fff]
-    if has_cpp:
-        names.append("FFF C++ Hard")
-        results.append(fff_cpp)  # type: ignore[arg-type]
+    results: list[ModelBenchResult] = [dense, fff]
+    if fff_alt is not None:
+        names.append(alt_name)
+        results.append(fff_alt)
 
     col0 = 34
     col_w = 20
@@ -456,11 +468,11 @@ def print_comparison_table(
         "Memory backend: "
         + " | ".join(f"{n}={r.memory.backend}" for n, r in zip(names, results))
     )
-    if has_cpp and fff_cpp is not None:
-        cpp_vs_pt = fff_cpp.multi.tokens_per_s / max(fff.multi.tokens_per_s, 1e-12)
+    if fff_alt is not None:
+        alt_vs_pt = fff_alt.multi.tokens_per_s / max(fff.multi.tokens_per_s, 1e-12)
         print(
-            f"FFF C++ vs PyTorch Hard (multi-thread): {cpp_vs_pt:.2f}x "
-            f"({fff_cpp.multi.tokens_per_s:.2f} / {fff.multi.tokens_per_s:.2f} tok/s)"
+            f"{alt_name} vs PyTorch Hard (multi-thread): {alt_vs_pt:.2f}x "
+            f"({fff_alt.multi.tokens_per_s:.2f} / {fff.multi.tokens_per_s:.2f} tok/s)"
         )
     print(
         f"FFF FFN sparsity: hard-active "
@@ -625,13 +637,14 @@ def run_pair_on_device(
         f"peak_RAM={fff_mem.peak_generate_mb:.1f} MB"
     )
 
-    fff_cpp_result: ModelBenchResult | None = None
+    fff_alt_result: ModelBenchResult | None = None
+    alt_name = "FFF Alt Hard"
     if device.type == "cpu":
+        alt_name = "FFF C++ Hard"
         print("\n[3/3] Benchmarking FFFTransformer (C++ mode=hard_cpp)...")
         if not is_fff_cpp_available():
             print("  SKIP — C++ extension unavailable (fallback-only)")
         else:
-            # Numerical check: one forward must match PyTorch hard.
             with torch.no_grad():
                 layer = next(iter(fff_model.fff_layers()))
                 probe = torch.randn(8, layer.in_features)
@@ -644,21 +657,20 @@ def run_pair_on_device(
                     )
                 print(f"  numerical match OK (max |Δ|={max_abs:.3e})")
 
-            fff_cpp_step = make_fff_cpp_step(fff_model)
-            # Reuse loaded model; measure a short gen for RAM peak.
+            fff_alt_step = make_fff_cpp_step(fff_model)
             generate_timed(
-                fff_cpp_step,
+                fff_alt_step,
                 prompt.clone(),
                 min(32, n_tokens),
                 config.block_size,
             )
-            cpp_mem = MemoryResult(
+            alt_mem = MemoryResult(
                 baseline_mb=fff_mem.baseline_mb,
                 after_load_mb=fff_mem.after_load_mb,
                 peak_generate_mb=_rss_mb(),
                 backend=fff_mem.backend,
             )
-            cpp_param = ModelParamReport(
+            alt_param = ModelParamReport(
                 name="FFF C++ Hard Routing",
                 total_params=fff_param.total_params,
                 active_params_per_token=fff_param.active_params_per_token,
@@ -666,46 +678,118 @@ def run_pair_on_device(
                 ffn_stored=fff_param.ffn_stored,
                 ffn_active=fff_param.ffn_active,
             )
-            cpp_single = benchmark_speed(
-                fff_cpp_step,
+            alt_single = benchmark_speed(
+                fff_alt_step,
                 prompt,
                 config.block_size,
                 n_tokens,
                 warmup,
                 num_threads=1,
             )
-            cpp_multi = benchmark_speed(
-                fff_cpp_step,
+            alt_multi = benchmark_speed(
+                fff_alt_step,
                 prompt,
                 config.block_size,
                 n_tokens,
                 warmup,
                 num_threads=cpu_count,
             )
-            fff_cpp_result = ModelBenchResult(
-                param=cpp_param,
-                memory=cpp_mem,
-                single=cpp_single,
-                multi=cpp_multi,
+            fff_alt_result = ModelBenchResult(
+                param=alt_param,
+                memory=alt_mem,
+                single=alt_single,
+                multi=alt_multi,
             )
             print(
-                f"  params={cpp_param.total_params:,} | "
-                f"speed={cpp_multi.tokens_per_s:.2f} tok/s | "
-                f"latency={cpp_multi.ms_per_token:.3f} ms | "
-                f"peak_RAM={cpp_mem.peak_generate_mb:.1f} MB"
+                f"  params={alt_param.total_params:,} | "
+                f"speed={alt_multi.tokens_per_s:.2f} tok/s | "
+                f"latency={alt_multi.ms_per_token:.3f} ms | "
+                f"peak_RAM={alt_mem.peak_generate_mb:.1f} MB"
+            )
+    elif device.type == "cuda":
+        alt_name = "FFF Triton CUDA Hard"
+        print("\n[3/3] Benchmarking FFFTransformer (Triton CUDA mode=triton)...")
+        if not is_triton_available():
+            print("  SKIP — Triton not installed (`pip install triton`)")
+        else:
+            with torch.no_grad():
+                layer = next(iter(fff_model.fff_layers()))
+                probe = torch.randn(
+                    8, layer.in_features, device=device, dtype=torch.float32
+                )
+                y_pt = layer.forward_hard(probe)
+                y_tr = layer.forward_hard_triton(probe)
+                max_abs = float((y_pt - y_tr).abs().max().item())
+                if not torch.allclose(y_pt, y_tr, atol=1e-3, rtol=1e-3):
+                    raise AssertionError(
+                        f"Triton hard ≠ PyTorch hard (max |Δ|={max_abs:.3e})"
+                    )
+                print(f"  numerical match OK (max |Δ|={max_abs:.3e})")
+
+            fff_alt_step = make_fff_triton_step(fff_model)
+            generate_timed(
+                fff_alt_step,
+                prompt.clone(),
+                min(32, n_tokens),
+                config.block_size,
+            )
+            alt_mem = MemoryResult(
+                baseline_mb=fff_mem.baseline_mb,
+                after_load_mb=fff_mem.after_load_mb,
+                peak_generate_mb=_rss_mb(),
+                backend=fff_mem.backend,
+            )
+            alt_param = ModelParamReport(
+                name="FFF Triton CUDA Hard",
+                total_params=fff_param.total_params,
+                active_params_per_token=fff_param.active_params_per_token,
+                active_pct=fff_param.active_pct,
+                ffn_stored=fff_param.ffn_stored,
+                ffn_active=fff_param.ffn_active,
+            )
+            # GPU: thread count is less meaningful; still report 1 vs multi for table.
+            alt_single = benchmark_speed(
+                fff_alt_step,
+                prompt,
+                config.block_size,
+                n_tokens,
+                warmup,
+                num_threads=1,
+            )
+            alt_multi = benchmark_speed(
+                fff_alt_step,
+                prompt,
+                config.block_size,
+                n_tokens,
+                warmup,
+                num_threads=cpu_count,
+            )
+            fff_alt_result = ModelBenchResult(
+                param=alt_param,
+                memory=alt_mem,
+                single=alt_single,
+                multi=alt_multi,
+            )
+            print(
+                f"  params={alt_param.total_params:,} | "
+                f"speed={alt_multi.tokens_per_s:.2f} tok/s | "
+                f"latency={alt_multi.ms_per_token:.3f} ms | "
+                f"peak_RAM={alt_mem.peak_generate_mb:.1f} MB"
             )
     else:
-        print("\n[3/3] FFF C++ Hard skipped (CPU-only kernel)")
+        print(f"\n[3/3] Alt FFF backend skipped on device={device.type}")
 
     print(f"\n=== Dense vs FFF on {device.type.upper()} ===")
-    print_comparison_table(dense_result, fff_result, fff_cpp_result)
+    print_comparison_table(
+        dense_result, fff_result, fff_alt_result, alt_name=alt_name
+    )
 
     del fff_model
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    return dense_result, fff_result, fff_cpp_result
+    return dense_result, fff_result, fff_alt_result
 
 
 def print_gpu_vs_cpu_summary(
@@ -739,6 +823,7 @@ def main() -> None:
     print_device_info(primary)
     print(f"logical_cpus={cpu_count} | psutil={'yes' if _HAS_PSUTIL else 'NO (tracemalloc fallback)'}")
     print(f"FFF C++ hard extension: {'available' if is_fff_cpp_available() else 'UNAVAILABLE (PyTorch fallback)'}")
+    print(f"FFF Triton CUDA kernel: {'available' if is_triton_available() else 'UNAVAILABLE (pip install triton)'}")
     if not _HAS_PSUTIL:
         print(
             "WARNING: install psutil for accurate RSS peak memory "

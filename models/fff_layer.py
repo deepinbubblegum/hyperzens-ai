@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-RoutingMode = Literal["soft", "hard", "hard_cpp"]
+RoutingMode = Literal["soft", "hard", "hard_cpp", "triton"]
 
 # ---------------------------------------------------------------------------
 # Optional C++ hard-routing extension (JIT via torch.utils.cpp_extension)
@@ -333,6 +333,8 @@ class FastFeedforwardLinear(nn.Module):
             ``"hard"`` — discrete tree walk, single leaf (PyTorch).
             ``"hard_cpp"`` — same semantics via CPU C++ kernel (falls back
             to PyTorch if the extension is unavailable or ``x`` is not CPU).
+            ``"triton"`` — fused CUDA Triton kernel (falls back to PyTorch hard
+            if Triton/CUDA is unavailable).
 
         Returns
         -------
@@ -345,8 +347,10 @@ class FastFeedforwardLinear(nn.Module):
             return self.forward_hard(x)
         if mode == "hard_cpp":
             return self.forward_hard_cpp(x)
+        if mode == "triton":
+            return self.forward_hard_triton(x)
         raise ValueError(
-            f"mode must be 'soft', 'hard', or 'hard_cpp', got {mode!r}"
+            f"mode must be 'soft', 'hard', 'hard_cpp', or 'triton', got {mode!r}"
         )
 
     # ------------------------------------------------------------------
@@ -518,6 +522,38 @@ class FastFeedforwardLinear(nn.Module):
             int(self.depth),
         )
         return y.to(dtype=flat.dtype).view(*leading, self.out_features)
+
+    def forward_hard_triton(self, x: Tensor) -> Tensor:
+        """Hard routing via fused Triton CUDA kernel (tree walk + leaf GEMV).
+
+        Falls back to :meth:`forward_hard` when Triton is missing or ``x`` is
+        not on CUDA. Preallocates the output buffer inside the Triton wrapper
+        to reduce allocator fragmentation under repeated inference.
+        """
+        flat, leading = self._flatten_input(x)
+        if flat.device.type != "cuda":
+            return self.forward_hard(x)
+
+        try:
+            from models.fff_hard_triton import (
+                fff_hard_forward_triton,
+                is_triton_available,
+            )
+        except ImportError:
+            return self.forward_hard(x)
+
+        if not is_triton_available():
+            return self.forward_hard(x)
+
+        y = fff_hard_forward_triton(
+            flat.contiguous(),
+            self.router_weights.detach().contiguous(),
+            self.router_biases.detach().contiguous(),
+            self.leaf_weights.detach().contiguous(),
+            self.leaf_biases.detach().contiguous(),
+            int(self.depth),
+        )
+        return y.view(*leading, self.out_features)
 
     def forward_hard_sequential(self, x: Tensor) -> Tensor:
         """Hard routing with explicit Python if-else (single-vector / debug).
