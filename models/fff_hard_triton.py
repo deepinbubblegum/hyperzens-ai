@@ -23,8 +23,9 @@ Precision (Ampere / sm_86 Tensor Cores)
 * Autotune uses a 3-config Ampere (sm_86) shortlist with power-of-two
   tiles ``>= 64`` so FP16 warmup stays fast and Tensor Core–aligned.
 * Neither hybrid path upcasts tensors to FP32 for the whole forward.
-* INT8 / INT4 leaf weights: fused kernels dequantize on-the-fly
-  (``fff_hard_forward_triton_quant``); see ``models/fff_quant.py``.
+* INT8 / INT4 leaf weights: fused kernels dequantize on-the-fly in SRAM
+  (``fff_hard_forward_triton_quant``); packed weights are never expanded to
+  FP16 in PyTorch/HBM before launch — see ``models/fff_quant.py``.
 """
 
 from __future__ import annotations
@@ -464,7 +465,7 @@ if _HAS_TRITON:
 
         leaf_id = node - (num_leaves - 1)
         leaf_id = tl.maximum(tl.minimum(leaf_id, num_leaves - 1), 0)
-        scale = tl.load(scale_ptr + leaf_id).to(tl.float32)
+        scale_f16 = tl.load(scale_ptr + leaf_id).to(tl.float16)
 
         acc = tl.load(
             bl_ptr + leaf_id * stride_bl_l + o_offsets * stride_bl_o,
@@ -474,25 +475,30 @@ if _HAS_TRITON:
         for i_start in tl.static_range(0, MAX_DIN, BLOCK_SIZE_I):
             i_offsets = i_start + tl.arange(0, BLOCK_SIZE_I)
             i_mask = i_offsets < D_in
-            x_tile = tl.load(
+            # Activations → FP16 for Tensor-Core–friendly math.
+            x_f16 = tl.load(
                 x_ptr + n * stride_x_n + i_offsets * stride_x_d,
                 mask=i_mask,
                 other=0.0,
-            ).to(tl.float32)
+            ).to(tl.float16)
             w_ptrs = (
                 wl_q_ptr
                 + leaf_id * stride_wl_l
                 + i_offsets[:, None] * stride_wl_i
                 + o_offsets[None, :] * stride_wl_o
             )
-            # Load INT8 → FP32, multiply by per-leaf scale (on-the-fly dequant).
-            w_q = tl.load(
-                w_ptrs,
-                mask=i_mask[:, None] & o_mask[None, :],
-                other=0,
-            ).to(tl.float32)
-            w_tile = w_q * scale
-            acc += tl.sum(x_tile[:, None] * w_tile, axis=0)
+            # INT8 → FP16 in SRAM, scale in-register (never materialize FP16 W in HBM).
+            w_f16 = (
+                tl.load(
+                    w_ptrs,
+                    mask=i_mask[:, None] & o_mask[None, :],
+                    other=0,
+                ).to(tl.float16)
+                * scale_f16
+            )
+            # (1, BLOCK_I) @ (BLOCK_I, BLOCK_O) — pipelined FP16 tile product.
+            partial = tl.dot(x_f16[None, :], w_f16)
+            acc += partial.to(tl.float32).reshape(BLOCK_SIZE_O)
 
         tl.store(
             y_ptr + n * stride_y_n + o_offsets * stride_y_o,
@@ -568,7 +574,7 @@ if _HAS_TRITON:
 
         leaf_id = node - (num_leaves - 1)
         leaf_id = tl.maximum(tl.minimum(leaf_id, num_leaves - 1), 0)
-        scale = tl.load(scale_ptr + leaf_id).to(tl.float32)
+        scale_f16 = tl.load(scale_ptr + leaf_id).to(tl.float16)
 
         acc = tl.load(
             bl_ptr + leaf_id * stride_bl_l + o_offsets * stride_bl_o,
@@ -578,12 +584,12 @@ if _HAS_TRITON:
         for i_start in tl.static_range(0, MAX_DIN, BLOCK_SIZE_I):
             i_offsets = i_start + tl.arange(0, BLOCK_SIZE_I)
             i_mask = i_offsets < D_in
-            x_tile = tl.load(
+            x_f16 = tl.load(
                 x_ptr + n * stride_x_n + i_offsets * stride_x_d,
                 mask=i_mask,
                 other=0.0,
-            ).to(tl.float32)
-            # Flat index into (D_in, D_out); unpack low/high nibble from uint8.
+            ).to(tl.float16)
+            # Flat index into (D_in, D_out); vectorized nibble unpack in SRAM.
             flat_idx = i_offsets[:, None] * D_out + o_offsets[None, :]
             byte_idx = flat_idx // 2
             is_high = flat_idx % 2
@@ -595,11 +601,14 @@ if _HAS_TRITON:
                 mask=pack_mask,
                 other=0,
             ).to(tl.int32)
-            nibble = tl.where(is_high == 1, (byte >> 4) & 0x0F, byte & 0x0F)
-            # Sign-extend 4-bit two's complement → [-8, 7].
-            signed = tl.where(nibble >= 8, nibble - 16, nibble).to(tl.float32)
-            w_tile = signed * scale
-            acc += tl.sum(x_tile[:, None] * w_tile, axis=0)
+            # Parallel low/high nibble extract (reduces ALU dependence stalls).
+            lo = byte & 0x0F
+            hi = (byte >> 4) & 0x0F
+            nibble = tl.where(is_high == 1, hi, lo)
+            signed = tl.where(nibble >= 8, nibble - 16, nibble)
+            w_f16 = signed.to(tl.float16) * scale_f16
+            partial = tl.dot(x_f16[None, :], w_f16)
+            acc += partial.to(tl.float32).reshape(BLOCK_SIZE_O)
 
         tl.store(
             y_ptr + n * stride_y_n + o_offsets * stride_y_o,
@@ -943,46 +952,15 @@ def _coalesced_leaf_gemm_quant(
     y: Tensor,
     buf: _FFFTritonBuffers,
 ) -> Tensor:
-    """Sorted leaf GEMM after dequantizing each occupied leaf to compute dtype."""
-    from models.fff_quant import dequantize_fff_leaf_int4
+    """Deprecated for hot path — expands leaves to FP16 and spikes VRAM.
 
-    n = x.shape[0]
-    leaf_view = leaf_ids[:n]
-    leaf_sorted = buf.leaf_sorted[:n]
-    order = buf.order[:n]
-    x_sorted = buf.x_sorted[:n]
-    y_sorted = buf.y_sorted[:n]
-
-    torch.sort(leaf_view, stable=True, out=(leaf_sorted, order))
-    x_sorted.copy_(x.index_select(0, order))
-
-    uniq, counts = torch.unique_consecutive(leaf_sorted, return_counts=True)
-    uniq_list = uniq.tolist()
-    counts_list = counts.tolist()
-
-    offset = 0
-    for leaf_k, cnt in zip(uniq_list, counts_list):
-        sl = slice(offset, offset + cnt)
-        if qstate.mode == "int8":
-            w_fp = qstate.weight_q[leaf_k].to(dtype=torch.float16) * qstate.scale[
-                leaf_k
-            ].to(dtype=torch.float16)
-        else:
-            w_fp = dequantize_fff_leaf_int4(
-                qstate.weight_q[leaf_k : leaf_k + 1],
-                qstate.scale[leaf_k : leaf_k + 1],
-                qstate.d_in,
-                qstate.d_out,
-            )[0]
-        if w_fp.dtype != x_sorted.dtype:
-            w_fp = w_fp.to(dtype=x_sorted.dtype)
-        torch.mm(x_sorted[sl], w_fp, out=y_sorted[sl])
-        y_sorted[sl].add_(b_leaf[leaf_k])
-        offset += cnt
-
-    y_out = y[:n]
-    y_out.index_copy_(0, order, y_sorted)
-    return y_out
+    Kept only as an explicit error if called; quant inference must use the
+    fused INT8/INT4 Triton kernels (on-the-fly SRAM dequant, no HBM expand).
+    """
+    raise RuntimeError(
+        "_coalesced_leaf_gemm_quant expands INT8/INT4 → FP16 in HBM and is "
+        "disabled; use fff_hard_forward_triton_quant fused kernels instead"
+    )
 
 
 def fff_hard_forward_triton_quant(
@@ -996,11 +974,11 @@ def fff_hard_forward_triton_quant(
     out: Tensor | None = None,
     dispatch_n: int | None = None,
 ) -> Tensor:
-    """Hard-routing forward with INT8/INT4 leaf weights (on-the-fly dequant).
+    """Hard-routing with INT8/INT4 leaves — on-the-fly Triton dequant only.
 
-    Routers stay in activation dtype (typically FP16). Leaf matrices are stored
-    as INT8 or packed INT4 + FP16 scales and dequantized inside the fused Triton
-    kernel (small batch) or just-in-time before ``torch.mm`` (large batch).
+    Passes packed ``int8`` / ``uint8`` weights straight into Triton. Never
+    materializes a full FP16 ``w_leaf`` in PyTorch before launch. Output ``y``
+    is taken from the reusable buffer pool (or ``out``).
     """
     from models.fff_quant import QuantizedLeafWeights
 
@@ -1016,18 +994,34 @@ def fff_hard_forward_triton_quant(
     if depth < 1 or depth > 12:
         raise ValueError(f"depth must be in [1, 12], got {depth}")
 
-    x = x.contiguous()
+    x = x if x.is_contiguous() else x.contiguous()
     compute_dtype = x.dtype
     if compute_dtype not in SUPPORTED_DTYPES:
         raise TypeError(f"unsupported x.dtype={compute_dtype}")
+
     wr = _as_compute_tensor(w_router, compute_dtype)
     br = _as_compute_tensor(b_router, compute_dtype)
     bl = _as_compute_tensor(b_leaf, compute_dtype)
+
+    # Pass quantized tensors directly — no FP16 expand / clone.
     w_q = qstate.weight_q
-    scale = qstate.scale.to(dtype=torch.float16).contiguous()
-    if w_q.device != x.device:
-        w_q = w_q.to(device=x.device)
-        scale = scale.to(device=x.device)
+    scale = qstate.scale
+    if w_q.device != x.device or scale.device != x.device:
+        raise RuntimeError(
+            "qstate tensors must already be on x.device "
+            "(use attach_leaf_qstates); refusing to allocate a device copy here"
+        )
+    if scale.dtype != torch.float16:
+        scale = scale.to(dtype=torch.float16)
+    if not scale.is_contiguous():
+        scale = scale.contiguous()
+    if not w_q.is_contiguous():
+        w_q = w_q.contiguous()
+
+    if qstate.mode == "int8" and w_q.dtype != torch.int8:
+        raise TypeError(f"INT8 path expects torch.int8 weights, got {w_q.dtype}")
+    if qstate.mode == "int4" and w_q.dtype != torch.uint8:
+        raise TypeError(f"INT4 path expects torch.uint8 packed weights, got {w_q.dtype}")
 
     if x.ndim != 2:
         raise ValueError(f"x must be (N, D_in), got {tuple(x.shape)}")
@@ -1035,8 +1029,6 @@ def fff_hard_forward_triton_quant(
     if d_in != qstate.d_in:
         raise ValueError(f"D_in mismatch: x={d_in}, qstate={qstate.d_in}")
     d_out = qstate.d_out
-    route_n = int(dispatch_n) if dispatch_n is not None else n
-    fused_limit = fused_dispatch_limit(compute_dtype)
     num_leaves = 1 << depth
     if w_q.shape[0] != num_leaves or scale.shape != (num_leaves,):
         raise ValueError("quantized leaf / scale shape incompatible with depth")
@@ -1044,20 +1036,23 @@ def fff_hard_forward_triton_quant(
         raise ValueError(f"b_leaf shape {tuple(bl.shape)} != ({num_leaves}, {d_out})")
 
     try:
+        # Single preallocated output buffer for this forward (pooled).
         buf = _get_buffers(n, d_in, d_out, x.device, compute_dtype)
-        y = buf.y if out is None else out.contiguous()
-        if y.shape != (n, d_out):
-            raise ValueError(f"out must be ({n}, {d_out})")
+        if out is None:
+            y = buf.y
+        else:
+            if out.shape != (n, d_out) or out.device != x.device or out.dtype != compute_dtype:
+                raise ValueError(
+                    f"out must be ({n}, {d_out}) {compute_dtype} on {x.device}"
+                )
+            y = out if out.is_contiguous() else out.contiguous()
 
-        if route_n <= fused_limit:
-            if qstate.mode == "int8":
-                _launch_fused_int8(x, wr, br, w_q, scale, bl, depth, y[:n])
-            else:
-                _launch_fused_int4(x, wr, br, w_q, scale, bl, depth, y[:n])
-            return y[:n]
-
-        _launch_route_leaf_ids(x, wr, br, buf.leaf_ids[:n], depth)
-        return _coalesced_leaf_gemm_quant(x, qstate, bl, buf.leaf_ids, y, buf)
+        # Always fused Triton dequant kernels — avoids HBM FP16 leaf expand / OOM.
+        if qstate.mode == "int8":
+            _launch_fused_int8(x, wr, br, w_q, scale, bl, depth, y[:n])
+        else:
+            _launch_fused_int4(x, wr, br, w_q, scale, bl, depth, y[:n])
+        return y[:n]
     except torch.cuda.OutOfMemoryError:
         clear_triton_buffer_pool(empty_cache=True)
         raise
