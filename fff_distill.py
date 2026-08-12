@@ -14,7 +14,7 @@ so the forward pass activates only the winning leaf (Hard / Triton semantics)
 while gradients flow through soft leaf probabilities. Eval soft PPL still uses
 the soft mixture; hard eval uses Triton. Attention / LayerNorm / embeddings are
 copied from the teacher. FFF **leaves are smart-initialized** from each Teacher
-MLP (``c_fc`` / ``c_proj`` intermediate slices) and scaled by ``√N_leaves``;
+MLP (``c_fc`` / ``c_proj`` intermediate slices) without extra leaf-norm scaling;
 routers use small orthogonal init.
 
 Loss
@@ -22,18 +22,17 @@ Loss
 ``L = KL(student ‖ teacher) · T² + 0.5 · MSE(ffn_out) − 0.01 · H(leaf)``
 
 Targets RTX 3060 12GB: short context, micro-batch, FP16 autocast, optional
-grad accumulation. Default ``τ: 1.0 → 0.10`` over ``max_steps=2000`` on WikiText-2.
+grad accumulation. Default ``τ: 1.0 → 0.10`` over ``max_steps=5000`` on WikiText-2.
 
 Example
 -------
     pip install transformers
-    python fff_distill.py --device cuda --max-steps 2000
+    python fff_distill.py --device cuda --max-steps 5000
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -194,10 +193,9 @@ def init_fff_from_dense_mlp(
         ``W_leaf[i] = c_fc[:, i·s:(i+1)·s] @ c_proj[i·s:(i+1)·s, :]``
         ``b_leaf[i] = b_fc[i·s:(i+1)·s] @ c_proj[i·s:(i+1)·s, :] + b_proj``
 
-    Because STE / Hard / Triton activate **one** leaf per token (not a soft
-    mixture of ``L`` slices), leaf weights and biases are scaled by
-    ``√L`` so the output tensor norm matches LayerNorm expectations
-    (e.g. ``√16 = 4`` for depth 4).
+    Leaf weights are left at the composed-slice scale (no ``√L`` multiplier) so
+    initial activations stay within typical LayerNorm ranges under STE / Hard
+    single-leaf execution.
 
     A tiny Gaussian ``N(0, noise_std²)`` breaks exact leaf symmetry. Router
     weights are small **orthogonal** matrices (QR / ``nn.init.orthogonal_``).
@@ -279,11 +277,6 @@ def init_fff_from_dense_mlp(
         leaf_w[i] = w_in @ w_out
         leaf_b[i] = b_fc[start:end] @ w_out + b_proj
 
-    # Single-leaf STE / Hard / Triton: scale so ‖y‖ matches dense mixture of L slices.
-    leaf_scale = math.sqrt(float(n_leaves))
-    leaf_w = leaf_w * leaf_scale
-    leaf_b = leaf_b * leaf_scale
-
     if noise_std > 0.0:
         leaf_w = leaf_w + noise_std * torch.randn_like(leaf_w)
         leaf_b = leaf_b + noise_std * torch.randn_like(leaf_b)
@@ -338,12 +331,10 @@ def build_fff_student_from_teacher(
     d_model = int(config.n_embd)
     dropout = float(config.resid_pdrop)
     n_leaves = 1 << int(fff_depth)
-    leaf_scale = math.sqrt(float(n_leaves))
     print(
         f"Smart FFF init from Teacher MLP: depth={fff_depth} "
-        f"leaves={n_leaves} leaf_scale=√L={leaf_scale:.4f} "
-        f"leaf_noise={leaf_noise_std} router_gain={router_gain} "
-        f"(STE hard-aware training)"
+        f"leaves={n_leaves} leaf_noise={leaf_noise_std} router_gain={router_gain} "
+        f"(STE hard-aware training, no √L leaf scale)"
     )
 
     for layer_idx, (s_block, t_block) in enumerate(
@@ -705,21 +696,48 @@ def annealed_tau(
     return float(tau_start * (tau_end / tau_start) ** t)
 
 
-def cosine_lr(
-    step: int,
-    total_steps: int,
-    lr_max: float,
-    lr_min: float,
-    warmup_steps: int,
-) -> float:
-    if step < warmup_steps:
-        return lr_max * float(step + 1) / float(max(warmup_steps, 1))
-    if total_steps <= warmup_steps:
-        return lr_min
-    progress = (step - warmup_steps) / float(max(total_steps - warmup_steps, 1))
-    progress = min(max(progress, 0.0), 1.0)
-    cos = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return lr_min + (lr_max - lr_min) * cos
+def build_student_param_groups(
+    student: Any,
+    *,
+    lr_leaf: float,
+    lr_router: float,
+) -> list[dict[str, Any]]:
+    """Split student params into leaf / router / other AdamW groups.
+
+    Routers use a lower LR so routing stays stable while leaves fine-tune.
+    Non-FFF weights (attention, LN, embeddings, LM head) share ``lr_leaf``.
+    """
+    leaf_params: list[nn.Parameter] = []
+    router_params: list[nn.Parameter] = []
+    seen: set[int] = set()
+
+    for block in iter_fff_blocks(student):
+        fff = block.fff
+        for p in (fff.leaf_weights, fff.leaf_biases):
+            if p.requires_grad and id(p) not in seen:
+                leaf_params.append(p)
+                seen.add(id(p))
+        for p in (fff.router_weights, fff.router_biases):
+            if p.requires_grad and id(p) not in seen:
+                router_params.append(p)
+                seen.add(id(p))
+
+    other_params: list[nn.Parameter] = []
+    for p in student.parameters():
+        if p.requires_grad and id(p) not in seen:
+            other_params.append(p)
+            seen.add(id(p))
+
+    groups: list[dict[str, Any]] = []
+    if leaf_params:
+        groups.append({"params": leaf_params, "lr": float(lr_leaf)})
+    if other_params:
+        groups.append({"params": other_params, "lr": float(lr_leaf)})
+    if router_params:
+        groups.append({"params": router_params, "lr": float(lr_router)})
+    if not groups:
+        raise RuntimeError("no trainable student parameters for optimizer")
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -740,11 +758,12 @@ class DistillConfig:
     block_size: int = 128
     batch_size: int = 2
     grad_accum_steps: int = 8
-    lr: float = 3e-4
-    min_lr: float = 3e-5
+    lr: float = 3e-4  # leaf (+ non-FFF) learning rate
+    lr_router: float = 1e-4  # lower LR keeps routing stable
+    min_lr: float = 3e-5  # CosineAnnealingLR eta_min
     weight_decay: float = 0.01
-    warmup_steps: int = 100
-    max_steps: int = 2000
+    warmup_steps: int = 100  # retained for CLI compat; unused with CosineAnnealingLR
+    max_steps: int = 5000
     log_every: int = 20
     save_every: int = 500
     seed: int = 42
@@ -767,8 +786,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--block-size", type=int, default=d.block_size)
     p.add_argument("--batch-size", type=int, default=d.batch_size)
     p.add_argument("--grad-accum-steps", type=int, default=d.grad_accum_steps)
-    p.add_argument("--lr", type=float, default=d.lr)
-    p.add_argument("--min-lr", type=float, default=d.min_lr)
+    p.add_argument("--lr", type=float, default=d.lr, help="leaf / non-FFF LR (default 3e-4)")
+    p.add_argument(
+        "--lr-router",
+        type=float,
+        default=d.lr_router,
+        help="FFF router LR (default 1e-4; lower than leaf)",
+    )
+    p.add_argument("--min-lr", type=float, default=d.min_lr, help="CosineAnnealingLR eta_min")
     p.add_argument("--weight-decay", type=float, default=d.weight_decay)
     p.add_argument("--warmup-steps", type=int, default=d.warmup_steps)
     p.add_argument("--max-steps", type=int, default=d.max_steps)
@@ -801,6 +826,7 @@ def main() -> None:
         batch_size=args.batch_size,
         grad_accum_steps=args.grad_accum_steps,
         lr=args.lr,
+        lr_router=args.lr_router,
         min_lr=args.min_lr,
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
@@ -867,10 +893,17 @@ def main() -> None:
     student_cap = _FFNCapture(student)
 
     optimizer = torch.optim.AdamW(
-        (p for p in student.parameters() if p.requires_grad),
-        lr=cfg.lr,
+        build_student_param_groups(
+            student, lr_leaf=cfg.lr, lr_router=cfg.lr_router
+        ),
         weight_decay=cfg.weight_decay,
         betas=(0.9, 0.95),
+    )
+    # Cosine over the full run: one scheduler tick per micro-step (matches max_steps).
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(cfg.max_steps, 1),
+        eta_min=cfg.min_lr,
     )
     scaler = make_grad_scaler(device)
 
@@ -881,13 +914,17 @@ def main() -> None:
     running: dict[str, float] = {"kl": 0.0, "mse": 0.0, "entropy": 0.0, "total": 0.0}
     log_count = 0
 
+    print(
+        f"optimizer: AdamW leaf/other lr={cfg.lr:.2e} router lr={cfg.lr_router:.2e} | "
+        f"CosineAnnealingLR T_max={cfg.max_steps} eta_min={cfg.min_lr:.2e}"
+    )
+
     pbar = tqdm(range(cfg.max_steps), desc="distill", dynamic_ncols=True)
     for step in pbar:
         tau = annealed_tau(step, cfg.max_steps, cfg.init_tau, cfg.min_tau)
         set_student_temperature(student, tau)
-        lr = cosine_lr(step, cfg.max_steps, cfg.lr, cfg.min_lr, cfg.warmup_steps)
-        for g in optimizer.param_groups:
-            g["lr"] = lr
+        lr_leaf = float(optimizer.param_groups[0]["lr"])
+        lr_router = float(optimizer.param_groups[-1]["lr"])
 
         try:
             batch = next(data_iter)
@@ -931,6 +968,9 @@ def main() -> None:
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
+        # Advance cosine once per micro-step so T_max aligns with max_steps.
+        scheduler.step()
+
         for k in running:
             running[k] += float(parts[k].detach().item())
         log_count += 1
@@ -943,7 +983,7 @@ def main() -> None:
                 f"kl={running['kl'] * inv:.4f} "
                 f"mse={running['mse'] * inv:.4f} "
                 f"H={running['entropy'] * inv:.4f} "
-                f"τ={tau:.3f} lr={lr:.2e}"
+                f"τ={tau:.3f} lr_leaf={lr_leaf:.2e} lr_router={lr_router:.2e}"
             )
             pbar.set_postfix_str(
                 f"L={running['total'] * inv:.3f} τ={tau:.2f}", refresh=False
@@ -958,6 +998,7 @@ def main() -> None:
                 "config": asdict(cfg),
                 "student_state_dict": student.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "fff_depth": cfg.fff_depth,
                 "model_name": cfg.model_name,
             }
