@@ -537,6 +537,7 @@ class FastFeedforwardLinear(nn.Module):
 
         try:
             from models.fff_hard_triton import (
+                _as_compute_tensor,
                 fff_hard_forward_triton,
                 is_triton_available,
             )
@@ -546,18 +547,22 @@ class FastFeedforwardLinear(nn.Module):
         if not is_triton_available():
             return self.forward_hard(x)
 
-        # Match activation dtype (fp16/bf16/fp32); no FP32 promotion.
+        # Match activation dtype without re-casting when already half/BF16.
+        # On Triton failure, fall back to PyTorch hard in the same dtype.
         dt = flat.dtype
         dispatch_n = int(x.shape[0]) if x.ndim >= 2 else int(flat.shape[0])
-        y = fff_hard_forward_triton(
-            flat.contiguous(),
-            self.router_weights.detach().to(dtype=dt).contiguous(),
-            self.router_biases.detach().to(dtype=dt).contiguous(),
-            self.leaf_weights.detach().to(dtype=dt).contiguous(),
-            self.leaf_biases.detach().to(dtype=dt).contiguous(),
-            int(self.depth),
-            dispatch_n=dispatch_n,
-        )
+        try:
+            y = fff_hard_forward_triton(
+                flat if flat.is_contiguous() else flat.contiguous(),
+                _as_compute_tensor(self.router_weights.detach(), dt),
+                _as_compute_tensor(self.router_biases.detach(), dt),
+                _as_compute_tensor(self.leaf_weights.detach(), dt),
+                _as_compute_tensor(self.leaf_biases.detach(), dt),
+                int(self.depth),
+                dispatch_n=dispatch_n,
+            )
+        except (RuntimeError, TypeError, ValueError):
+            return self.forward_hard(x)
         return y.view(*leading, self.out_features)
 
     def forward_hard_sequential(self, x: Tensor) -> Tensor:

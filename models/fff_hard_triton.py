@@ -24,8 +24,8 @@ Precision (Ampere / sm_86 Tensor Cores)
 * Activations and weights may be ``float16``, ``bfloat16``, or ``float32``.
 * Triton kernels accumulate ``score`` / ``acc`` in ``tl.float32`` and cast to
   the destination dtype only on store into ``y``.
-* Autotune ``BLOCK_SIZE_{I,O}`` are multiples of 16 so half-precision GEMMs
-  (esp. the coalesced ``torch.mm`` path) map cleanly onto Tensor Cores.
+* Autotune uses a 3-config Ampere (sm_86) shortlist with power-of-two
+  tiles ``>= 16`` so FP16 warmup stays fast and Tensor Core–aligned.
 * Neither hybrid path upcasts tensors to FP32 for the whole forward.
 """
 
@@ -154,6 +154,17 @@ def _dtype_code(dtype: torch.dtype) -> int:
     return 0
 
 
+def _as_compute_tensor(t: Tensor, dtype: torch.dtype) -> Tensor:
+    """Return ``t`` in ``dtype`` without redundant casts/copies.
+
+    Same-dtype contiguous tensors are returned as-is (avoids FP16 cast loops
+    on the hybrid hot path when the model is already ``.half()`` / BF16).
+    """
+    if t.dtype != dtype:
+        t = t.to(dtype=dtype)
+    return t if t.is_contiguous() else t.contiguous()
+
+
 def _ensure_compute_dtype(*tensors: Tensor) -> torch.dtype:
     """Require a shared supported dtype across activations / weights."""
     dtype = tensors[0].dtype
@@ -174,61 +185,43 @@ def _ensure_compute_dtype(*tensors: Tensor) -> torch.dtype:
 if _HAS_TRITON:
 
     # ------------------------------------------------------------------
-    # Autotune configs (Ampere / sm_86) — BLOCK sizes are multiples of 16
-    # for Tensor Core–friendly half-precision tiles.
+    # Autotune configs — fixed Ampere (sm_86 / RTX 3060) shortlist.
+    # Tile dims are powers of 2 and >= 16 (Tensor Core alignment).
+    # Keep ≤3 configs so FP16 warmup does not hang on a huge search space.
     # ------------------------------------------------------------------
 
     def _route_autotune_configs() -> list:
-        configs: list = []
-        for block_i in (16, 32, 64, 128, 256, 512):
-            for num_warps in (2, 4, 8):
-                if block_i >= 512 and num_warps < 4:
-                    continue
-                if block_i <= 16 and num_warps > 4:
-                    continue
-                configs.append(
-                    triton.Config(
-                        {"BLOCK_SIZE_I": block_i},
-                        num_warps=num_warps,
-                        num_stages=2,
-                    )
-                )
-        return configs
+        return [
+            triton.Config({"BLOCK_SIZE_I": 128}, num_warps=4, num_stages=3),
+            triton.Config({"BLOCK_SIZE_I": 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_SIZE_I": 256}, num_warps=8, num_stages=3),
+        ]
 
     def _fused_autotune_configs() -> list:
-        configs: list = []
-        # Multiples of 16 → Ampere Tensor Core tile alignment for fp16/bf16.
-        for block_i in (16, 32, 64, 128, 256, 512):
-            for block_o in (16, 32, 64, 128, 256):
-                if block_i * block_o > 16_384:
-                    continue
-                for num_warps in (2, 4, 8):
-                    if block_i * block_o >= 8_192 and num_warps < 4:
-                        continue
-                    if block_i >= 512 and num_warps < 4:
-                        continue
-                    if block_i <= 16 and block_o <= 16 and num_warps > 4:
-                        continue
-                    for num_stages in (2, 3, 4):
-                        if num_stages >= 4 and block_i * block_o >= 8_192:
-                            continue
-                        configs.append(
-                            triton.Config(
-                                {
-                                    "BLOCK_SIZE_I": block_i,
-                                    "BLOCK_SIZE_O": block_o,
-                                },
-                                num_warps=num_warps,
-                                num_stages=num_stages,
-                            )
-                        )
-        return configs
+        return [
+            triton.Config(
+                {"BLOCK_SIZE_I": 128, "BLOCK_SIZE_O": 128},
+                num_warps=4,
+                num_stages=3,
+            ),
+            triton.Config(
+                {"BLOCK_SIZE_I": 64, "BLOCK_SIZE_O": 64},
+                num_warps=4,
+                num_stages=2,
+            ),
+            triton.Config(
+                {"BLOCK_SIZE_I": 256, "BLOCK_SIZE_O": 64},
+                num_warps=8,
+                num_stages=3,
+            ),
+        ]
 
     def _decorate_autotune(configs: list, key: list[str]):  # type: ignore[no-untyped-def]
         def deco(fn):  # type: ignore[no-untyped-def]
+            # Low warmup/rep: 3 configs × few reps is enough for sm_86.
             kwargs: dict[str, Any] = {"configs": configs, "key": key}
             try:
-                return triton.autotune(**kwargs, warmup=5, rep=25)(fn)
+                return triton.autotune(**kwargs, warmup=1, rep=3)(fn)
             except TypeError:
                 return triton.autotune(**kwargs)(fn)
 
@@ -561,17 +554,18 @@ def fff_hard_forward_triton(
         raise ValueError(f"depth must be in [1, 12], got {depth}")
 
     x = x.contiguous()
-    # Align weights to activation dtype without promoting to FP32.
+    # Align weights to activation dtype without promoting to FP32 or re-casting
+    # tensors that are already in the correct half/BF16/FP32 dtype.
     compute_dtype = x.dtype
     if compute_dtype not in SUPPORTED_DTYPES:
         raise TypeError(
             f"unsupported x.dtype={compute_dtype}; expected one of "
             f"{sorted(str(d) for d in SUPPORTED_DTYPES)}"
         )
-    wr = w_router.to(dtype=compute_dtype).contiguous()
-    br = b_router.to(dtype=compute_dtype).contiguous()
-    wl = w_leaf.to(dtype=compute_dtype).contiguous()
-    bl = b_leaf.to(dtype=compute_dtype).contiguous()
+    wr = _as_compute_tensor(w_router, compute_dtype)
+    br = _as_compute_tensor(b_router, compute_dtype)
+    wl = _as_compute_tensor(w_leaf, compute_dtype)
+    bl = _as_compute_tensor(b_leaf, compute_dtype)
     _ensure_compute_dtype(x, wr, br, wl, bl)
 
     if x.ndim != 2:
