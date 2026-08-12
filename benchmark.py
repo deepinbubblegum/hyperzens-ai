@@ -48,7 +48,7 @@ from device_utils import (
     resolve_device,
 )
 from models.fff_layer import is_fff_cpp_available
-from models.fff_hard_triton import is_triton_available
+from models.fff_hard_triton import is_triton_available, warmup_fff_model_triton
 from models.transformer import FFFConfig, FFFTransformer, StandardTransformer
 
 # ---------------------------------------------------------------------------
@@ -726,6 +726,19 @@ def run_pair_on_device(
                     )
                 print(f"  numerical match OK (max |Δ|={max_abs:.3e})")
 
+            # Autotune + CUDA compile BEFORE timed runs (cost excluded from latency).
+            print(
+                "  warming up Triton autotuner / CUDA compile "
+                "(excluded from benchmark timing)..."
+            )
+            warmup_fff_model_triton(
+                fff_model,
+                sample_tokens=max(prompt.size(1), 32),
+                n_iters=max(5, warmup),
+            )
+            _sync_device(device)
+            print("  Triton warmup done — starting timed runs")
+
             fff_alt_step = make_fff_triton_step(fff_model)
             generate_timed(
                 fff_alt_step,
@@ -733,6 +746,7 @@ def run_pair_on_device(
                 min(32, n_tokens),
                 config.block_size,
             )
+            _sync_device(device)
             alt_mem = MemoryResult(
                 baseline_mb=fff_mem.baseline_mb,
                 after_load_mb=fff_mem.after_load_mb,
