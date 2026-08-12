@@ -72,23 +72,20 @@ from device_utils import (
     print_device_info,
     resolve_device,
 )
-from distill_modern_llm import (
+from fff_distill import annealed_tau
+from fff_hf_utils import (
     bf16_autocast,
-    build_student_param_groups,
-    resolve_compute_dtype,
-)
-from distill_thai_qwen import (
     build_fff_student,
+    build_student_param_groups,
     extract_teacher_topk,
     gather_student_leaf_probs,
     load_4bit_teacher,
     load_dense_teacher,
-    thai_distill_loss,
+    resolve_compute_dtype,
+    topk_kl_distill_loss,
 )
-from fff_distill import annealed_tau
 from fff_modern_llm import (
     iter_fff_swiglu_blocks,
-    set_fff_routing_mode,
     set_fff_temperature,
 )
 
@@ -147,14 +144,14 @@ DOMAIN_DATASETS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _require_transformers() -> tuple[Any, Any]:
+def _require_tokenizer() -> Any:
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoTokenizer
     except ImportError as exc:
         raise SystemExit(
             "transformers is required: pip install transformers"
         ) from exc
-    return AutoModelForCausalLM, AutoTokenizer
+    return AutoTokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -676,7 +673,7 @@ def ultimate_distill_loss(
     pad_id: int = 0,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Top-K KL + optional feature MSE + CE − leaf entropy."""
-    loss, parts = thai_distill_loss(
+    loss, parts = topk_kl_distill_loss(
         student_logits,
         None,
         routing_probs,
@@ -853,7 +850,7 @@ def main() -> None:
     print(f"target leaf entropy H_uniform=log({n_leaves})={h_uniform:.4f}")
     _warn_vocab_mismatch(cfg.teacher_name, cfg.student_name)
 
-    _, AutoTokenizer = _require_transformers()
+    AutoTokenizer = _require_tokenizer()
     print("\nLoading student tokenizer ...")
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.student_name, trust_remote_code=True

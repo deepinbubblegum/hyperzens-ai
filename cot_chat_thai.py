@@ -40,13 +40,12 @@ from device_utils import (
     print_device_info,
     resolve_device,
 )
-from distill_modern_llm import resolve_compute_dtype
 from eval_distilled import (
     _apply_no_repeat_ngram,
     _apply_repetition_penalty,
     _topk_topp_filter,
 )
-from eval_qwen import load_student_from_checkpoint
+from fff_hf_utils import load_student_from_checkpoint, resolve_compute_dtype
 from fff_modern_llm import iter_fff_swiglu_blocks, warmup_fff_swiglu
 from models.fff_hard_triton import is_triton_available
 
