@@ -48,6 +48,27 @@ DEFAULT_MODELS: tuple[str, ...] = (
 )
 
 
+def _init_orthogonal_fp32_(weight: Tensor, gain: float = 0.1) -> None:
+    """``nn.init.orthogonal_`` in FP32 (CPU LAPACK), then copy into ``weight``.
+
+    Avoids ``RuntimeError: "geqrf_cpu" not implemented for 'Half'`` when the
+    parameter lives in FP16/BF16.
+    """
+    w_fp32 = torch.empty(weight.shape, dtype=torch.float32, device="cpu")
+    nn.init.orthogonal_(w_fp32, gain=float(gain))
+    weight.data.copy_(w_fp32.to(device=weight.device, dtype=weight.dtype))
+
+
+def _init_uniform_fp32_(weight: Tensor, a: float, b: float | None = None) -> None:
+    """Uniform init in FP32, then cast/copy into ``weight``."""
+    if b is None:
+        b = a
+        a = -a
+    w_fp32 = torch.empty(weight.shape, dtype=torch.float32, device="cpu")
+    nn.init.uniform_(w_fp32, a=a, b=b)
+    weight.data.copy_(w_fp32.to(device=weight.device, dtype=weight.dtype))
+
+
 # ---------------------------------------------------------------------------
 # SwiGLU FFF tree
 # ---------------------------------------------------------------------------
@@ -138,13 +159,13 @@ class FastFeedforwardSwiGLU(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """Small orthogonal routers; Xavier-style leaf slices."""
-        nn.init.orthogonal_(self.router_weights, gain=0.1)
+        """Small orthogonal routers; Xavier-style leaf slices (always via FP32)."""
+        _init_orthogonal_fp32_(self.router_weights, gain=0.1)
         nn.init.zeros_(self.router_biases)
         a = math.sqrt(1.0 / self.d_model)
-        nn.init.uniform_(self.w_gate_leaf, -a, a)
-        nn.init.uniform_(self.w_up_leaf, -a, a)
-        nn.init.uniform_(self.w_down_leaf, -a, a)
+        _init_uniform_fp32_(self.w_gate_leaf, a)
+        _init_uniform_fp32_(self.w_up_leaf, a)
+        _init_uniform_fp32_(self.w_down_leaf, a)
 
     def set_temperature(self, temp: float) -> None:
         """Set soft-routing temperature ``τ`` (must be ``> 0``)."""
@@ -398,7 +419,8 @@ def init_fff_from_swiglu(
         ``W_down[i] = down[:, i·S:(i+1)·S].T``   → ``(S, D)``
 
     Tiny Gaussian ``N(0, noise_std²)`` breaks leaf symmetry. Routers use small
-    orthogonal init.
+    orthogonal init. **All init math runs in float32** (CPU ``geqrf`` / noise),
+    then results are copied into the parameter dtype (FP16-safe).
     """
     gate_proj, up_proj, down_proj = _get_swiglu_projections(swiglu_mlp)
     fff = fff_block.fff
@@ -426,18 +448,17 @@ def init_fff_from_swiglu(
             f"(D={d_model}, I={fff.intermediate_size})"
         )
 
-    device = fff.w_gate_leaf.device
-    dtype = fff.w_gate_leaf.dtype
-    w_gate = w_gate.to(device=device, dtype=torch.float32)
-    w_up = w_up.to(device=device, dtype=torch.float32)
-    w_down = w_down.to(device=device, dtype=torch.float32)
+    # Slice + noise entirely in FP32 on CPU (LAPACK / RNG safe), then cast.
+    w_gate = w_gate.detach().to(device="cpu", dtype=torch.float32)
+    w_up = w_up.detach().to(device="cpu", dtype=torch.float32)
+    w_down = w_down.detach().to(device="cpu", dtype=torch.float32)
 
     gate_leaves = torch.empty(
-        n_leaves, d_model, slice_size, device=device, dtype=torch.float32
+        n_leaves, d_model, slice_size, device="cpu", dtype=torch.float32
     )
     up_leaves = torch.empty_like(gate_leaves)
     down_leaves = torch.empty(
-        n_leaves, slice_size, d_model, device=device, dtype=torch.float32
+        n_leaves, slice_size, d_model, device="cpu", dtype=torch.float32
     )
     for i in range(n_leaves):
         start = i * slice_size
@@ -451,11 +472,14 @@ def init_fff_from_swiglu(
         up_leaves = up_leaves + noise_std * torch.randn_like(up_leaves)
         down_leaves = down_leaves + noise_std * torch.randn_like(down_leaves)
 
-    fff.w_gate_leaf.copy_(gate_leaves.to(dtype=dtype))
-    fff.w_up_leaf.copy_(up_leaves.to(dtype=dtype))
-    fff.w_down_leaf.copy_(down_leaves.to(dtype=dtype))
+    tgt_device = fff.w_gate_leaf.device
+    tgt_dtype = fff.w_gate_leaf.dtype
+    fff.w_gate_leaf.copy_(gate_leaves.to(device=tgt_device, dtype=tgt_dtype))
+    fff.w_up_leaf.copy_(up_leaves.to(device=tgt_device, dtype=tgt_dtype))
+    fff.w_down_leaf.copy_(down_leaves.to(device=tgt_device, dtype=tgt_dtype))
 
-    nn.init.orthogonal_(fff.router_weights, gain=float(router_gain))
+    # orthogonal_ requires FP32 (geqrf); never call it on Half parameters.
+    _init_orthogonal_fp32_(fff.router_weights, gain=float(router_gain))
     nn.init.zeros_(fff.router_biases)
 
 
@@ -505,6 +529,9 @@ def patch_model_with_fff_swiglu(
 ) -> int:
     """Replace each ``layer.mlp`` with :class:`FFFSwiGLUBlock` (in-place).
 
+    Blocks are constructed and smart-initialized in **float32**. Callers that
+    want FP16 inference should cast the full model **after** this returns.
+
     Returns the number of patched layers.
     """
     config = model.config
@@ -517,6 +544,10 @@ def patch_model_with_fff_swiglu(
             f"2^{fff_depth}={n_leaves}"
         )
 
+    # Keep patching on the model's current device, but force FP32 params for init.
+    ref = next(model.parameters())
+    patch_device = ref.device
+
     n_patched = 0
     for layer_idx, layer in enumerate(iter_decoder_layers(model)):
         dense_mlp = layer.mlp
@@ -526,9 +557,7 @@ def patch_model_with_fff_swiglu(
             fff_depth=fff_depth,
             init_temp=init_temp,
         )
-        # Match device / dtype of the dense MLP before weight copy.
-        ref = next(dense_mlp.parameters())
-        block = block.to(device=ref.device, dtype=ref.dtype)
+        block = block.to(device=patch_device, dtype=torch.float32)
         init_fff_from_swiglu(
             block,
             dense_mlp,
@@ -540,7 +569,8 @@ def patch_model_with_fff_swiglu(
         if layer_idx == 0:
             print(
                 f"  layer 0: FFF SwiGLU depth={fff_depth} leaves={n_leaves} "
-                f"slice={intermediate // n_leaves} D={d_model} I={intermediate}"
+                f"slice={intermediate // n_leaves} D={d_model} I={intermediate} "
+                f"(init dtype=float32)"
             )
     return n_patched
 
@@ -553,7 +583,13 @@ def load_and_patch_modern_llm(
     dtype: torch.dtype | None = None,
     routing_mode: str = "triton",
 ) -> tuple[Any, Any]:
-    """Load HF CausalLM, inject FFF SwiGLU MLPs, set routing mode.
+    """Load HF CausalLM in FP32, inject FFF SwiGLU, then cast to ``dtype``.
+
+    Order (required to avoid Half ``geqrf`` failures)
+    -------------------------------------------------
+    1. Load pretrained weights in **float32**.
+    2. Inject / smart-init all FFF SwiGLU blocks in **float32**.
+    3. Cast patched model to FP16 (CUDA default) and ``.to(device)``.
 
     Returns ``(model, tokenizer)``.
     """
@@ -570,19 +606,23 @@ def load_and_patch_modern_llm(
         else:
             dtype = torch.float32
 
-    print(f"Loading `{model_name}` (dtype={dtype}) ...")
+    print(f"Loading `{model_name}` in float32 for safe FFF init ...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        dtype=dtype,
+        dtype=torch.float32,
         trust_remote_code=True,
     )
-    print("Injecting FFF SwiGLU blocks (smart-init from pretrained MLP) ...")
+    print("Injecting FFF SwiGLU blocks (smart-init FP32) ...")
     n = patch_model_with_fff_swiglu(model, fff_depth=fff_depth)
-    model.to(device)
+
+    if dtype != torch.float32:
+        print(f"Casting patched model → {dtype} and moving to {device} ...")
+        model = model.to(dtype=dtype)
+    model = model.to(device)
     model.eval()
 
     if routing_mode == "triton" and (
@@ -593,7 +633,7 @@ def load_and_patch_modern_llm(
         )
         routing_mode = "hard"
     set_fff_routing_mode(model, routing_mode)
-    print(f"Patched {n} MLP layers | routing_mode={routing_mode}")
+    print(f"Patched {n} MLP layers | routing_mode={routing_mode} | dtype={dtype}")
     return model, tokenizer
 
 
