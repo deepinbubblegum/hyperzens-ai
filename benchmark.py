@@ -11,6 +11,9 @@ Execution
     python benchmark.py --device cuda --skip-cpu
     python benchmark.py --device cpu
 
+    # CUDA batch-size scaling (Dense vs FFF Triton crossover)
+    python benchmark.py --device cuda --skip-cpu --batch-sweep
+
     # Faster smoke / custom size
     python benchmark.py --n-tokens 50 --warmup 5 --n-embd 256 --n-layer 4
 
@@ -19,7 +22,8 @@ Execution
 
 Notes
 -----
-* Compares Dense MLP vs FFF PyTorch hard vs FFF C++ hard (CPU).
+* Compares Dense MLP vs FFF PyTorch hard vs FFF C++ hard (CPU) / Triton (CUDA).
+* On CUDA, optionally sweeps batch sizes to find where FFF Triton beats Dense.
 * By default benchmarks the auto-detected accelerator **and** CPU for a
   side-by-side report (skip CPU with ``--skip-cpu``).
 * Peak RAM via ``psutil`` when available, else ``tracemalloc`` fallback.
@@ -524,6 +528,30 @@ def build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not also run a CPU baseline when primary device is a GPU",
     )
+    p.add_argument(
+        "--batch-sweep",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="On CUDA: run Dense vs FFF Triton batch-size scaling (default: on)",
+    )
+    p.add_argument(
+        "--batch-sizes",
+        type=str,
+        default="1,2,4,8,16",
+        help="Comma-separated batch sizes for CUDA batch sweep",
+    )
+    p.add_argument(
+        "--batch-sweep-tokens",
+        type=int,
+        default=100,
+        help="Timed new tokens per sequence in batch sweep (default 100)",
+    )
+    p.add_argument(
+        "--batch-sweep-prompt-len",
+        type=int,
+        default=32,
+        help="Prompt length for batch sweep (default 32)",
+    )
     return p
 
 
@@ -824,6 +852,280 @@ def print_gpu_vs_cpu_summary(
     print("=" * 72)
 
 
+# ---------------------------------------------------------------------------
+# CUDA batch-size scaling (Dense vs FFF Triton crossover)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BatchSweepRow:
+    """One row of the CUDA batch-size scaling table."""
+
+    batch_size: int
+    dense_tok_s: float
+    fff_tok_s: float
+    speedup: float
+    dense_peak_ram_mb: float
+    fff_peak_ram_mb: float
+    note: str = ""
+
+
+def _cuda_peak_ram_mb(device: torch.device, host_rss_mb: float) -> float:
+    """Prefer CUDA allocator peak when on GPU; else host RSS."""
+    if device.type == "cuda" and torch.cuda.is_available():
+        return float(torch.cuda.max_memory_allocated(device)) / (1024.0 * 1024.0)
+    return host_rss_mb
+
+
+@torch.no_grad()
+def _time_batched_generate(
+    forward_step: Callable[[Tensor], Tensor],
+    prompt: Tensor,
+    block_size: int,
+    n_tokens: int,
+    warmup_tokens: int,
+) -> tuple[float, float]:
+    """Warmup (untimed) then time greedy generation.
+
+    Returns ``(tokens_per_s, peak_ram_mb)`` where tokens = ``B * n_tokens``.
+    """
+    device = prompt.device
+    batch_size = int(prompt.size(0))
+
+    if warmup_tokens > 0:
+        generate_timed(forward_step, prompt.clone(), warmup_tokens, block_size)
+        _sync_device(device)
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+
+    rss_before = _rss_mb()
+    _ids, elapsed = generate_timed(
+        forward_step, prompt.clone(), n_tokens, block_size
+    )
+    _sync_device(device)
+    rss_after = _rss_mb()
+    peak_host = max(rss_before, rss_after, _peak_traced_mb() + rss_before)
+    peak_ram = _cuda_peak_ram_mb(device, peak_host)
+
+    total_new_tokens = batch_size * n_tokens
+    tok_s = total_new_tokens / max(elapsed, 1e-12)
+    return tok_s, peak_ram
+
+
+def print_batch_scaling_table(rows: list[BatchSweepRow]) -> None:
+    """Print Dense vs FFF Triton throughput / RAM across batch sizes."""
+    headers = [
+        "Batch Size",
+        "Dense (tok/s)",
+        "FFF Triton (tok/s)",
+        "FFF Speedup vs Dense",
+        "Peak RAM (Dense)",
+        "Peak RAM (FFF)",
+    ]
+    widths = [12, 16, 20, 22, 18, 16]
+
+    def fmt_row(cells: list[str]) -> str:
+        parts = []
+        for cell, w in zip(cells, widths):
+            parts.append(f" {cell:<{w - 1}}")
+        return "|" + "|".join(parts) + "|"
+
+    sep = "+" + "+".join("-" * w for w in widths) + "+"
+    print("\n" + "=" * 72)
+    print("CUDA Batch Size Scaling — Dense MLP vs FFF Triton Hard")
+    print("=" * 72)
+    print(sep)
+    print(fmt_row(headers))
+    print(sep)
+
+    crossover: int | None = None
+    for row in rows:
+        if row.note:
+            cells = [
+                str(row.batch_size),
+                "OOM/SKIP",
+                "OOM/SKIP",
+                "—",
+                "—",
+                "—",
+            ]
+        else:
+            cells = [
+                str(row.batch_size),
+                f"{row.dense_tok_s:.2f}",
+                f"{row.fff_tok_s:.2f}",
+                f"{row.speedup:.2f}x",
+                f"{row.dense_peak_ram_mb:.1f} MB",
+                f"{row.fff_peak_ram_mb:.1f} MB",
+            ]
+            if crossover is None and row.speedup > 1.0:
+                crossover = row.batch_size
+        print(fmt_row(cells))
+    print(sep)
+
+    if crossover is not None:
+        print(
+            f"Crossover: FFF Triton surpasses Dense at batch_size ≥ {crossover}"
+        )
+    else:
+        ok = [r for r in rows if not r.note]
+        if ok:
+            best = max(ok, key=lambda r: r.speedup)
+            print(
+                f"No crossover in this sweep (FFF best speedup "
+                f"{best.speedup:.2f}x at batch_size={best.batch_size})."
+            )
+        else:
+            print("No successful batch-size measurements (all OOM/SKIP).")
+    print("=" * 72)
+
+
+def run_cuda_batch_scaling_benchmark(
+    device: torch.device,
+    config: FFFConfig,
+    ckpt_path: Path | None,
+    *,
+    batch_sizes: list[int] | None = None,
+    prompt_len: int = 32,
+    n_tokens: int = 100,
+    warmup: int = 10,
+    seed: int = 42,
+) -> list[BatchSweepRow]:
+    """Sweep batch sizes on CUDA: Standard Dense vs FFF Triton hard routing.
+
+    Uses ``prompt_len=32`` and ``n_tokens=100`` by default to keep throughput
+    estimates stable without blowing 12GB VRAM on RTX 3060-class GPUs.
+    """
+    if device.type != "cuda":
+        print("Batch-size scaling skipped (CUDA only).")
+        return []
+    if not is_triton_available():
+        print(
+            "Batch-size scaling skipped — Triton unavailable "
+            "(`pip install triton`)."
+        )
+        return []
+
+    batch_sizes = batch_sizes or [1, 2, 4, 8, 16]
+    apply_hardware_optimizations(device)
+
+    print("\n" + "-" * 72)
+    print("CUDA Batch Size Scaling Benchmark (Dense vs FFF Triton)")
+    print("-" * 72)
+    print(
+        f"batch_sizes={batch_sizes} | prompt_len={prompt_len} | "
+        f"timed={n_tokens} | warmup={warmup}"
+    )
+
+    torch.manual_seed(seed)
+
+    def _build_dense() -> StandardTransformer:
+        m = StandardTransformer(config).to(device)
+        m.eval()
+        return m
+
+    def _build_fff() -> FFFTransformer:
+        m = FFFTransformer(config).to(device)
+        if ckpt_path is not None:
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            m.load_state_dict(ckpt["model_state_dict"])
+        m.eval()
+        return m
+
+    print("Loading StandardTransformer (Dense)...")
+    dense_model = _build_dense()
+    dense_step = make_dense_step(dense_model)
+
+    print("Loading FFFTransformer (Triton mode)...")
+    fff_model = _build_fff()
+    fff_step = make_fff_triton_step(fff_model)
+
+    # Autotune once for model shapes before any timed batch (cost excluded).
+    print(
+        "Warming up Triton autotuner / CUDA compile "
+        "(excluded from batch-sweep timing)..."
+    )
+    warmup_fff_model_triton(
+        fff_model,
+        sample_tokens=max(prompt_len, 32),
+        n_iters=max(5, warmup),
+    )
+    _sync_device(device)
+    # Also touch a full generate path once so CUDA graphs / allocator settle.
+    warm_prompt = torch.randint(
+        0, config.vocab_size, (1, prompt_len), device=device, dtype=torch.long
+    )
+    generate_timed(fff_step, warm_prompt, min(8, n_tokens), config.block_size)
+    generate_timed(dense_step, warm_prompt.clone(), min(8, n_tokens), config.block_size)
+    _sync_device(device)
+    print("Warmup done — starting batch-size sweep")
+
+    rows: list[BatchSweepRow] = []
+    for bsz in batch_sizes:
+        print(f"\n  batch_size={bsz} ...")
+        prompt = torch.randint(
+            0,
+            config.vocab_size,
+            (bsz, prompt_len),
+            device=device,
+            dtype=torch.long,
+        )
+        try:
+            dense_tok_s, dense_ram = _time_batched_generate(
+                dense_step,
+                prompt,
+                config.block_size,
+                n_tokens,
+                warmup_tokens=warmup,
+            )
+            fff_tok_s, fff_ram = _time_batched_generate(
+                fff_step,
+                prompt,
+                config.block_size,
+                n_tokens,
+                warmup_tokens=warmup,
+            )
+            speedup = fff_tok_s / max(dense_tok_s, 1e-12)
+            row = BatchSweepRow(
+                batch_size=bsz,
+                dense_tok_s=dense_tok_s,
+                fff_tok_s=fff_tok_s,
+                speedup=speedup,
+                dense_peak_ram_mb=dense_ram,
+                fff_peak_ram_mb=fff_ram,
+            )
+            print(
+                f"    Dense={dense_tok_s:.2f} tok/s | "
+                f"FFF Triton={fff_tok_s:.2f} tok/s | "
+                f"speedup={speedup:.2f}x | "
+                f"RAM D/F={dense_ram:.1f}/{fff_ram:.1f} MB"
+            )
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            row = BatchSweepRow(
+                batch_size=bsz,
+                dense_tok_s=float("nan"),
+                fff_tok_s=float("nan"),
+                speedup=float("nan"),
+                dense_peak_ram_mb=float("nan"),
+                fff_peak_ram_mb=float("nan"),
+                note="OOM",
+            )
+            print("    OOM — skipping this batch size")
+        rows.append(row)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    print_batch_scaling_table(rows)
+
+    del dense_model, fff_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    return rows
+
+
 def main() -> None:
     args = build_argparser().parse_args()
     torch.set_grad_enabled(False)
@@ -905,6 +1207,31 @@ def main() -> None:
             cpu_count,
         )
         print_gpu_vs_cpu_summary(primary, fff_primary, fff_cpu)
+
+    # CUDA batch-size scaling: find Dense → FFF Triton crossover
+    if primary.type == "cuda" and args.batch_sweep:
+        try:
+            batch_sizes = [
+                int(x.strip())
+                for x in str(args.batch_sizes).split(",")
+                if x.strip()
+            ]
+        except ValueError:
+            print(
+                f"ERROR: invalid --batch-sizes {args.batch_sizes!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        run_cuda_batch_scaling_benchmark(
+            primary,
+            config,
+            ckpt_path,
+            batch_sizes=batch_sizes,
+            prompt_len=args.batch_sweep_prompt_len,
+            n_tokens=args.batch_sweep_tokens,
+            warmup=args.warmup,
+            seed=args.seed,
+        )
 
     torch.set_num_threads(cpu_count)
 
