@@ -3,21 +3,22 @@
 
 Hosts
 -----
-* **macOS (Apple Silicon)** — CPU-only. Builds ``fff_hard_cpp`` with
-  ``-O3 -std=c++17``. OpenMP is optional (Homebrew libomp); threading still
-  works via PyTorch ``at::parallel_for``. CUDA is **skipped** (no errors).
-* **Linux x86_64 + RTX 3060** — full build. C++ flags include
-  ``-O3 -march=native -fopenmp -funroll-loops``. If CUDA is available **and**
-  ``csrc/*.cu`` sources exist, also builds a ``CUDAExtension`` for ``sm_86``.
+* **macOS (Apple Silicon)** — CPU-only ``fff_hard_cpp`` (``-O3 -std=c++17``).
+* **Linux x86_64 + RTX 3060** — CPU + optional CUDA ``sm_86`` if ``csrc/*.cu`` exists.
 
-Examples
---------
-    # Mac M4 local CPU benchmarks
-    pip install -e .
+Important — pip build isolation
+-------------------------------
+``pip install -e .`` runs ``setup.py`` in an **isolated** env that does **not**
+see your venv's ``torch``. Always install torch first, then use
+``--no-build-isolation`` so the extension links against the venv PyTorch::
 
-    # Linux RTX 3060
-    export TORCH_CUDA_ARCH_LIST=8.6
-    pip install -e .
+    pip install torch  # or your CUDA wheel
+    export TORCH_CUDA_ARCH_LIST=8.6   # Linux RTX 3060
+    pip install -e . --no-build-isolation
+
+If torch is missing, this setup still installs the pure-Python package; the
+C++ kernel can JIT-compile later via ``models.fff_layer`` or you can re-run
+the command above to build the extension in-place.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ _CSRC = _ROOT / "csrc"
 if str(_CSRC) not in sys.path:
     sys.path.insert(0, str(_CSRC))
 
+# compiler_flags is pure-Python (torch import is deferred inside helpers).
 from compiler_flags import (  # noqa: E402
     TARGET_CUDA_ARCH,
     apply_cuda_arch_env,
@@ -48,18 +50,36 @@ from compiler_flags import (  # noqa: E402
     should_build_cuda,
 )
 
-try:
-    from torch.utils.cpp_extension import BuildExtension, CppExtension
-except ImportError as exc:  # pragma: no cover
-    raise SystemExit(
-        "PyTorch is required to build fff_hard. Install torch first, then retry."
-    ) from exc
+_TORCH_CPP_EXT_AVAILABLE = False
+BuildExtension = None  # type: ignore[misc, assignment]
+CppExtension = None  # type: ignore[misc, assignment]
+CUDAExtension = None  # type: ignore[misc, assignment]
 
-# CUDAExtension is optional — missing on CPU-only torch wheels is fine.
 try:
-    from torch.utils.cpp_extension import CUDAExtension
-except ImportError:  # pragma: no cover
-    CUDAExtension = None  # type: ignore[misc, assignment]
+    from torch.utils.cpp_extension import BuildExtension as _BuildExtension
+    from torch.utils.cpp_extension import CppExtension as _CppExtension
+
+    BuildExtension = _BuildExtension
+    CppExtension = _CppExtension
+    _TORCH_CPP_EXT_AVAILABLE = True
+    try:
+        from torch.utils.cpp_extension import CUDAExtension as _CUDAExtension
+
+        CUDAExtension = _CUDAExtension
+    except ImportError:
+        CUDAExtension = None
+except ImportError:
+    print(
+        "=" * 72 + "\n"
+        "WARNING: PyTorch not importable in this build environment.\n"
+        "  → Installing pure-Python package only (no fff_hard C++ extension).\n"
+        "  → To compile the native extension against your venv torch:\n"
+        "       pip install torch\n"
+        "       pip install -e . --no-build-isolation\n"
+        "  (pip's default build isolation hides venv packages like torch.)\n"
+        + "=" * 72,
+        file=sys.stderr,
+    )
 
 
 def _print_banner(plan: dict) -> None:
@@ -86,8 +106,9 @@ def _print_banner(plan: dict) -> None:
     print("=" * 72)
 
 
-def _cpu_extension() -> CppExtension:
-    """Always-built CPU hard-routing kernel (macOS + Linux)."""
+def _cpu_extension():
+    """CPU hard-routing kernel (macOS + Linux)."""
+    assert CppExtension is not None
     compile_args = fff_hard_extra_compile_args()
     return CppExtension(
         name="fff_hard_cpp",
@@ -102,9 +123,7 @@ def _cpu_extension() -> CppExtension:
 
 def _cuda_extension_or_none(cuda_sources: list[str]):
     """Optional CUDA sibling targeting RTX 3060 (sm_86). Never built on macOS."""
-    if not cuda_sources:
-        return None
-    if not should_build_cuda():
+    if not cuda_sources or not should_build_cuda():
         return None
     if CUDAExtension is None:
         print("CUDAExtension unavailable in this torch build — skipping CUDA.")
@@ -126,12 +145,13 @@ def _cuda_extension_or_none(cuda_sources: list[str]):
 
 
 def build_ext_modules() -> list:
+    if not _TORCH_CPP_EXT_AVAILABLE:
+        return []
+
     plan = extension_build_plan(_CSRC)
     _print_banner(plan)
 
     modules: list = [_cpu_extension()]
-
-    # macOS: never attempt CUDA (even if a .cu file exists).
     if is_macos():
         return modules
 
@@ -142,6 +162,9 @@ def build_ext_modules() -> list:
 
 
 ext_modules = build_ext_modules()
+cmdclass: dict = {}
+if _TORCH_CPP_EXT_AVAILABLE and ext_modules and BuildExtension is not None:
+    cmdclass = {"build_ext": BuildExtension.with_options(no_python_abi_suffix=True)}
 
 setup(
     name="hyperzens-ai",
@@ -151,7 +174,7 @@ setup(
     ),
     packages=find_packages(exclude=("old", "data.cache", "csrc.build")),
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension.with_options(no_python_abi_suffix=True)},
+    cmdclass=cmdclass,
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.0.0",
