@@ -2,19 +2,15 @@
 
 Hybrid dispatch
 ---------------
-Routing chooses a path from a **dispatch count** ``D`` (default: flattened
-token count ``N = x.shape[0]``). Transformer callers should pass
-``dispatch_n=B`` (microbatch size) so small-batch full-context decode
-(``N = B·T`` with ``T ≫ 1``) still hits the fused path:
+Routing uses a **dispatch count** ``D`` (default: flattened ``N = x.shape[0]``;
+transformer callers pass ``dispatch_n=B`` so full-context decode still keys
+off microbatch size):
 
-* **``D <= 4`` (single token / small batch):** ``fff_hard_forward_triton_kernel``
-  — single-pass tree-walk + leaf GEMV, no sort/bucket overhead
-  (~189+ tok/s at batch=1).
-* **``D > 4`` (large batch):** grouped / sorted multi-pass path
-  1. Pass 1 — route: Triton writes ``leaf_id[n]`` for all tokens.
-  2. Pass 2 — sort: ``torch.sort`` buckets by ``leaf_id``.
-  3. Pass 3 — coalesced leaf GEMM: one ``mm`` per unique leaf
-     (~670+ tok/s at large batch).
+* **FP16 / BF16:** fused while ``D <= 16``; sorted for ``D > 16``.
+* **FP32:** fused while ``D <= 4``; sorted for ``D > 4``.
+
+Fused path: single-pass ``fff_hard_forward_triton_kernel`` (no sort overhead).
+Sorted path: route → ``torch.sort`` by leaf → coalesced ``torch.mm`` per leaf.
 
 Buffers for ``y``, ``leaf_ids``, sort indices, and sorted ``x``/``y`` are
 pooled and reused to avoid allocator churn / fragmentation on RTX 3060.
@@ -25,7 +21,7 @@ Precision (Ampere / sm_86 Tensor Cores)
 * Triton kernels accumulate ``score`` / ``acc`` in ``tl.float32`` and cast to
   the destination dtype only on store into ``y``.
 * Autotune uses a 3-config Ampere (sm_86) shortlist with power-of-two
-  tiles ``>= 16`` so FP16 warmup stays fast and Tensor Core–aligned.
+  tiles ``>= 64`` so FP16 warmup stays fast and Tensor Core–aligned.
 * Neither hybrid path upcasts tensors to FP32 for the whole forward.
 """
 
@@ -141,8 +137,17 @@ def clear_triton_buffer_pool(*, empty_cache: bool = False) -> None:
         torch.cuda.empty_cache()
 
 
-# Max token count that uses the fused kernel (no sort). Above this → grouped path.
+# Fast-path (fused) thresholds. Half-precision keeps fused longer — sorting
+# overhead dominates until medium microbatches on Ampere Tensor Cores.
 FUSED_MAX_N: int = 4
+FUSED_MAX_N_HALF: int = 16
+
+
+def fused_dispatch_limit(dtype: torch.dtype) -> int:
+    """Return fused-path max dispatch count for ``dtype`` (tokens or batch hint)."""
+    if dtype in (torch.float16, torch.bfloat16):
+        return FUSED_MAX_N_HALF
+    return FUSED_MAX_N
 
 
 def _dtype_code(dtype: torch.dtype) -> int:
@@ -193,11 +198,12 @@ if _HAS_TRITON:
     def _route_autotune_configs() -> list:
         return [
             triton.Config({"BLOCK_SIZE_I": 128}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_SIZE_I": 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_SIZE_I": 128}, num_warps=4, num_stages=2),
             triton.Config({"BLOCK_SIZE_I": 256}, num_warps=8, num_stages=3),
         ]
 
     def _fused_autotune_configs() -> list:
+        # Powers of 2 >= 64 — Ampere Tensor Core–friendly sm_86 shortlist.
         return [
             triton.Config(
                 {"BLOCK_SIZE_I": 128, "BLOCK_SIZE_O": 128},
@@ -205,12 +211,12 @@ if _HAS_TRITON:
                 num_stages=3,
             ),
             triton.Config(
-                {"BLOCK_SIZE_I": 64, "BLOCK_SIZE_O": 64},
+                {"BLOCK_SIZE_I": 128, "BLOCK_SIZE_O": 64},
                 num_warps=4,
                 num_stages=2,
             ),
             triton.Config(
-                {"BLOCK_SIZE_I": 256, "BLOCK_SIZE_O": 64},
+                {"BLOCK_SIZE_I": 256, "BLOCK_SIZE_O": 128},
                 num_warps=8,
                 num_stages=3,
             ),
@@ -287,7 +293,7 @@ if _HAS_TRITON:
         tl.store(leaf_ptr + n, leaf_id.to(tl.int32))
 
     # ------------------------------------------------------------------
-    # Fused path (N <= FUSED_MAX_N): tree walk + leaf GEMV in one launch
+    # Fused path (dispatch <= fused_dispatch_limit): tree walk + leaf GEMV
     # ------------------------------------------------------------------
 
     @_decorate_autotune(
@@ -540,8 +546,9 @@ def fff_hard_forward_triton(
         Optional ``(N, D_out)`` preallocated output (else pooled buffer is used).
     dispatch_n:
         Count used for hybrid selection. Defaults to ``N = x.shape[0]``.
-        Pass the microbatch size ``B`` from ``(B, T, D)`` callers so
-        ``B <= FUSED_MAX_N`` stays on the fused kernel even when ``N = B·T > 4``.
+        Pass the microbatch size ``B`` from ``(B, T, D)`` callers so small
+        batches stay fused even when ``N = B·T`` is large. FP16/BF16 use
+        ``FUSED_MAX_N_HALF`` (16); FP32 uses ``FUSED_MAX_N`` (4).
     """
     if not _HAS_TRITON:
         raise RuntimeError(
@@ -571,9 +578,11 @@ def fff_hard_forward_triton(
     if x.ndim != 2:
         raise ValueError(f"x must be (N, D_in), got {tuple(x.shape)}")
     n, d_in = x.shape
+    # Dispatch count: explicit batch hint, else total flattened tokens N.
     route_n = int(dispatch_n) if dispatch_n is not None else n
     if route_n < 1:
         raise ValueError(f"dispatch_n must be >= 1, got {route_n}")
+    fused_limit = fused_dispatch_limit(compute_dtype)
     num_leaves = 1 << depth
     num_routers = num_leaves - 1
     if wr.shape != (num_routers, d_in):
@@ -604,8 +613,8 @@ def fff_hard_forward_triton(
                 )
             y = out.contiguous()
 
-        # Small batch / single-token: fused kernel (no sort/bucket overhead).
-        if route_n <= FUSED_MAX_N:
+        # FP16/BF16: fused for route_n <= 16; FP32: <= 4. Else sorted GEMM.
+        if route_n <= fused_limit:
             _launch_fused(x, wr, br, wl, bl, depth, y[:n])
             return y[:n]
 
@@ -632,7 +641,8 @@ def warmup_fff_hard_triton(
     """Force Triton autotune + buffer pool init before benchmark timing."""
     if not _HAS_TRITON or x.device.type != "cuda":
         return
-    # Warm fused (dispatch_n<=4) and sorted (dispatch_n>4) on the same token buffer.
+    # Warm fused (dispatch <= limit) and sorted (dispatch > limit) paths.
+    limit = fused_dispatch_limit(x.dtype)
     for _ in range(max(n_iters, 1)):
         fff_hard_forward_triton(
             x, w_router, b_router, w_leaf, b_leaf, depth, dispatch_n=1
@@ -644,7 +654,7 @@ def warmup_fff_hard_triton(
             w_leaf,
             b_leaf,
             depth,
-            dispatch_n=FUSED_MAX_N + 1,
+            dispatch_n=limit + 1,
         )
     torch.cuda.synchronize(x.device)
 
@@ -667,10 +677,10 @@ def warmup_fff_model_triton(
         return
 
     d_model = int(layers[0].in_features)
-    n = max(int(sample_tokens), FUSED_MAX_N + 1)
     dtype = next(model.parameters()).dtype
     if dtype not in SUPPORTED_DTYPES:
         dtype = torch.float32
+    n = max(int(sample_tokens), fused_dispatch_limit(dtype) + 1)
     x = torch.randn(n, d_model, device=device, dtype=dtype)
     for layer in layers:
         warmup_fff_hard_triton(

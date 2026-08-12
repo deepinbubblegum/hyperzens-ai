@@ -535,7 +535,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--batch-sizes",
         type=str,
-        default="1,2,4,8,16,32,64",
+        default="1,2,4,8,16,32,64,128",
         help="Comma-separated batch sizes for CUDA batch sweep",
     )
     p.add_argument(
@@ -1067,7 +1067,7 @@ def run_cuda_batch_scaling_benchmark(
         print("Batch-size scaling skipped — BF16 not supported on this GPU.")
         return []
 
-    batch_sizes = batch_sizes or [1, 2, 4, 8, 16, 32, 64]
+    batch_sizes = batch_sizes or [1, 2, 4, 8, 16, 32, 64, 128]
     label = _dtype_label(dtype)
     apply_hardware_optimizations(device)
 
