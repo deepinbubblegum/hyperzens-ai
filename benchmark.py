@@ -14,16 +14,14 @@ Execution
     # CUDA batch-size scaling (Dense vs FFF Triton crossover)
     python benchmark.py --device cuda --skip-cpu --batch-sweep
 
-    # Faster smoke / custom size
-    python benchmark.py --n-tokens 50 --warmup 5 --n-embd 256 --n-layer 4
-
-    # Match a trained checkpoint's config
-    python benchmark.py --checkpoint fff_checkpoint.pt
+    # FP16 Tensor Core sweep (Ampere)
+    python benchmark.py --device cuda --skip-cpu --batch-sweep --precision fp16
 
 Notes
 -----
 * Compares Dense MLP vs FFF PyTorch hard vs FFF C++ hard (CPU) / Triton (CUDA).
 * On CUDA, optionally sweeps batch sizes to find where FFF Triton beats Dense.
+* ``--precision fp16|bf16|fp32|both`` casts models for Tensor Core paths (default: both fp32+fp16 on CUDA sweeps).
 * By default benchmarks the auto-detected accelerator **and** CPU for a
   side-by-side report (skip CPU with ``--skip-cpu``).
 * Peak RAM via ``psutil`` when available, else ``tracemalloc`` fallback.
@@ -552,6 +550,16 @@ def build_argparser() -> argparse.ArgumentParser:
         default=32,
         help="Prompt length for batch sweep (default 32)",
     )
+    p.add_argument(
+        "--precision",
+        type=str,
+        default="both",
+        choices=("fp32", "fp16", "bf16", "both"),
+        help=(
+            "Compute dtype for CUDA batch sweep: fp32, fp16, bf16, or both "
+            "(fp32 then fp16; default both)"
+        ),
+    )
     return p
 
 
@@ -867,7 +875,40 @@ class BatchSweepRow:
     speedup: float
     dense_peak_ram_mb: float
     fff_peak_ram_mb: float
+    dense_ms_per_tok: float = float("nan")
+    fff_ms_per_tok: float = float("nan")
     note: str = ""
+
+
+def _precision_to_dtype(name: str) -> torch.dtype:
+    """Map CLI precision name to a torch.dtype."""
+    key = name.lower().strip()
+    if key in ("fp16", "float16", "half"):
+        return torch.float16
+    if key in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    if key in ("fp32", "float32", "float"):
+        return torch.float32
+    raise ValueError(f"unknown precision {name!r}")
+
+
+def _dtype_label(dtype: torch.dtype) -> str:
+    if dtype == torch.float16:
+        return "FP16"
+    if dtype == torch.bfloat16:
+        return "BF16"
+    return "FP32"
+
+
+def _cast_model_(model: nn.Module, dtype: torch.dtype) -> nn.Module:
+    """In-place cast of floating parameters / buffers to ``dtype``."""
+    if dtype == torch.float32:
+        return model.float()
+    if dtype == torch.float16:
+        return model.half()
+    if dtype == torch.bfloat16:
+        return model.to(dtype=torch.bfloat16)
+    raise TypeError(f"unsupported model dtype {dtype}")
 
 
 def _cuda_peak_ram_mb(device: torch.device, host_rss_mb: float) -> float:
@@ -884,10 +925,11 @@ def _time_batched_generate(
     block_size: int,
     n_tokens: int,
     warmup_tokens: int,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     """Warmup (untimed) then time greedy generation.
 
-    Returns ``(tokens_per_s, peak_ram_mb)`` where tokens = ``B * n_tokens``.
+    Returns ``(tokens_per_s, ms_per_token, peak_ram_mb)`` where tokens =
+    ``B * n_tokens``.
     """
     device = prompt.device
     batch_size = int(prompt.size(0))
@@ -911,20 +953,28 @@ def _time_batched_generate(
 
     total_new_tokens = batch_size * n_tokens
     tok_s = total_new_tokens / max(elapsed, 1e-12)
-    return tok_s, peak_ram
+    ms_per_tok = (elapsed * 1000.0) / max(total_new_tokens, 1)
+    return tok_s, ms_per_tok, peak_ram
 
 
-def print_batch_scaling_table(rows: list[BatchSweepRow]) -> None:
-    """Print Dense vs FFF Triton throughput / RAM across batch sizes."""
+def print_batch_scaling_table(
+    rows: list[BatchSweepRow],
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> None:
+    """Print Dense vs FFF Triton throughput / latency / VRAM across batch sizes."""
+    label = _dtype_label(dtype)
     headers = [
-        "Batch Size",
-        "Dense (tok/s)",
-        "FFF Triton (tok/s)",
-        "FFF Speedup vs Dense",
-        "Peak RAM (Dense)",
-        "Peak RAM (FFF)",
+        "Batch",
+        "Dense tok/s",
+        "FFF tok/s",
+        "Speedup",
+        "Dense ms/tok",
+        "FFF ms/tok",
+        "VRAM Dense",
+        "VRAM FFF",
     ]
-    widths = [12, 16, 20, 22, 18, 16]
+    widths = [8, 13, 12, 10, 14, 12, 12, 12]
 
     def fmt_row(cells: list[str]) -> str:
         parts = []
@@ -933,9 +983,9 @@ def print_batch_scaling_table(rows: list[BatchSweepRow]) -> None:
         return "|" + "|".join(parts) + "|"
 
     sep = "+" + "+".join("-" * w for w in widths) + "+"
-    print("\n" + "=" * 72)
-    print("CUDA Batch Size Scaling — Dense MLP vs FFF Triton Hard")
-    print("=" * 72)
+    print("\n" + "=" * 88)
+    print(f"CUDA Batch Scaling — Dense MLP vs FFF Triton Hard ({label})")
+    print("=" * 88)
     print(sep)
     print(fmt_row(headers))
     print(sep)
@@ -950,6 +1000,8 @@ def print_batch_scaling_table(rows: list[BatchSweepRow]) -> None:
                 "—",
                 "—",
                 "—",
+                "—",
+                "—",
             ]
         else:
             cells = [
@@ -957,6 +1009,8 @@ def print_batch_scaling_table(rows: list[BatchSweepRow]) -> None:
                 f"{row.dense_tok_s:.2f}",
                 f"{row.fff_tok_s:.2f}",
                 f"{row.speedup:.2f}x",
+                f"{row.dense_ms_per_tok:.3f}",
+                f"{row.fff_ms_per_tok:.3f}",
                 f"{row.dense_peak_ram_mb:.1f} MB",
                 f"{row.fff_peak_ram_mb:.1f} MB",
             ]
@@ -967,19 +1021,20 @@ def print_batch_scaling_table(rows: list[BatchSweepRow]) -> None:
 
     if crossover is not None:
         print(
-            f"Crossover: FFF Triton surpasses Dense at batch_size ≥ {crossover}"
+            f"Crossover ({label}): FFF Triton surpasses Dense at "
+            f"batch_size ≥ {crossover}"
         )
     else:
         ok = [r for r in rows if not r.note]
         if ok:
             best = max(ok, key=lambda r: r.speedup)
             print(
-                f"No crossover in this sweep (FFF best speedup "
+                f"No crossover in this {label} sweep (FFF best speedup "
                 f"{best.speedup:.2f}x at batch_size={best.batch_size})."
             )
         else:
-            print("No successful batch-size measurements (all OOM/SKIP).")
-    print("=" * 72)
+            print(f"No successful {label} batch-size measurements (all OOM/SKIP).")
+    print("=" * 88)
 
 
 def run_cuda_batch_scaling_benchmark(
@@ -992,11 +1047,12 @@ def run_cuda_batch_scaling_benchmark(
     n_tokens: int = 100,
     warmup: int = 10,
     seed: int = 42,
+    dtype: torch.dtype = torch.float32,
 ) -> list[BatchSweepRow]:
     """Sweep batch sizes on CUDA: Standard Dense vs FFF Triton hard routing.
 
-    Uses ``prompt_len=32`` and ``n_tokens=100`` by default to keep throughput
-    estimates stable without blowing 12GB VRAM on RTX 3060-class GPUs.
+    Models and activations run in ``dtype`` (``float32`` / ``float16`` /
+    ``bfloat16``). Token ids remain ``int64``; embeddings emit ``dtype``.
     """
     if device.type != "cuda":
         print("Batch-size scaling skipped (CUDA only).")
@@ -1007,15 +1063,19 @@ def run_cuda_batch_scaling_benchmark(
             "(`pip install triton`)."
         )
         return []
+    if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        print("Batch-size scaling skipped — BF16 not supported on this GPU.")
+        return []
 
     batch_sizes = batch_sizes or [1, 2, 4, 8, 16, 32, 64]
+    label = _dtype_label(dtype)
     apply_hardware_optimizations(device)
 
     print("\n" + "-" * 72)
-    print("CUDA Batch Size Scaling Benchmark (Dense vs FFF Triton)")
+    print(f"CUDA Batch Size Scaling ({label}) — Dense vs FFF Triton")
     print("-" * 72)
     print(
-        f"batch_sizes={batch_sizes} | prompt_len={prompt_len} | "
+        f"dtype={label} | batch_sizes={batch_sizes} | prompt_len={prompt_len} | "
         f"timed={n_tokens} | warmup={warmup}"
     )
 
@@ -1023,6 +1083,7 @@ def run_cuda_batch_scaling_benchmark(
 
     def _build_dense() -> StandardTransformer:
         m = StandardTransformer(config).to(device)
+        _cast_model_(m, dtype)
         m.eval()
         return m
 
@@ -1031,20 +1092,20 @@ def run_cuda_batch_scaling_benchmark(
         if ckpt_path is not None:
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
             m.load_state_dict(ckpt["model_state_dict"])
+        _cast_model_(m, dtype)
         m.eval()
         return m
 
-    print("Loading StandardTransformer (Dense)...")
+    print(f"Loading StandardTransformer (Dense, {label})...")
     dense_model = _build_dense()
     dense_step = make_dense_step(dense_model)
 
-    print("Loading FFFTransformer (Triton mode)...")
+    print(f"Loading FFFTransformer (Triton mode, {label})...")
     fff_model = _build_fff()
     fff_step = make_fff_triton_step(fff_model)
 
-    # Autotune once for model shapes before any timed batch (cost excluded).
     print(
-        "Warming up Triton autotuner / CUDA compile "
+        f"Warming up Triton autotuner / CUDA compile [{label}] "
         "(excluded from batch-sweep timing)..."
     )
     warmup_fff_model_triton(
@@ -1053,18 +1114,17 @@ def run_cuda_batch_scaling_benchmark(
         n_iters=max(5, warmup),
     )
     _sync_device(device)
-    # Also touch a full generate path once so CUDA graphs / allocator settle.
     warm_prompt = torch.randint(
         0, config.vocab_size, (1, prompt_len), device=device, dtype=torch.long
     )
     generate_timed(fff_step, warm_prompt, min(8, n_tokens), config.block_size)
     generate_timed(dense_step, warm_prompt.clone(), min(8, n_tokens), config.block_size)
     _sync_device(device)
-    print("Warmup done — starting batch-size sweep")
+    print(f"Warmup done — starting {label} batch-size sweep")
 
     rows: list[BatchSweepRow] = []
     for bsz in batch_sizes:
-        print(f"\n  batch_size={bsz} ...")
+        print(f"\n  [{label}] batch_size={bsz} ...")
         prompt = torch.randint(
             0,
             config.vocab_size,
@@ -1073,14 +1133,14 @@ def run_cuda_batch_scaling_benchmark(
             dtype=torch.long,
         )
         try:
-            dense_tok_s, dense_ram = _time_batched_generate(
+            dense_tok_s, dense_ms, dense_ram = _time_batched_generate(
                 dense_step,
                 prompt,
                 config.block_size,
                 n_tokens,
                 warmup_tokens=warmup,
             )
-            fff_tok_s, fff_ram = _time_batched_generate(
+            fff_tok_s, fff_ms, fff_ram = _time_batched_generate(
                 fff_step,
                 prompt,
                 config.block_size,
@@ -1095,12 +1155,14 @@ def run_cuda_batch_scaling_benchmark(
                 speedup=speedup,
                 dense_peak_ram_mb=dense_ram,
                 fff_peak_ram_mb=fff_ram,
+                dense_ms_per_tok=dense_ms,
+                fff_ms_per_tok=fff_ms,
             )
             print(
-                f"    Dense={dense_tok_s:.2f} tok/s | "
-                f"FFF Triton={fff_tok_s:.2f} tok/s | "
+                f"    Dense={dense_tok_s:.2f} tok/s ({dense_ms:.3f} ms) | "
+                f"FFF Triton={fff_tok_s:.2f} tok/s ({fff_ms:.3f} ms) | "
                 f"speedup={speedup:.2f}x | "
-                f"RAM D/F={dense_ram:.1f}/{fff_ram:.1f} MB"
+                f"VRAM D/F={dense_ram:.1f}/{fff_ram:.1f} MB"
             )
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
@@ -1118,7 +1180,7 @@ def run_cuda_batch_scaling_benchmark(
         gc.collect()
         torch.cuda.empty_cache()
 
-    print_batch_scaling_table(rows)
+    print_batch_scaling_table(rows, dtype=dtype)
 
     del dense_model, fff_model
     gc.collect()
@@ -1222,16 +1284,22 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        run_cuda_batch_scaling_benchmark(
-            primary,
-            config,
-            ckpt_path,
-            batch_sizes=batch_sizes,
-            prompt_len=args.batch_sweep_prompt_len,
-            n_tokens=args.batch_sweep_tokens,
-            warmup=args.warmup,
-            seed=args.seed,
-        )
+        if args.precision == "both":
+            sweep_dtypes = [torch.float32, torch.float16]
+        else:
+            sweep_dtypes = [_precision_to_dtype(args.precision)]
+        for sweep_dtype in sweep_dtypes:
+            run_cuda_batch_scaling_benchmark(
+                primary,
+                config,
+                ckpt_path,
+                batch_sizes=batch_sizes,
+                prompt_len=args.batch_sweep_prompt_len,
+                n_tokens=args.batch_sweep_tokens,
+                warmup=args.warmup,
+                seed=args.seed,
+                dtype=sweep_dtype,
+            )
 
     torch.set_num_threads(cpu_count)
 

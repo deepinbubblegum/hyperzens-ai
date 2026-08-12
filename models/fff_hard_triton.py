@@ -18,6 +18,15 @@ token count ``N = x.shape[0]``). Transformer callers should pass
 
 Buffers for ``y``, ``leaf_ids``, sort indices, and sorted ``x``/``y`` are
 pooled and reused to avoid allocator churn / fragmentation on RTX 3060.
+
+Precision (Ampere / sm_86 Tensor Cores)
+---------------------------------------
+* Activations and weights may be ``float16``, ``bfloat16``, or ``float32``.
+* Triton kernels accumulate ``score`` / ``acc`` in ``tl.float32`` and cast to
+  the destination dtype only on store into ``y``.
+* Autotune ``BLOCK_SIZE_{I,O}`` are multiples of 16 so half-precision GEMMs
+  (esp. the coalesced ``torch.mm`` path) map cleanly onto Tensor Cores.
+* Neither hybrid path upcasts tensors to FP32 for the whole forward.
 """
 
 from __future__ import annotations
@@ -28,6 +37,11 @@ from typing import Any
 
 import torch
 from torch import Tensor
+
+# Native compute dtypes for Triton / cuBLAS Tensor Core paths.
+SUPPORTED_DTYPES: frozenset[torch.dtype] = frozenset(
+    {torch.float16, torch.bfloat16, torch.float32}
+)
 
 _TRITON_IMPORT_ERROR: BaseException | None = None
 try:
@@ -131,17 +145,46 @@ def clear_triton_buffer_pool(*, empty_cache: bool = False) -> None:
 FUSED_MAX_N: int = 4
 
 
+def _dtype_code(dtype: torch.dtype) -> int:
+    """Compact dtype tag for Triton autotune keys (0=fp32, 1=fp16, 2=bf16)."""
+    if dtype == torch.float16:
+        return 1
+    if dtype == torch.bfloat16:
+        return 2
+    return 0
+
+
+def _ensure_compute_dtype(*tensors: Tensor) -> torch.dtype:
+    """Require a shared supported dtype across activations / weights."""
+    dtype = tensors[0].dtype
+    if dtype not in SUPPORTED_DTYPES:
+        raise TypeError(
+            f"unsupported dtype {dtype}; expected one of "
+            f"{sorted(str(d) for d in SUPPORTED_DTYPES)}"
+        )
+    for t in tensors[1:]:
+        if t.dtype != dtype:
+            raise TypeError(
+                f"dtype mismatch: expected {dtype}, got {t.dtype} "
+                f"(cast weights to activation dtype before calling)"
+            )
+    return dtype
+
+
 if _HAS_TRITON:
 
     # ------------------------------------------------------------------
-    # Autotune configs (Ampere / sm_86)
+    # Autotune configs (Ampere / sm_86) — BLOCK sizes are multiples of 16
+    # for Tensor Core–friendly half-precision tiles.
     # ------------------------------------------------------------------
 
     def _route_autotune_configs() -> list:
         configs: list = []
-        for block_i in (64, 128, 256, 512):
+        for block_i in (16, 32, 64, 128, 256, 512):
             for num_warps in (2, 4, 8):
                 if block_i >= 512 and num_warps < 4:
+                    continue
+                if block_i <= 16 and num_warps > 4:
                     continue
                 configs.append(
                     triton.Config(
@@ -154,14 +197,17 @@ if _HAS_TRITON:
 
     def _fused_autotune_configs() -> list:
         configs: list = []
-        for block_i in (64, 128, 256, 512):
-            for block_o in (32, 64, 128, 256):
+        # Multiples of 16 → Ampere Tensor Core tile alignment for fp16/bf16.
+        for block_i in (16, 32, 64, 128, 256, 512):
+            for block_o in (16, 32, 64, 128, 256):
                 if block_i * block_o > 16_384:
                     continue
                 for num_warps in (2, 4, 8):
                     if block_i * block_o >= 8_192 and num_warps < 4:
                         continue
                     if block_i >= 512 and num_warps < 4:
+                        continue
+                    if block_i <= 16 and block_o <= 16 and num_warps > 4:
                         continue
                     for num_stages in (2, 3, 4):
                         if num_stages >= 4 and block_i * block_o >= 8_192:
@@ -192,7 +238,10 @@ if _HAS_TRITON:
     # Pass 1: route-only kernel → leaf_ids
     # ------------------------------------------------------------------
 
-    @_decorate_autotune(_route_autotune_configs(), ["D_in", "DEPTH", "MAX_DIN"])
+    @_decorate_autotune(
+        _route_autotune_configs(),
+        ["D_in", "DEPTH", "MAX_DIN", "DTYPE_CODE"],
+    )
     @triton.jit
     def fff_route_leaf_ids_kernel(
         x_ptr,
@@ -209,8 +258,13 @@ if _HAS_TRITON:
         DEPTH: tl.constexpr,
         MAX_DIN: tl.constexpr,
         BLOCK_SIZE_I: tl.constexpr,
+        DTYPE_CODE: tl.constexpr,
     ):
-        """Walk the FFF tree for each token; store contiguous ``leaf_id``."""
+        """Walk the FFF tree for each token; store contiguous ``leaf_id``.
+
+        Dot products accumulate in ``tl.float32`` regardless of input dtype
+        (fp16 / bf16 / fp32) for stable router decisions.
+        """
         n = tl.program_id(0)
         if n >= N:
             return
@@ -245,7 +299,7 @@ if _HAS_TRITON:
 
     @_decorate_autotune(
         _fused_autotune_configs(),
-        ["D_in", "D_out", "DEPTH", "MAX_DIN"],
+        ["D_in", "D_out", "DEPTH", "MAX_DIN", "DTYPE_CODE"],
     )
     @triton.jit
     def fff_hard_forward_triton_kernel(
@@ -274,8 +328,9 @@ if _HAS_TRITON:
         MAX_DIN: tl.constexpr,
         BLOCK_SIZE_O: tl.constexpr,
         BLOCK_SIZE_I: tl.constexpr,
+        DTYPE_CODE: tl.constexpr,
     ):
-        """Fused hard routing for small ``N`` (no cross-token leaf reuse)."""
+        """Fused hard routing for small batches; FP32 accumulate, store as ``y`` dtype."""
         n = tl.program_id(0)
         o_tile = tl.program_id(1)
         if n >= N:
@@ -333,9 +388,10 @@ if _HAS_TRITON:
             ).to(tl.float32)
             acc += tl.sum(x_tile[:, None] * w_tile, axis=0)
 
+        # Cast FP32 accumulator to destination dtype (fp16/bf16/fp32) on writeback.
         tl.store(
             y_ptr + n * stride_y_n + o_offsets * stride_y_o,
-            acc,
+            acc.to(y_ptr.dtype.element_ty),
             mask=o_mask,
         )
 
@@ -351,6 +407,7 @@ def _launch_route_leaf_ids(
     n, d_in = x.shape
     num_leaves = 1 << depth
     max_din = triton.next_power_of_2(max(d_in, 1))
+    dtype_code = _dtype_code(x.dtype)
 
     def grid(_meta: dict[str, Any]) -> tuple[int]:
         return (n,)
@@ -369,6 +426,7 @@ def _launch_route_leaf_ids(
         w_router.stride(1),
         DEPTH=depth,
         MAX_DIN=max_din,
+        DTYPE_CODE=dtype_code,
     )
 
 
@@ -386,6 +444,7 @@ def _launch_fused(
     d_out = w_leaf.shape[-1]
     num_leaves = 1 << depth
     max_din = triton.next_power_of_2(max(d_in, 1))
+    dtype_code = _dtype_code(x.dtype)
 
     def grid(meta: dict[str, Any]) -> tuple[int, int]:
         return (n, triton.cdiv(d_out, meta["BLOCK_SIZE_O"]))
@@ -414,6 +473,7 @@ def _launch_fused(
         y.stride(1),
         DEPTH=depth,
         MAX_DIN=max_din,
+        DTYPE_CODE=dtype_code,
     )
 
 
@@ -428,7 +488,8 @@ def _coalesced_leaf_gemm(
     """Pass 2–3: sort by leaf_id, batched GEMM per unique leaf, scatter to ``y``.
 
     ``w_leaf[k]`` is loaded once per occupied leaf and reused across all tokens
-    routed to that leaf (coalesced / cuBLAS-friendly).
+    routed to that leaf. Uses ``torch.mm`` in the input dtype (fp16/bf16/fp32)
+    so Ampere Tensor Cores are eligible for half-precision GEMMs — no FP32 upcast.
     """
     n = x.shape[0]
     leaf_view = leaf_ids[:n]
@@ -451,7 +512,7 @@ def _coalesced_leaf_gemm(
     offset = 0
     for leaf_k, cnt in zip(uniq_list, counts_list):
         sl = slice(offset, offset + cnt)
-        # y = x @ W[leaf] + b[leaf]; W is (D_in, D_out)
+        # y = x @ W[leaf] + b[leaf] in-place in ``x.dtype`` (Tensor Core path).
         torch.mm(x_sorted[sl], w_leaf[leaf_k], out=y_sorted[sl])
         y_sorted[sl].add_(b_leaf[leaf_k])
         offset += cnt
@@ -473,21 +534,21 @@ def fff_hard_forward_triton(
     out: Tensor | None = None,
     dispatch_n: int | None = None,
 ) -> Tensor:
-    """Hard-routing forward with hybrid fused / sorted paths.
+    """Hard-routing forward with hybrid fused / sorted paths (fp16/bf16/fp32).
 
     Parameters
     ----------
     x:
         ``(N, D_in)`` CUDA contiguous (``N`` may be ``B·T`` after flatten).
+        Supported dtypes: ``float16``, ``bfloat16``, ``float32``.
     w_router, b_router, w_leaf, b_leaf, depth:
-        FFF tree parameters (see module docstring).
+        FFF tree parameters; must share ``x.dtype`` (no silent FP32 upcast).
     out:
         Optional ``(N, D_out)`` preallocated output (else pooled buffer is used).
     dispatch_n:
         Count used for hybrid selection. Defaults to ``N = x.shape[0]``.
         Pass the microbatch size ``B`` from ``(B, T, D)`` callers so
-        ``B <= FUSED_MAX_N`` stays on the fused kernel even when ``N = B·T > 4``
-        (restores batch=1 decode throughput).
+        ``B <= FUSED_MAX_N`` stays on the fused kernel even when ``N = B·T > 4``.
     """
     if not _HAS_TRITON:
         raise RuntimeError(
@@ -500,10 +561,18 @@ def fff_hard_forward_triton(
         raise ValueError(f"depth must be in [1, 12], got {depth}")
 
     x = x.contiguous()
-    w_router = w_router.contiguous()
-    b_router = b_router.contiguous()
-    w_leaf = w_leaf.contiguous()
-    b_leaf = b_leaf.contiguous()
+    # Align weights to activation dtype without promoting to FP32.
+    compute_dtype = x.dtype
+    if compute_dtype not in SUPPORTED_DTYPES:
+        raise TypeError(
+            f"unsupported x.dtype={compute_dtype}; expected one of "
+            f"{sorted(str(d) for d in SUPPORTED_DTYPES)}"
+        )
+    wr = w_router.to(dtype=compute_dtype).contiguous()
+    br = b_router.to(dtype=compute_dtype).contiguous()
+    wl = w_leaf.to(dtype=compute_dtype).contiguous()
+    bl = b_leaf.to(dtype=compute_dtype).contiguous()
+    _ensure_compute_dtype(x, wr, br, wl, bl)
 
     if x.ndim != 2:
         raise ValueError(f"x must be (N, D_in), got {tuple(x.shape)}")
@@ -513,35 +582,30 @@ def fff_hard_forward_triton(
         raise ValueError(f"dispatch_n must be >= 1, got {route_n}")
     num_leaves = 1 << depth
     num_routers = num_leaves - 1
-    if w_router.shape != (num_routers, d_in):
+    if wr.shape != (num_routers, d_in):
         raise ValueError(
-            f"w_router shape {tuple(w_router.shape)} != ({num_routers}, {d_in})"
+            f"w_router shape {tuple(wr.shape)} != ({num_routers}, {d_in})"
         )
-    if b_router.shape != (num_routers,):
-        raise ValueError(f"b_router shape {tuple(b_router.shape)} != ({num_routers},)")
-    if w_leaf.ndim != 3 or w_leaf.shape[0] != num_leaves or w_leaf.shape[1] != d_in:
+    if br.shape != (num_routers,):
+        raise ValueError(f"b_router shape {tuple(br.shape)} != ({num_routers},)")
+    if wl.ndim != 3 or wl.shape[0] != num_leaves or wl.shape[1] != d_in:
         raise ValueError(
-            f"w_leaf shape {tuple(w_leaf.shape)} incompatible with depth/D_in"
+            f"w_leaf shape {tuple(wl.shape)} incompatible with depth/D_in"
         )
-    d_out = w_leaf.shape[2]
-    if b_leaf.shape != (num_leaves, d_out):
-        raise ValueError(f"b_leaf shape {tuple(b_leaf.shape)} != ({num_leaves}, {d_out})")
+    d_out = wl.shape[2]
+    if bl.shape != (num_leaves, d_out):
+        raise ValueError(f"b_leaf shape {tuple(bl.shape)} != ({num_leaves}, {d_out})")
     if d_in > 4096:
         raise ValueError(f"D_in={d_in} exceeds supported max (4096)")
 
-    wr = w_router.to(dtype=x.dtype)
-    br = b_router.to(dtype=x.dtype)
-    wl = w_leaf.to(dtype=x.dtype)
-    bl = b_leaf.to(dtype=x.dtype)
-
     try:
-        buf = _get_buffers(n, d_in, d_out, x.device, x.dtype)
+        buf = _get_buffers(n, d_in, d_out, x.device, compute_dtype)
         if out is None:
             y = buf.y
         else:
-            if out.shape != (n, d_out) or out.device != x.device or out.dtype != x.dtype:
+            if out.shape != (n, d_out) or out.device != x.device or out.dtype != compute_dtype:
                 raise ValueError(
-                    f"out must be ({n}, {d_out}) {x.dtype} on {x.device}, "
+                    f"out must be ({n}, {d_out}) {compute_dtype} on {x.device}, "
                     f"got {tuple(out.shape)} {out.dtype} on {out.device}"
                 )
             y = out.contiguous()
@@ -610,7 +674,10 @@ def warmup_fff_model_triton(
 
     d_model = int(layers[0].in_features)
     n = max(int(sample_tokens), FUSED_MAX_N + 1)
-    x = torch.randn(n, d_model, device=device, dtype=torch.float32)
+    dtype = next(model.parameters()).dtype
+    if dtype not in SUPPORTED_DTYPES:
+        dtype = torch.float32
+    x = torch.randn(n, d_model, device=device, dtype=dtype)
     for layer in layers:
         warmup_fff_hard_triton(
             x,

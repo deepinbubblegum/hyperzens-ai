@@ -546,15 +546,15 @@ class FastFeedforwardLinear(nn.Module):
         if not is_triton_available():
             return self.forward_hard(x)
 
-        # Hybrid dispatch keys off microbatch B when x is (B, T, D), not N=B·T,
-        # so batch=1..4 full-context decode stays on the fused Triton kernel.
+        # Match activation dtype (fp16/bf16/fp32); no FP32 promotion.
+        dt = flat.dtype
         dispatch_n = int(x.shape[0]) if x.ndim >= 2 else int(flat.shape[0])
         y = fff_hard_forward_triton(
             flat.contiguous(),
-            self.router_weights.detach().contiguous(),
-            self.router_biases.detach().contiguous(),
-            self.leaf_weights.detach().contiguous(),
-            self.leaf_biases.detach().contiguous(),
+            self.router_weights.detach().to(dtype=dt).contiguous(),
+            self.router_biases.detach().to(dtype=dt).contiguous(),
+            self.leaf_weights.detach().to(dtype=dt).contiguous(),
+            self.leaf_biases.detach().to(dtype=dt).contiguous(),
             int(self.depth),
             dispatch_n=dispatch_n,
         )
