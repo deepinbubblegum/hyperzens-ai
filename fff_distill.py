@@ -10,14 +10,15 @@ Student
 Same GPT-2 stack (token embed, attention, LayerNorm, LM head) with each
 block's ``mlp`` replaced by :class:`FFFBlock` (``FastFeedforwardLinear`` soft
 routing + temperature ``τ``). Attention / LayerNorm / embeddings are copied
-from the teacher; FFF router & leaf weights are small-Gaussian init.
+from the teacher. FFF **leaves are smart-initialized** from each Teacher MLP
+(``c_fc`` / ``c_proj`` intermediate slices); routers use small orthogonal init.
 
 Loss
 ----
 ``L = KL(student ‖ teacher) · T² + 0.5 · MSE(ffn_out) − 0.01 · H(leaf)``
 
 Targets RTX 3060 12GB: short context, micro-batch, FP16 autocast, optional
-grad accumulation.
+grad accumulation. Default ``τ: 1.0 → 0.10`` over ``max_steps=2000`` on WikiText-2.
 
 Example
 -------
@@ -144,11 +145,127 @@ class FFFBlock(nn.Module):
 
 
 def _init_fff_gaussian(block: FFFBlock, std: float = 0.02) -> None:
-    """Small Gaussian init for router / leaf parameters (Teacher attn kept)."""
+    """Fallback small Gaussian init (used only if dense MLP init is unavailable)."""
     nn.init.normal_(block.fff.router_weights, mean=0.0, std=std)
     nn.init.zeros_(block.fff.router_biases)
     nn.init.normal_(block.fff.leaf_weights, mean=0.0, std=std)
     nn.init.zeros_(block.fff.leaf_biases)
+
+
+@torch.no_grad()
+def init_fff_from_dense_mlp(
+    fff_block: FFFBlock,
+    dense_mlp: nn.Module,
+    *,
+    noise_std: float = 0.001,
+    router_gain: float = 0.1,
+) -> None:
+    """Smart-init FFF leaves from a pretrained GPT-2 MLP (``c_fc`` / ``c_proj``).
+
+    GPT-2 MLP (HuggingFace ``Conv1D``)
+    ---------------------------------
+    * ``c_fc.weight``: ``(D, I)`` with ``I = 4D`` (e.g. 768×3072 on GPT-2 Small;
+      or 512×2048 on a D=512 teacher).
+    * ``c_proj.weight``: ``(I, D)``.
+
+    For ``L = 2^k`` leaves, split the intermediate axis into ``L`` equal slices
+    of width ``s = I / L``. Leaf ``i`` is the rank-``s`` factorization of that
+    slice, folded into a single ``(D, D)`` map matching
+    :class:`~models.fff_layer.FastFeedforwardLinear` leaf layout:
+
+        ``W_leaf[i] = c_fc[:, i·s:(i+1)·s] @ c_proj[i·s:(i+1)·s, :]``
+        ``b_leaf[i] = b_fc[i·s:(i+1)·s] @ c_proj[i·s:(i+1)·s, :] + b_proj``
+
+    A tiny Gaussian ``N(0, noise_std²)`` breaks exact leaf symmetry. Router
+    weights are small **orthogonal** matrices (QR / ``nn.init.orthogonal_``).
+
+    Parameters
+    ----------
+    fff_block:
+        Student :class:`FFFBlock` to overwrite in-place.
+    dense_mlp:
+        Teacher layer MLP with ``c_fc`` and ``c_proj`` (GPT-2 style).
+    noise_std:
+        Symmetry-breaking noise on leaf weights / biases (default ``1e-3``).
+    router_gain:
+        Gain for orthogonal router initialization.
+    """
+    if not hasattr(dense_mlp, "c_fc") or not hasattr(dense_mlp, "c_proj"):
+        raise TypeError(
+            "dense_mlp must expose GPT-2-style c_fc / c_proj (Conv1D) modules"
+        )
+
+    fff = fff_block.fff
+    n_leaves = int(fff.num_leaves)
+    d_model = int(fff.in_features)
+    if fff.out_features != d_model:
+        raise ValueError(
+            "init_fff_from_dense_mlp expects square FFF (D→D); "
+            f"got in={fff.in_features}, out={fff.out_features}"
+        )
+
+    w_fc = dense_mlp.c_fc.weight.detach()
+    w_proj = dense_mlp.c_proj.weight.detach()
+    # HF Conv1D: c_fc (D, I), c_proj (I, D)
+    if w_fc.ndim != 2 or w_proj.ndim != 2:
+        raise ValueError("c_fc / c_proj weights must be 2-D")
+    if w_fc.shape[0] != d_model or w_proj.shape[1] != d_model:
+        raise ValueError(
+            f"MLP width mismatch: FFF D={d_model}, "
+            f"c_fc={tuple(w_fc.shape)}, c_proj={tuple(w_proj.shape)}"
+        )
+    if w_fc.shape[1] != w_proj.shape[0]:
+        raise ValueError(
+            f"intermediate dim mismatch: c_fc[..., {w_fc.shape[1]}] vs "
+            f"c_proj[{w_proj.shape[0]}, ...]"
+        )
+
+    intermediate = int(w_fc.shape[1])
+    if intermediate % n_leaves != 0:
+        raise ValueError(
+            f"intermediate={intermediate} not divisible by n_leaves={n_leaves} "
+            f"(fff_depth={fff.depth}); choose depth so 2^depth | I"
+        )
+    slice_size = intermediate // n_leaves
+
+    b_fc = (
+        dense_mlp.c_fc.bias.detach()
+        if dense_mlp.c_fc.bias is not None
+        else torch.zeros(intermediate, device=w_fc.device, dtype=w_fc.dtype)
+    )
+    b_proj = (
+        dense_mlp.c_proj.bias.detach()
+        if dense_mlp.c_proj.bias is not None
+        else torch.zeros(d_model, device=w_proj.device, dtype=w_proj.dtype)
+    )
+
+    device = fff.leaf_weights.device
+    dtype = fff.leaf_weights.dtype
+    w_fc = w_fc.to(device=device, dtype=torch.float32)
+    w_proj = w_proj.to(device=device, dtype=torch.float32)
+    b_fc = b_fc.to(device=device, dtype=torch.float32)
+    b_proj = b_proj.to(device=device, dtype=torch.float32)
+
+    leaf_w = torch.empty(n_leaves, d_model, d_model, device=device, dtype=torch.float32)
+    leaf_b = torch.empty(n_leaves, d_model, device=device, dtype=torch.float32)
+    for i in range(n_leaves):
+        start = i * slice_size
+        end = start + slice_size
+        w_in = w_fc[:, start:end]  # (D, s)
+        w_out = w_proj[start:end, :]  # (s, D)
+        leaf_w[i] = w_in @ w_out
+        leaf_b[i] = b_fc[start:end] @ w_out + b_proj
+
+    if noise_std > 0.0:
+        leaf_w = leaf_w + noise_std * torch.randn_like(leaf_w)
+        leaf_b = leaf_b + noise_std * torch.randn_like(leaf_b)
+
+    fff.leaf_weights.copy_(leaf_w.to(dtype=dtype))
+    fff.leaf_biases.copy_(leaf_b.to(dtype=dtype))
+
+    # Routers: small orthogonal rows / matrix (symmetry-breaking random splits).
+    nn.init.orthogonal_(fff.router_weights, gain=float(router_gain))
+    nn.init.zeros_(fff.router_biases)
 
 
 # ---------------------------------------------------------------------------
@@ -173,11 +290,16 @@ def build_fff_student_from_teacher(
     fff_depth: int = 4,
     init_temp: float = 1.0,
     fff_init_std: float = 0.02,
+    leaf_noise_std: float = 0.001,
+    router_gain: float = 0.1,
 ) -> Any:
     """Clone GPT-2 structure; replace each ``mlp`` with :class:`FFFBlock`.
 
     Copies embeddings, attention, LayerNorm, and LM head from ``teacher``.
-    FFF router/leaf weights are re-initialized with ``N(0, fff_init_std²)``.
+    Each FFF block is **smart-initialized** from that layer's dense MLP via
+    :func:`init_fff_from_dense_mlp` (intermediate axis sliced across leaves).
+    ``fff_init_std`` is retained for API compatibility (router gain fallback
+    only if dense init fails).
     """
     _, GPT2LMHeadModelCls, _ = _require_transformers()
     config = teacher.config
@@ -187,15 +309,35 @@ def build_fff_student_from_teacher(
 
     d_model = int(config.n_embd)
     dropout = float(config.resid_pdrop)
-    for block in student.transformer.h:
+    n_leaves = 1 << int(fff_depth)
+    print(
+        f"Smart FFF init from Teacher MLP: depth={fff_depth} "
+        f"leaves={n_leaves} leaf_noise={leaf_noise_std} router_gain={router_gain}"
+    )
+
+    for layer_idx, (s_block, t_block) in enumerate(
+        zip(student.transformer.h, teacher.transformer.h)
+    ):
         fff_block = FFFBlock(
             d_model=d_model,
             fff_depth=fff_depth,
             init_temp=init_temp,
             dropout=dropout,
         )
-        _init_fff_gaussian(fff_block, std=fff_init_std)
-        block.mlp = fff_block
+        try:
+            init_fff_from_dense_mlp(
+                fff_block,
+                t_block.mlp,
+                noise_std=leaf_noise_std,
+                router_gain=router_gain,
+            )
+        except (TypeError, ValueError) as exc:
+            print(
+                f"  layer {layer_idx}: dense MLP init failed ({exc}); "
+                f"falling back to Gaussian std={fff_init_std}"
+            )
+            _init_fff_gaussian(fff_block, std=fff_init_std)
+        s_block.mlp = fff_block
 
     student.train()
     return student
