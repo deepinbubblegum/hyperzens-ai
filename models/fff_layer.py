@@ -524,11 +524,12 @@ class FastFeedforwardLinear(nn.Module):
         return y.to(dtype=flat.dtype).view(*leading, self.out_features)
 
     def forward_hard_triton(self, x: Tensor) -> Tensor:
-        """Hard routing via fused Triton CUDA kernel (tree walk + leaf GEMV).
+        """Hard routing via hybrid Triton CUDA kernels (fused or leaf-sorted).
 
         Falls back to :meth:`forward_hard` when Triton is missing or ``x`` is
-        not on CUDA. Preallocates the output buffer inside the Triton wrapper
-        to reduce allocator fragmentation under repeated inference.
+        not on CUDA. Hybrid dispatch uses the leading batch size when ``x`` is
+        ``(B, T, D)`` so small batches stay on the fused kernel even if
+        ``N = B·T > 4``.
         """
         flat, leading = self._flatten_input(x)
         if flat.device.type != "cuda":
@@ -545,6 +546,9 @@ class FastFeedforwardLinear(nn.Module):
         if not is_triton_available():
             return self.forward_hard(x)
 
+        # Hybrid dispatch keys off microbatch B when x is (B, T, D), not N=B·T,
+        # so batch=1..4 full-context decode stays on the fused Triton kernel.
+        dispatch_n = int(x.shape[0]) if x.ndim >= 2 else int(flat.shape[0])
         y = fff_hard_forward_triton(
             flat.contiguous(),
             self.router_weights.detach().contiguous(),
@@ -552,6 +556,7 @@ class FastFeedforwardLinear(nn.Module):
             self.leaf_weights.detach().contiguous(),
             self.leaf_biases.detach().contiguous(),
             int(self.depth),
+            dispatch_n=dispatch_n,
         )
         return y.view(*leading, self.out_features)
 
