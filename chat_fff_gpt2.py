@@ -6,7 +6,7 @@ in Triton hard-routing mode, warms CUDA kernels, then opens a prompt loop.
 
 Example
 -------
-    python standalone_infer.py --checkpoint fff_distill_checkpoint.pt --device cuda
+    python chat_fff_gpt2.py --checkpoint fff_distill_checkpoint.pt --device cuda
 """
 
 from __future__ import annotations
@@ -27,14 +27,14 @@ from device_utils import (
     print_device_info,
     resolve_device,
 )
-from eval_distilled import (
+from eval_fff_gpt2 import (
     _apply_no_repeat_ngram,
     _apply_repetition_penalty,
     _topk_topp_filter,
     load_student_from_checkpoint,
     warmup_student_triton,
 )
-from fff_distill import (
+from train_fff_gpt2 import (
     iter_fff_blocks,
     set_student_routing_mode,
     set_student_temperature,
