@@ -535,8 +535,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--batch-sizes",
         type=str,
-        default="1,2,4,8,16,32,64,128",
-        help="Comma-separated batch sizes for CUDA batch sweep",
+        default="1,2,4,8,16,32,64,128,256",
+        help=(
+            "Comma-separated batch sizes for CUDA batch sweep "
+            "(FP16 also probes 512 when VRAM allows)"
+        ),
     )
     p.add_argument(
         "--batch-sweep-tokens",
@@ -971,10 +974,10 @@ def print_batch_scaling_table(
         "Speedup",
         "Dense ms/tok",
         "FFF ms/tok",
-        "VRAM Dense",
-        "VRAM FFF",
+        "Peak VRAM Dense",
+        "Peak VRAM FFF",
     ]
-    widths = [8, 13, 12, 10, 14, 12, 12, 12]
+    widths = [8, 13, 12, 10, 14, 12, 16, 14]
 
     def fmt_row(cells: list[str]) -> str:
         parts = []
@@ -983,14 +986,19 @@ def print_batch_scaling_table(
         return "|" + "|".join(parts) + "|"
 
     sep = "+" + "+".join("-" * w for w in widths) + "+"
-    print("\n" + "=" * 88)
-    print(f"CUDA Batch Scaling — Dense MLP vs FFF Triton Hard ({label})")
-    print("=" * 88)
+    print("\n" + "=" * 100)
+    print(f"CUDA Batch Scaling Summary — Dense MLP vs FFF Triton Hard ({label})")
+    print(
+        "Columns: Throughput (tok/s) | Latency (ms/tok) | "
+        "Speedup (FFF/Dense) | Peak VRAM (MB)"
+    )
+    print("=" * 100)
     print(sep)
     print(fmt_row(headers))
     print(sep)
 
     crossover: int | None = None
+    max_ok: int | None = None
     for row in rows:
         if row.note:
             cells = [
@@ -1011,10 +1019,11 @@ def print_batch_scaling_table(
                 f"{row.speedup:.2f}x",
                 f"{row.dense_ms_per_tok:.3f}",
                 f"{row.fff_ms_per_tok:.3f}",
-                f"{row.dense_peak_ram_mb:.1f} MB",
-                f"{row.fff_peak_ram_mb:.1f} MB",
+                f"{row.dense_peak_ram_mb:.1f}",
+                f"{row.fff_peak_ram_mb:.1f}",
             ]
-            if crossover is None and row.speedup > 1.0:
+            max_ok = row.batch_size
+            if crossover is None and row.speedup >= 1.0:
                 crossover = row.batch_size
         print(fmt_row(cells))
     print(sep)
@@ -1022,7 +1031,7 @@ def print_batch_scaling_table(
     if crossover is not None:
         print(
             f"Crossover ({label}): FFF Triton surpasses Dense at "
-            f"batch_size ≥ {crossover}"
+            f"batch_size >= {crossover}"
         )
     else:
         ok = [r for r in rows if not r.note]
@@ -1034,7 +1043,17 @@ def print_batch_scaling_table(
             )
         else:
             print(f"No successful {label} batch-size measurements (all OOM/SKIP).")
-    print("=" * 88)
+
+    if max_ok is not None:
+        print(f"Max achieved batch_size ({label}): {max_ok}")
+    oom_rows = [r for r in rows if r.note == "OOM"]
+    if oom_rows:
+        first_oom = min(r.batch_size for r in oom_rows)
+        print(
+            f"VRAM limit hit ({label}): OOM at batch_size={first_oom} "
+            f"(larger sizes not attempted)."
+        )
+    print("=" * 100)
 
 
 def run_cuda_batch_scaling_benchmark(
@@ -1067,7 +1086,10 @@ def run_cuda_batch_scaling_benchmark(
         print("Batch-size scaling skipped — BF16 not supported on this GPU.")
         return []
 
-    batch_sizes = batch_sizes or [1, 2, 4, 8, 16, 32, 64, 128]
+    batch_sizes = batch_sizes or [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    # FP16/BF16: also probe 512 when VRAM allows (OOM stop below).
+    if dtype in (torch.float16, torch.bfloat16) and 512 not in batch_sizes:
+        batch_sizes = list(batch_sizes) + [512]
     label = _dtype_label(dtype)
     apply_hardware_optimizations(device)
 
@@ -1123,16 +1145,17 @@ def run_cuda_batch_scaling_benchmark(
     print(f"Warmup done — starting {label} batch-size sweep")
 
     rows: list[BatchSweepRow] = []
+    max_achieved: int | None = None
     for bsz in batch_sizes:
         print(f"\n  [{label}] batch_size={bsz} ...")
-        prompt = torch.randint(
-            0,
-            config.vocab_size,
-            (bsz, prompt_len),
-            device=device,
-            dtype=torch.long,
-        )
         try:
+            prompt = torch.randint(
+                0,
+                config.vocab_size,
+                (bsz, prompt_len),
+                device=device,
+                dtype=torch.long,
+            )
             dense_tok_s, dense_ms, dense_ram = _time_batched_generate(
                 dense_step,
                 prompt,
@@ -1158,14 +1181,19 @@ def run_cuda_batch_scaling_benchmark(
                 dense_ms_per_tok=dense_ms,
                 fff_ms_per_tok=fff_ms,
             )
+            max_achieved = bsz
             print(
-                f"    Dense={dense_tok_s:.2f} tok/s ({dense_ms:.3f} ms) | "
-                f"FFF Triton={fff_tok_s:.2f} tok/s ({fff_ms:.3f} ms) | "
+                f"    Dense={dense_tok_s:.2f} tok/s ({dense_ms:.3f} ms/tok) | "
+                f"FFF Triton={fff_tok_s:.2f} tok/s ({fff_ms:.3f} ms/tok) | "
                 f"speedup={speedup:.2f}x | "
-                f"VRAM D/F={dense_ram:.1f}/{fff_ram:.1f} MB"
+                f"Peak VRAM D/F={dense_ram:.1f}/{fff_ram:.1f} MB"
             )
+            rows.append(row)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             row = BatchSweepRow(
                 batch_size=bsz,
                 dense_tok_s=float("nan"),
@@ -1175,8 +1203,18 @@ def run_cuda_batch_scaling_benchmark(
                 fff_peak_ram_mb=float("nan"),
                 note="OOM",
             )
-            print("    OOM — skipping this batch size")
-        rows.append(row)
+            rows.append(row)
+            if max_achieved is not None:
+                print(
+                    f"    OOM at batch_size={bsz} — stopping sweep "
+                    f"(max achieved batch_size={max_achieved})."
+                )
+            else:
+                print(
+                    f"    OOM at batch_size={bsz} — stopping sweep "
+                    "(no successful batch sizes)."
+                )
+            break
         gc.collect()
         torch.cuda.empty_cache()
 
