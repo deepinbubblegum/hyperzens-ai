@@ -118,7 +118,11 @@ def _sign_extend_nibble(nibble: Tensor) -> Tensor:
 
 
 def dequantize_fff_leaf_int8(w_int8: Tensor, scale: Tensor) -> Tensor:
-    """Dequantize INT8 leaves → FP16 ``(L, D_in, D_out)``."""
+    """Reference dequant INT8 → FP16 (CPU / tests only — not used on CUDA hot path).
+
+    CUDA inference must keep ``w_int8`` packed and dequantize inside Triton so
+    a full FP16 leaf tensor is never allocated in HBM.
+    """
     s = scale.to(dtype=torch.float16).view(-1, 1, 1)
     return (w_int8.to(dtype=torch.float16) * s).contiguous()
 
@@ -129,12 +133,11 @@ def dequantize_fff_leaf_int4(
     d_in: int,
     d_out: int,
 ) -> Tensor:
-    """Unpack INT4 leaves → FP16 ``(L, D_in, D_out)``."""
+    """Reference unpack INT4 → FP16 (CPU / tests only — not used on CUDA hot path)."""
     l = w_packed.shape[0]
     flat_n = d_in * d_out
     even = _sign_extend_nibble(w_packed.to(torch.int16) & 0x0F)
     odd = _sign_extend_nibble((w_packed.to(torch.int16) >> 4) & 0x0F)
-    # Interleave even/odd → flat length 2 * packed_width (may include pad).
     flat = torch.empty(l, even.shape[1] * 2, device=w_packed.device, dtype=torch.int8)
     flat[:, 0::2] = even
     flat[:, 1::2] = odd
@@ -144,7 +147,10 @@ def dequantize_fff_leaf_int4(
 
 
 def quantize_leaf_weights(w_leaf: Tensor, mode: QuantMode) -> QuantizedLeafWeights:
-    """Quantize ``(L, D_in, D_out)`` leaf weights to INT8 or packed INT4."""
+    """Quantize ``(L, D_in, D_out)`` leaf weights to INT8 or packed INT4.
+
+    Output tensors stay on ``w_leaf.device`` (no host round-trip).
+    """
     d_in = int(w_leaf.shape[1])
     d_out = int(w_leaf.shape[2])
     flat_numel = d_in * d_out
@@ -165,7 +171,7 @@ def quantize_leaf_weights(w_leaf: Tensor, mode: QuantMode) -> QuantizedLeafWeigh
 
 
 def dequantize_leaf_weights(qstate: QuantizedLeafWeights) -> Tensor:
-    """Full FP16 reconstruction of leaf weights (reference / coalesced GEMM)."""
+    """Full FP16 reconstruction (reference / CPU fallback only)."""
     if qstate.mode == "int8":
         return dequantize_fff_leaf_int8(qstate.weight_q, qstate.scale)
     return dequantize_fff_leaf_int4(
@@ -211,19 +217,34 @@ def attach_leaf_qstates(
     model: torch.nn.Module,
     states: list[QuantizedLeafWeights],
 ) -> None:
-    """Attach ``leaf_qstate`` on each FFF layer (parallel to ``fff_layers()``)."""
+    """Attach ``leaf_qstate`` on each FFF layer without redundant device copies.
+
+    If ``weight_q`` / ``scale`` are already on the layer device, they are reused
+    in-place (no FP16 expand, no extra ``.to()`` allocation).
+    """
     layers = list(model.fff_layers())  # type: ignore[attr-defined]
     if len(layers) != len(states):
         raise ValueError(
             f"layer/state count mismatch: {len(layers)} vs {len(states)}"
         )
     for layer, st in zip(layers, states):
-        # Move packed tensors to the layer device.
         device = layer.leaf_weights.device
+        w_q = st.weight_q
+        scale = st.scale
+        if w_q.device != device:
+            w_q = w_q.to(device=device, non_blocking=True)
+        if scale.device != device:
+            scale = scale.to(device=device, non_blocking=True)
+        if scale.dtype != torch.float16:
+            scale = scale.to(dtype=torch.float16)
+        if not w_q.is_contiguous():
+            w_q = w_q.contiguous()
+        if not scale.is_contiguous():
+            scale = scale.contiguous()
         layer.leaf_qstate = QuantizedLeafWeights(
             mode=st.mode,
-            weight_q=st.weight_q.to(device=device),
-            scale=st.scale.to(device=device),
+            weight_q=w_q,
+            scale=scale,
             d_in=st.d_in,
             d_out=st.d_out,
             flat_numel=st.flat_numel,
@@ -237,3 +258,5 @@ def clear_leaf_qstates(model: torch.nn.Module) -> None:
     for layer in model.fff_layers():
         if hasattr(layer, "leaf_qstate"):
             delattr(layer, "leaf_qstate")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()

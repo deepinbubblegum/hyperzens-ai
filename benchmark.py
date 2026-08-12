@@ -1287,7 +1287,7 @@ def run_cuda_quant_sweep_benchmark(
         print("Quant sweep skipped — Triton unavailable.")
         return []
 
-    batch_sizes = batch_sizes or [1, 16, 64, 256, 512]
+    batch_sizes = batch_sizes or [1, 16, 64, 256]
     apply_hardware_optimizations(device)
     torch.manual_seed(seed)
 
@@ -1590,7 +1590,7 @@ def main() -> None:
             primary,
             config,
             ckpt_path,
-            batch_sizes=[1, 16, 64, 256, 512],
+            batch_sizes=[1, 16, 64, 256],
             prompt_len=args.batch_sweep_prompt_len,
             n_tokens=min(50, args.batch_sweep_tokens),
             warmup=max(3, args.warmup // 2),

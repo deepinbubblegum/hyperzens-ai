@@ -404,6 +404,89 @@ class FastFeedforwardLinear(nn.Module):
         y = torch.bmm(leaf_probs.unsqueeze(1), leaf_out).squeeze(1)
         return y.view(*leading, self.out_features)
 
+    def forward_soft_ste(self, x: Tensor) -> Tensor:
+        """Straight-Through Estimator (STE) hard-aware soft training.
+
+        Forward uses a hard one-hot leaf mask (same single-leaf semantics as
+        hard / Triton inference). Backward treats the mask as soft mixture
+        probabilities so router gradients still flow:
+
+            ``logits`` = log-path scores (routers already divided by ``τ``)
+            ``p = softmax(logits)``
+            ``m_hard = one_hot(argmax(logits))``
+            ``m = (m_hard - p).detach() + p``
+            ``y = Σ_ℓ m_ℓ · ((m_ℓ · x) W_ℓ + m_ℓ b_ℓ)``
+
+        Caches ``_last_leaf_probs = p`` (soft) for entropy / load-balance.
+
+        Shapes
+        ------
+        x: ``(..., D_in)``
+        returns: ``(..., D_out)``
+        """
+        flat, leading = self._flatten_input(x)
+        log_leaf, node_decisions = self._soft_leaf_logits(flat)
+        # Routers already use ``/ τ``; leaf softmax matches :meth:`forward_soft`.
+        prob_soft = F.softmax(log_leaf, dim=-1)
+        reach_probs = prob_soft @ self.leaf_router_inc
+
+        self._last_leaf_probs = prob_soft
+        self._last_node_decisions = node_decisions
+        self._last_reach_probs = reach_probs
+
+        mask_hard = F.one_hot(
+            torch.argmax(log_leaf, dim=-1),
+            num_classes=self.num_leaves,
+        ).to(dtype=prob_soft.dtype)
+        # STE: forward == hard one-hot; backward == ∂softmax.
+        mask = (mask_hard - prob_soft).detach() + prob_soft
+
+        # Mask tokens per leaf so only the winning leaf is active in forward.
+        # masked_in: (N, L, D_in); leaf_out: (N, L, D_out)
+        masked_in = flat.unsqueeze(1) * mask.unsqueeze(-1)
+        leaf_out = torch.einsum("nli,lio->nlo", masked_in, self.leaf_weights)
+        leaf_out = leaf_out + self.leaf_biases.unsqueeze(0) * mask.unsqueeze(-1)
+        y = leaf_out.sum(dim=1)
+        return y.view(*leading, self.out_features)
+
+    def _soft_leaf_logits(self, flat: Tensor) -> tuple[Tensor, Tensor]:
+        """Log-path scores and router decisions for soft / STE routing.
+
+        Parameters
+        ----------
+        flat:
+            ``(N, D_in)``
+
+        Returns
+        -------
+        log_leaf:
+            ``(N, L)`` — unnormalized log-path scores (routers already ``/ τ``).
+        node_decisions:
+            ``(N, R)`` — clamped right-child sigmoid at every router.
+        """
+        eps = 1e-7
+
+        # All router logits at once: (N, R) — batch matmul via F.linear
+        router_logits = (
+            F.linear(flat, self.router_weights, self.router_biases)
+            / self.temperature
+        )
+        node_decisions = torch.sigmoid(router_logits).clamp(min=eps, max=1.0 - eps)
+
+        # Log-space edge weights for every router (N, R)
+        log_c = F.logsigmoid(router_logits)
+        log_not_c = F.logsigmoid(-router_logits)
+
+        # Gather path routers for all leaves in one shot: (N, L, depth)
+        idx = self.path_router_idx
+        log_c_path = log_c[:, idx]
+        log_not_c_path = log_not_c[:, idx]
+
+        go_right = self.path_go_right.unsqueeze(0)  # (1, L, depth)
+        log_edges = torch.where(go_right, log_c_path, log_not_c_path)
+        log_leaf = log_edges.sum(dim=-1)
+        return log_leaf, node_decisions
+
     def _soft_leaf_probs(
         self, flat: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -423,37 +506,9 @@ class FastFeedforwardLinear(nn.Module):
         reach_probs:
             ``(N, R)`` — soft visit mass per router (= ``leaf_probs @ incidence``).
         """
-        eps = 1e-7
-
-        # All router logits at once: (N, R) — batch matmul via F.linear
-        router_logits = (
-            F.linear(flat, self.router_weights, self.router_biases)
-            / self.temperature
-        )
-        node_decisions = torch.sigmoid(router_logits).clamp(min=eps, max=1.0 - eps)
-
-        # Log-space edge weights for every router (N, R)
-        log_c = F.logsigmoid(router_logits)
-        log_not_c = F.logsigmoid(-router_logits)
-
-        # Gather path routers for all leaves in one shot: (N, L, depth)
-        # path_router_idx: (L, depth)
-        idx = self.path_router_idx
-        log_c_path = log_c[:, idx]
-        log_not_c_path = log_not_c[:, idx]
-
-        # Select left/right log-prob along each leaf's path — still (N, L, depth)
-        go_right = self.path_go_right.unsqueeze(0)  # (1, L, depth)
-        log_edges = torch.where(go_right, log_c_path, log_not_c_path)
-
-        # Parallel path product in log-space → (N, L)
-        log_leaf = log_edges.sum(dim=-1)
+        log_leaf, node_decisions = self._soft_leaf_logits(flat)
         leaf_probs = torch.softmax(log_leaf, dim=-1)
-
-        # Reach mass: which routers soft-mass visits (N, R)
-        # leaf_router_inc: (L, R)
         reach_probs = leaf_probs @ self.leaf_router_inc
-
         return leaf_probs, node_decisions, reach_probs
 
     # ------------------------------------------------------------------
