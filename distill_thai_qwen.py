@@ -23,12 +23,15 @@ formatted with Qwen's official chat template::
 
 Loss / schedule
 ---------------
-``L = KL(student ‖ teacher)·T² − λ_H · H(leaf)``
-(+ optional small CE on labels). Feature MSE is **off by default** because
-Teacher 7B and Student 0.5B have different widths / depths.
+``L = TopK-KL(student ‖ teacher)·T² − λ_H · H(leaf)``
+(+ optional small CE on labels). KL is computed over the teacher's
+**Top-200** vocab candidates only (avoids OOM on Qwen's 151k vocab).
+Feature MSE is **off by default** (7B vs 0.5B size mismatch).
 
     AdamW  lr_leaf=2e-4  lr_router=5e-5
     CosineAnnealingLR  max_steps=3000
+    max_length=64  batch_size=1  grad_accum_steps=16
+    + student gradient checkpointing
 
 Checkpoint
 ----------
@@ -54,7 +57,6 @@ from typing import Any
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
@@ -389,6 +391,13 @@ def build_fff_student(
     student = student.to(device)
     student.train()
     set_fff_routing_mode(student, "soft")
+
+    # Recompute activations on backward to cut VRAM (critical with large vocab).
+    if hasattr(student, "gradient_checkpointing_enable"):
+        student.gradient_checkpointing_enable()
+        if hasattr(student, "config"):
+            student.config.use_cache = False
+        print("  gradient_checkpointing=ON (use_cache=False)")
     return student
 
 
@@ -404,35 +413,91 @@ def gather_student_leaf_probs(student: Any) -> Tensor:
     return torch.cat(chunks, dim=0)
 
 
+@torch.no_grad()
+def extract_teacher_topk(
+    teacher_logits: Tensor,
+    *,
+    k: int = 200,
+    vocab_limit: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Select teacher Top-K logits / indices; drop the full ``V`` tensor ASAP.
+
+    Parameters
+    ----------
+    teacher_logits:
+        ``(B, T, V_t)``
+    k:
+        Number of teacher candidates (default 200).
+    vocab_limit:
+        Clip vocab to ``min(V_s, V_t)`` so indices are valid for the student.
+
+    Returns
+    -------
+    topk_val, topk_idx:
+        Both ``(B, T, K)`` in float32 / int64.
+    """
+    v = int(teacher_logits.size(-1) if vocab_limit is None else vocab_limit)
+    v = min(v, int(teacher_logits.size(-1)))
+    k_eff = min(int(k), v)
+    topk_val, topk_idx = torch.topk(
+        teacher_logits[..., :v].float(), k=k_eff, dim=-1
+    )
+    return topk_val, topk_idx
+
+
 def thai_distill_loss(
     student_logits: Tensor,
-    teacher_logits: Tensor,
+    teacher_logits: Tensor | None,
     routing_probs: Tensor,
     *,
     kl_temperature: float = 2.0,
     entropy_coef: float = 0.01,
     ce_coef: float = 0.1,
+    kl_topk: int = 200,
     labels: Tensor | None = None,
     pad_id: int = 0,
+    teacher_topk_val: Tensor | None = None,
+    teacher_topk_idx: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """``KL·T² − λ_H · H(leaf) + λ_ce · CE`` (cross-size safe).
+    """``TopK-KL·T² − λ_H · H(leaf) + λ_ce · CE`` (VRAM-safe for large vocab).
 
-    Logits are aligned on the shared vocab axis (min vocab width). Pad
-    positions are excluded from CE when ``labels`` is provided.
+    Instead of softmax / KL over the full Qwen vocabulary (~151,646), select
+    the teacher's Top-``K`` logits and compute KL only on those candidates::
+
+        topk_val, topk_idx = topk(teacher, K)
+        student_topk = gather(student, topk_idx)
+        KL(softmax(topk_val/τ) ‖ log_softmax(student_topk/τ)) · τ²
+
+    Pass precomputed ``teacher_topk_val`` / ``teacher_topk_idx`` (recommended)
+    so the full teacher logit tensor can be freed before the student forward.
     """
     t = max(float(kl_temperature), 1e-6)
-    # Align vocab if student/teacher differ slightly.
-    v = min(student_logits.size(-1), teacher_logits.size(-1))
-    s_logits = student_logits[..., :v]
-    t_logits = teacher_logits[..., :v]
+    v_s = int(student_logits.size(-1))
 
-    # Flatten (B*T, V) for stable batchmean KL.
-    s_flat = s_logits.float().reshape(-1, v)
-    t_flat = t_logits.float().reshape(-1, v).detach()
+    if teacher_topk_val is None or teacher_topk_idx is None:
+        if teacher_logits is None:
+            raise ValueError(
+                "thai_distill_loss requires teacher_logits or teacher_topk_*"
+            )
+        v = min(v_s, int(teacher_logits.size(-1)))
+        topk_val, topk_idx = extract_teacher_topk(
+            teacher_logits, k=kl_topk, vocab_limit=v
+        )
+    else:
+        topk_val = teacher_topk_val
+        topk_idx = teacher_topk_idx
 
-    loss_kl = nn.KLDivLoss(reduction="batchmean")(
-        F.log_softmax(s_flat / t, dim=-1),
-        F.softmax(t_flat / t, dim=-1),
+    # Gather student logits at teacher Top-K indices → (B, T, K)
+    student_topk_logits = torch.gather(
+        student_logits.float(), dim=-1, index=topk_idx
+    )
+    p_teacher = F.softmax(topk_val / t, dim=-1)
+    log_q_student = F.log_softmax(student_topk_logits / t, dim=-1)
+    # Flatten to (N, K) for batchmean KL (matches nn.KLDivLoss batchmean).
+    loss_kl = F.kl_div(
+        log_q_student.reshape(-1, log_q_student.size(-1)),
+        p_teacher.reshape(-1, p_teacher.size(-1)),
+        reduction="batchmean",
     ) * (t**2)
 
     loss_entropy = compute_leaf_entropy_loss(routing_probs.float())
@@ -474,9 +539,10 @@ class DistillConfig:
     kl_temperature: float = 2.0
     entropy_coef: float = 0.01
     ce_coef: float = 0.1
-    max_length: int = 512
+    kl_topk: int = 200
+    max_length: int = 64
     batch_size: int = 1
-    grad_accum_steps: int = 8
+    grad_accum_steps: int = 16
     lr_leaf: float = 2e-4
     lr_router: float = 5e-5
     min_lr: float = 2e-5
@@ -507,7 +573,24 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--kl-temperature", type=float, default=d.kl_temperature)
     p.add_argument("--entropy-coef", type=float, default=d.entropy_coef)
     p.add_argument("--ce-coef", type=float, default=d.ce_coef)
-    p.add_argument("--max-length", type=int, default=d.max_length)
+    p.add_argument(
+        "--kl-topk",
+        type=int,
+        default=d.kl_topk,
+        help="Teacher Top-K vocab size for KL (default 200; avoids full-V OOM)",
+    )
+    p.add_argument(
+        "--max-length",
+        type=int,
+        default=d.max_length,
+        help="Sequence block size (default 64 for 12GB VRAM)",
+    )
+    p.add_argument(
+        "--block-size",
+        type=int,
+        default=None,
+        help="Alias for --max-length",
+    )
     p.add_argument("--batch-size", type=int, default=d.batch_size)
     p.add_argument("--grad-accum-steps", type=int, default=d.grad_accum_steps)
     p.add_argument("--lr-leaf", type=float, default=d.lr_leaf)
@@ -537,6 +620,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_argparser().parse_args()
+    max_length = int(args.block_size) if args.block_size is not None else int(args.max_length)
     cfg = DistillConfig(
         student_name=args.student_name,
         teacher_name=args.teacher_name,
@@ -547,7 +631,8 @@ def main() -> None:
         kl_temperature=args.kl_temperature,
         entropy_coef=args.entropy_coef,
         ce_coef=args.ce_coef,
-        max_length=args.max_length,
+        kl_topk=args.kl_topk,
+        max_length=max_length,
         batch_size=args.batch_size,
         grad_accum_steps=args.grad_accum_steps,
         lr_leaf=args.lr_leaf,
@@ -682,29 +767,53 @@ def main() -> None:
         input_ids = input_ids.clamp(0, min(vocab_s, vocab_t) - 1)
 
         with bf16_autocast(device):
+            # Teacher → Top-K only; free full (B,T,151k) logits before student.
             with torch.no_grad():
-                teacher_logits = teacher(input_ids=input_ids).logits
+                teacher_out = teacher(input_ids=input_ids)
+                teacher_logits = teacher_out.logits
+                del teacher_out
+                vocab_limit = min(vocab_s, int(teacher_logits.size(-1)))
+                topk_val, topk_idx = extract_teacher_topk(
+                    teacher_logits,
+                    k=cfg.kl_topk,
+                    vocab_limit=vocab_limit,
+                )
+                del teacher_logits
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
             student_logits = student(input_ids=input_ids).logits
             routing = gather_student_leaf_probs(student)
             loss, parts = thai_distill_loss(
                 student_logits,
-                teacher_logits,
+                None,
                 routing,
                 kl_temperature=cfg.kl_temperature,
                 entropy_coef=cfg.entropy_coef,
                 ce_coef=cfg.ce_coef,
+                kl_topk=cfg.kl_topk,
                 labels=input_ids,
                 pad_id=pad_id,
+                teacher_topk_val=topk_val,
+                teacher_topk_idx=topk_idx,
             )
             loss = loss / float(cfg.grad_accum_steps)
 
         loss.backward()
+        # Drop graph-held tensors before the next micro-batch.
+        parts = {k: v.detach() for k, v in parts.items()}
+        del student_logits, loss, topk_val, topk_idx, routing
 
         if (step + 1) % cfg.grad_accum_steps == 0:
             torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        elif device.type == "cuda" and (step + 1) % 4 == 0:
+            # Periodic hygiene during accumulation.
+            torch.cuda.empty_cache()
 
         for k in running:
             running[k] += float(parts[k].detach().item())
