@@ -1,4 +1,4 @@
-"""BPE (GPT-2) data loading utilities for the FFF SLM.
+"""BPE (GPT-2) data loading utilities and offline distill caches.
 
 Provides:
 * ``tiktoken`` GPT-2 BPE encode/decode helpers
@@ -6,6 +6,8 @@ Provides:
   and cache as a memory-mapped ``uint16`` ``.bin`` file under ``data/``
 * ``BPEDataset`` — **non-overlapping** windows of ``block_size`` tokens
   (``stride = block_size`` by default; never ``stride = 1``)
+* ``OfflineDistillDataset`` — precomputed teacher Top-K logits from
+  ``data/logits_cache/{domain}_logits.pt`` (no teacher at train time)
 
 Example
 -------
@@ -19,7 +21,7 @@ from __future__ import annotations
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -33,6 +35,17 @@ from tqdm import tqdm
 
 DATA_ROOT = Path(__file__).resolve().parent
 CACHE_DIR = DATA_ROOT / "cache"
+LOGITS_CACHE_DIR = DATA_ROOT / "logits_cache"
+
+# Compressed ``torch.save`` shards written by ``extract_teacher_logits.py``.
+OFFLINE_DISTILL_DOMAINS: tuple[str, ...] = (
+    "cot",
+    "agent",
+    "code",
+    "thai",
+    "english",
+)
+LOGITS_CACHE_FORMAT_VERSION: int = 1
 
 WikiVariant = Literal["wikitext-2", "wikitext-103"]
 SplitName = Literal["train", "validation", "test"]
@@ -518,6 +531,294 @@ def build_wikitext_datasets(
     val_ds = BPEDataset(meta["validation"], block_size=block_size, stride=stride)
     test_ds = BPEDataset(meta["test"], block_size=block_size, stride=stride)
     return train_ds, val_ds, test_ds, meta
+
+
+# ---------------------------------------------------------------------------
+# Offline distillation: precomputed teacher Top-K logits
+# ---------------------------------------------------------------------------
+
+
+def logits_cache_path(domain: str, cache_dir: str | Path | None = None) -> Path:
+    """Return ``{cache_dir}/{domain}_logits.pt`` (e.g. ``cot_logits.pt``)."""
+    root = Path(cache_dir) if cache_dir is not None else LOGITS_CACHE_DIR
+    safe = str(domain).strip().lower().replace("/", "_")
+    return root / f"{safe}_logits.pt"
+
+
+def format_byte_count(n_bytes: int) -> str:
+    """Human-readable byte count (e.g. ``512.4 MB``)."""
+    size = float(max(int(n_bytes), 0))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} TB"
+
+
+def logits_cache_dir_size(cache_dir: str | Path | None = None) -> int:
+    """Sum on-disk size of ``*.pt`` shards under the logits cache directory."""
+    root = Path(cache_dir) if cache_dir is not None else LOGITS_CACHE_DIR
+    if not root.is_dir():
+        return 0
+    return sum(p.stat().st_size for p in root.glob("*.pt") if p.is_file())
+
+
+def save_teacher_logits_cache(
+    path: str | Path,
+    *,
+    domain: str,
+    input_ids: Tensor,
+    attention_mask: Tensor,
+    topk_indices: Tensor,
+    topk_values: Tensor,
+    teacher_name: str,
+    pad_id: int,
+    extra_meta: dict[str, Any] | None = None,
+) -> Path:
+    """Write a compressed ``.pt`` shard of teacher Top-K logits.
+
+    Tensor contract
+    ---------------
+    ``input_ids``: ``(N, T)`` int32 token ids (right-padded).
+    ``attention_mask``: ``(N, T)`` uint8, ``1`` = real token, ``0`` = pad.
+    ``topk_indices``: ``(N, T, K)`` int32 teacher vocab ids of the Top-K logits.
+    ``topk_values``: ``(N, T, K)`` float16 / bfloat16 teacher logit values.
+
+    ``torch.save`` uses zipfile serialization (compressed).
+    """
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if input_ids.ndim != 2:
+        raise ValueError(f"input_ids must be (N, T), got {tuple(input_ids.shape)}")
+    n_samples, max_length = int(input_ids.size(0)), int(input_ids.size(1))
+    if tuple(attention_mask.shape) != (n_samples, max_length):
+        raise ValueError(
+            "attention_mask shape mismatch: "
+            f"{tuple(attention_mask.shape)} vs {(n_samples, max_length)}"
+        )
+    if topk_indices.ndim != 3 or topk_values.ndim != 3:
+        raise ValueError("topk_indices / topk_values must be (N, T, K)")
+    if tuple(topk_indices.shape) != tuple(topk_values.shape):
+        raise ValueError(
+            f"topk shape mismatch: idx={tuple(topk_indices.shape)} "
+            f"val={tuple(topk_values.shape)}"
+        )
+    if tuple(topk_indices.shape[:2]) != (n_samples, max_length):
+        raise ValueError(
+            f"topk leading dims {tuple(topk_indices.shape[:2])} "
+            f"!= {(n_samples, max_length)}"
+        )
+    kl_topk = int(topk_indices.size(-1))
+    payload: dict[str, Any] = {
+        "format_version": LOGITS_CACHE_FORMAT_VERSION,
+        "domain": str(domain),
+        "teacher_name": str(teacher_name),
+        "kl_topk": kl_topk,
+        "max_length": max_length,
+        "n_samples": n_samples,
+        "pad_id": int(pad_id),
+        "value_dtype": str(topk_values.dtype).replace("torch.", ""),
+        "input_ids": input_ids.detach().to(dtype=torch.int32).contiguous().cpu(),
+        "attention_mask": attention_mask.detach().to(dtype=torch.uint8).contiguous().cpu(),
+        "topk_indices": topk_indices.detach().to(dtype=torch.int32).contiguous().cpu(),
+        "topk_values": topk_values.detach().contiguous().cpu(),
+    }
+    if extra_meta:
+        payload["meta"] = dict(extra_meta)
+    torch.save(payload, dest)
+    return dest
+
+
+def load_teacher_logits_cache(path: str | Path) -> dict[str, Any]:
+    """Load one domain shard written by :func:`save_teacher_logits_cache`.
+
+    Returns the raw payload dict (CPU tensors). Validates required keys/shapes.
+    """
+    src = Path(path)
+    if not src.is_file():
+        raise FileNotFoundError(src)
+    payload = torch.load(src, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise TypeError(f"{src} is not a dict payload")
+    required = (
+        "input_ids",
+        "attention_mask",
+        "topk_indices",
+        "topk_values",
+    )
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise KeyError(f"{src} missing keys: {missing}")
+    return payload
+
+
+def discover_logits_cache_files(
+    cache_dir: str | Path | None = None,
+    domains: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, Path]:
+    """Map domain name → existing ``{domain}_logits.pt`` path.
+
+    If ``domains`` is None, scans ``OFFLINE_DISTILL_DOMAINS`` then any extra
+    ``*_logits.pt`` shards in the directory.
+    """
+    root = Path(cache_dir) if cache_dir is not None else LOGITS_CACHE_DIR
+    found: dict[str, Path] = {}
+    requested = list(domains) if domains is not None else list(OFFLINE_DISTILL_DOMAINS)
+    for domain in requested:
+        path = logits_cache_path(domain, root)
+        if path.is_file():
+            found[domain] = path
+    if domains is None and root.is_dir():
+        for path in sorted(root.glob("*_logits.pt")):
+            domain = path.name[: -len("_logits.pt")]
+            if domain and domain not in found:
+                found[domain] = path
+    return found
+
+
+class OfflineDistillDataset(Dataset):
+    """Map-style dataset over precomputed teacher Top-K logits.
+
+    Loads compressed ``.pt`` shards from ``data/logits_cache/`` produced by
+    ``extract_teacher_logits.py``. **No teacher weights** are required.
+
+    Each item is a dict::
+
+        input_ids      (T,)     int64  — ChatML token ids, right-padded
+        attention_mask (T,)     int64  — 1 = token, 0 = pad
+        topk_indices   (T, K)   int32  — teacher Top-K vocab ids
+        topk_values    (T, K)   fp16/bf16 — teacher Top-K logit values
+        domain         str      — source domain (``cot`` / ``agent`` / …)
+
+    Equal-weight mixing (default)
+    -----------------------------
+    When several domains are present, samples cycle so each domain is drawn
+    equally often (same 20% mixture as online ``MultiDomainChatMixture``),
+    even if shard lengths differ.
+
+    Parameters
+    ----------
+    cache_dir:
+        Directory containing ``{domain}_logits.pt`` (default ``data/logits_cache/``).
+    domains:
+        Subset of domains to load. ``None`` loads every shard that exists.
+    equal_weight:
+        If True, mix domains uniformly; if False, concatenate (length-weighted).
+    """
+
+    def __init__(
+        self,
+        cache_dir: str | Path | None = None,
+        domains: tuple[str, ...] | list[str] | None = None,
+        *,
+        equal_weight: bool = True,
+    ) -> None:
+        super().__init__()
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else LOGITS_CACHE_DIR
+        files = discover_logits_cache_files(self.cache_dir, domains)
+        if not files:
+            hint = domains if domains is not None else OFFLINE_DISTILL_DOMAINS
+            raise FileNotFoundError(
+                f"no teacher logit caches under {self.cache_dir} "
+                f"(looked for {list(hint)}). "
+                "Run: python extract_teacher_logits.py"
+            )
+
+        self.domains: list[str] = []
+        self._input_ids: list[Tensor] = []
+        self._attention_mask: list[Tensor] = []
+        self._topk_indices: list[Tensor] = []
+        self._topk_values: list[Tensor] = []
+        self._lengths: list[int] = []
+        self.pad_id: int = 0
+        self.kl_topk: int | None = None
+        self.max_length: int | None = None
+        self.teacher_name: str | None = None
+        self.shard_meta: dict[str, dict[str, Any]] = {}
+
+        for domain, path in files.items():
+            payload = load_teacher_logits_cache(path)
+            ids = payload["input_ids"]
+            mask = payload["attention_mask"]
+            idx = payload["topk_indices"]
+            val = payload["topk_values"]
+            n = int(ids.size(0))
+            if n == 0:
+                print(f"  skip empty cache {path.name}")
+                continue
+            k = int(idx.size(-1))
+            t = int(ids.size(1))
+            if self.kl_topk is None:
+                self.kl_topk = k
+                self.max_length = t
+                self.pad_id = int(payload.get("pad_id", 0))
+                self.teacher_name = str(payload.get("teacher_name") or "")
+            elif k != self.kl_topk or t != self.max_length:
+                raise ValueError(
+                    f"{path.name} has T={t} K={k}; expected "
+                    f"T={self.max_length} K={self.kl_topk}"
+                )
+            self.domains.append(domain)
+            self._input_ids.append(ids)
+            self._attention_mask.append(mask)
+            self._topk_indices.append(idx)
+            self._topk_values.append(val)
+            self._lengths.append(n)
+            self.shard_meta[domain] = {
+                "path": str(path),
+                "n_samples": n,
+                "kl_topk": k,
+                "max_length": t,
+                "bytes": int(path.stat().st_size),
+            }
+            print(
+                f"  offline[{domain}]: {n:,} samples  T={t}  K={k}  "
+                f"← {path.name} ({format_byte_count(path.stat().st_size)})"
+            )
+
+        if not self.domains:
+            raise ValueError(f"all logit caches under {self.cache_dir} were empty")
+
+        self.equal_weight = bool(equal_weight)
+        self._index = self._build_index()
+
+    def _build_index(self) -> Tensor:
+        """Build ``(N, 2)`` int64 pairs of ``(domain_slot, local_row)``."""
+        pairs: list[tuple[int, int]] = []
+        if self.equal_weight and len(self.domains) > 1:
+            max_n = max(self._lengths)
+            n_dom = len(self.domains)
+            for local in range(max_n):
+                for d in range(n_dom):
+                    pairs.append((d, local % self._lengths[d]))
+        else:
+            for d, n in enumerate(self._lengths):
+                for local in range(n):
+                    pairs.append((d, local))
+        return torch.tensor(pairs, dtype=torch.long)
+
+    def __len__(self) -> int:
+        return int(self._index.size(0))
+
+    def __getitem__(self, idx: int) -> dict[str, Tensor | str]:
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"index {idx} out of range for length {len(self)}")
+        d = int(self._index[idx, 0])
+        local = int(self._index[idx, 1])
+        return {
+            "input_ids": self._input_ids[d][local].long(),
+            "attention_mask": self._attention_mask[d][local].long(),
+            "topk_indices": self._topk_indices[d][local],
+            "topk_values": self._topk_values[d][local],
+            "domain": self.domains[d],
+        }
+
+    @property
+    def num_raw_samples(self) -> int:
+        """Sum of shard lengths (before equal-weight expansion)."""
+        return int(sum(self._lengths))
 
 
 # ---------------------------------------------------------------------------

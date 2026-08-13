@@ -36,12 +36,13 @@ ChatML assistant turns for CoT::
 
 Memory engine
 -------------
-* Top-K KL (``K=200``) + feature matching on last hidden states
+* Top-K KL (``K=50``) — feature matching off by default (``feature_coef=0``)
 * Freeze non-FFF backbone + AdamW8bit (fits RTX 3060 12GB)
 * Gradient checkpointing on the student
 * Model context ``262144`` (256K); train micro-batch ``max_length=64``
-* ``batch_size=1``, ``grad_accum_steps=16``
+* ``batch_size=1``, ``grad_accum_steps=4``
 * ``max_steps=4000``, Cosine ``lr_leaf=2e-4``, ``lr_router=5e-5``
+* SDPA (``F.scaled_dot_product_attention``) on student and teacher
 
 Checkpoint
 ----------
@@ -52,6 +53,7 @@ Example
     python train_fff_agent.py --device cuda --max-steps 4000
     # Stronger pair (needs more VRAM):
     python train_fff_agent.py --teacher-name Qwen/Qwen3.5-9B --student-name Qwen/Qwen3.5-4B --device cuda
+    python train_fff_agent.py --smoke-test
     python train_fff_agent.py --smoke-synthetic-data --max-steps 20
 """
 
@@ -84,10 +86,13 @@ from fff_hf import (
     CONTEXT_LENGTH_256K,
     annealed_tau,
     apply_context_length,
+    attn_implementation_name,
     bf16_autocast,
     build_fff_student,
     build_student_optimizer,
     build_student_param_groups,
+    enable_fast_sdpa,
+    enable_model_sdpa,
     encode_truncate_left,
     extract_teacher_topk,
     gather_student_leaf_probs,
@@ -701,8 +706,8 @@ def ultimate_distill_loss(
     kl_temperature: float = 2.0,
     entropy_coef: float = 0.01,
     ce_coef: float = 0.1,
-    feature_coef: float = 0.5,
-    kl_topk: int = 200,
+    feature_coef: float = 0.0,
+    kl_topk: int = 50,
     labels: Tensor | None = None,
     pad_id: int = 0,
 ) -> tuple[Tensor, dict[str, Tensor]]:
@@ -749,12 +754,12 @@ class UltimateConfig:
     kl_temperature: float = 2.0
     entropy_coef: float = 0.01
     ce_coef: float = 0.1
-    feature_coef: float = 0.5
-    kl_topk: int = 200
+    feature_coef: float = 0.0
+    kl_topk: int = 50
     max_context_length: int = CONTEXT_LENGTH_256K
     max_length: int = 64
     batch_size: int = 1
-    grad_accum_steps: int = 16
+    grad_accum_steps: int = 4
     lr_leaf: float = 2e-4
     lr_router: float = 5e-5
     min_lr: float = 2e-5
@@ -771,6 +776,7 @@ class UltimateConfig:
     freeze_backbone: bool = True
     adam_8bit: bool = True
     smoke_synthetic_data: bool = False
+    smoke_test: bool = False
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -791,8 +797,18 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--kl-temperature", type=float, default=d.kl_temperature)
     p.add_argument("--entropy-coef", type=float, default=d.entropy_coef)
     p.add_argument("--ce-coef", type=float, default=d.ce_coef)
-    p.add_argument("--feature-coef", type=float, default=d.feature_coef)
-    p.add_argument("--kl-topk", type=int, default=d.kl_topk)
+    p.add_argument(
+        "--feature-coef",
+        type=float,
+        default=d.feature_coef,
+        help="Last-hidden MSE weight (default 0 = disabled, faster)",
+    )
+    p.add_argument(
+        "--kl-topk",
+        type=int,
+        default=d.kl_topk,
+        help="Teacher Top-K vocabulary for KL (default 50)",
+    )
     p.add_argument(
         "--max-context-length",
         type=int,
@@ -834,6 +850,18 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Use full-precision AdamW instead of 8-bit (more VRAM)",
     )
     p.add_argument("--smoke-synthetic-data", action="store_true")
+    p.add_argument(
+        "--smoke-test",
+        "--fast-dev",
+        "--smoke_test",
+        "--fast_dev",
+        dest="smoke_test",
+        action="store_true",
+        help=(
+            "Fast pipeline check before a full 4000-step GPU run: "
+            "200 samples/domain, 50 steps, log/save every 10"
+        ),
+    )
     return p
 
 
@@ -886,12 +914,26 @@ def main() -> None:
         freeze_backbone=not args.unfreeze_backbone,
         adam_8bit=not args.adam_fp32,
         smoke_synthetic_data=args.smoke_synthetic_data,
+        smoke_test=bool(args.smoke_test),
     )
+
+    if cfg.smoke_test:
+        cfg.max_samples_per_domain = min(int(cfg.max_samples_per_domain), 200)
+        cfg.max_steps = 50
+        cfg.save_every = 10
+        cfg.log_every = 10
+        print(
+            "smoke_test / fast_dev: "
+            f"max_samples_per_domain={cfg.max_samples_per_domain} "
+            f"max_steps={cfg.max_steps} log_every={cfg.log_every} "
+            f"save_every={cfg.save_every}"
+        )
 
     torch.manual_seed(cfg.seed)
     random.seed(cfg.seed)
     device = resolve_device(cfg.device)
     apply_hardware_optimizations(device)
+    enable_fast_sdpa()
 
     # bitsandbytes 4-bit NF4 is CUDA-only. On macOS MPS / CPU, drop to native half.
     if cfg.teacher_4bit and not torch.cuda.is_available():
@@ -920,7 +962,10 @@ def main() -> None:
     print("=" * 72)
     print_device_info(device)
     print(f"config: {asdict(cfg)}")
-    print(f"student_dtype={compute_dtype} | kl_topk={cfg.kl_topk}")
+    print(
+        f"student_dtype={compute_dtype} | kl_topk={cfg.kl_topk} | "
+        f"feature_coef={cfg.feature_coef} | grad_accum={cfg.grad_accum_steps}"
+    )
     print(f"target leaf entropy H_uniform=log({n_leaves})={h_uniform:.4f}")
     if "Qwen3.5-9B" in cfg.student_name or (
         "Qwen3.5-9B" in cfg.teacher_name and "Qwen3.5-4B" in cfg.student_name
@@ -986,11 +1031,18 @@ def main() -> None:
     )
     apply_context_length(teacher, n_ctx=cfg.max_context_length)
     apply_context_length(student, tokenizer, n_ctx=cfg.max_context_length)
+    enable_model_sdpa(teacher)
+    enable_model_sdpa(student)
     if device.type == "cuda":
         torch.cuda.empty_cache()
     print(
         f"context_length={model_context_length(student):,} "
         f"(train microbatch max_length={cfg.max_length})"
+    )
+    print(
+        f"attention=SDPA (scaled_dot_product_attention) | "
+        f"teacher={attn_implementation_name(teacher)} | "
+        f"student={attn_implementation_name(student)}"
     )
 
     n_fff = sum(1 for _ in iter_fff_swiglu_blocks(student))

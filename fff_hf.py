@@ -125,38 +125,142 @@ def load_hf_causal_lm(
     dtype: torch.dtype = torch.float32,
     quantization_config: Any | None = None,
     device_map: Any | None = None,
+    max_memory: dict[Any, str] | None = None,
+    extra_from_pretrained: dict[str, Any] | None = None,
 ) -> Any:
-    """Load a HF CausalLM (Qwen2 / Qwen3.5 text or multimodal text trunk)."""
+    """Load a HF CausalLM or Qwen3.5 / Qwen3.6 image-text Instruct checkpoint.
+
+    Requests ``attn_implementation='sdpa'`` so both teacher and student use
+    ``F.scaled_dot_product_attention`` (Flash / mem-efficient on CUDA, fast
+    kernels on MPS). Falls back to the model's default attention if SDPA is
+    rejected.
+
+    ``max_memory`` is forwarded to Accelerate (e.g. ``{0: "10GiB", "cpu": "48GiB"}``)
+    so a 4-bit 35B teacher can cap GPU VRAM and offload remaining layers to CPU RAM.
+    """
     AutoModelForCausalLM, _ = _require_transformers()
     kwargs: dict[str, Any] = {
         "trust_remote_code": True,
         "dtype": dtype,
+        "attn_implementation": "sdpa",
     }
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
         kwargs.pop("dtype", None)
     if device_map is not None:
         kwargs["device_map"] = device_map
+        kwargs.setdefault("low_cpu_mem_usage", True)
+    if max_memory is not None:
+        kwargs["max_memory"] = max_memory
+    if extra_from_pretrained:
+        kwargs.update(extra_from_pretrained)
 
-    try:
-        return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
-    except Exception as first_exc:  # noqa: BLE001
-        # Qwen3.5 multimodal repos sometimes register under image-text loaders.
+    # Qwen3.5 / Qwen3.6 Instruct checkpoints are image-text wrappers
+    # (``pipeline_tag: image-text-to-text``), not plain CausalLM.
+    name_l = model_name.lower()
+    prefer_image_text = any(tag in name_l for tag in ("qwen3.5", "qwen3.6", "qwen3_5", "qwen3_6"))
+    loaders: list[tuple[str, Any]] = [("AutoModelForCausalLM", AutoModelForCausalLM)]
+    if prefer_image_text:
         try:
             from transformers import AutoModelForImageTextToText
 
-            print(
-                f"  AutoModelForCausalLM failed ({first_exc.__class__.__name__}); "
-                "retrying AutoModelForImageTextToText ..."
-            )
-            return AutoModelForImageTextToText.from_pretrained(model_name, **kwargs)
-        except Exception as second_exc:  # noqa: BLE001
-            raise SystemExit(
-                f"Failed to load `{model_name}`.\n"
-                f"  CausalLM error: {first_exc}\n"
-                f"  ImageText error: {second_exc}\n"
-                "Tip: pip install -U 'transformers>=4.57' (required for Qwen3.5)."
-            ) from second_exc
+            loaders = [
+                ("AutoModelForImageTextToText", AutoModelForImageTextToText),
+                ("AutoModelForCausalLM", AutoModelForCausalLM),
+            ]
+        except ImportError:
+            pass
+
+    errors: list[str] = []
+    model: Any | None = None
+    for label, loader in loaders:
+        try:
+            model = _from_pretrained_prefer_sdpa(loader, model_name, kwargs)
+            if label != "AutoModelForCausalLM":
+                print(f"  loaded `{model_name}` via {label}")
+            break
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{label}: {exc}")
+            print(f"  {label} failed ({exc.__class__.__name__}); trying next loader ...")
+    if model is None:
+        detail = "\n  ".join(errors) if errors else "no loader attempted"
+        raise SystemExit(
+            f"Failed to load `{model_name}`.\n  {detail}\n"
+            "Tip: pip install -U 'transformers>=4.57' (required for Qwen3.5 / Qwen3.6)."
+        )
+    enable_model_sdpa(model)
+    return model
+
+
+def _from_pretrained_prefer_sdpa(loader: Any, model_name: str, kwargs: dict[str, Any]) -> Any:
+    """``from_pretrained`` with SDPA, then retry without if the loader rejects it."""
+    try:
+        return loader.from_pretrained(model_name, **kwargs)
+    except (TypeError, ValueError):
+        if kwargs.get("attn_implementation") != "sdpa":
+            raise
+        print("  SDPA attn_implementation rejected; retrying default attention ...")
+        fallback = {k: v for k, v in kwargs.items() if k != "attn_implementation"}
+        return loader.from_pretrained(model_name, **fallback)
+
+
+def enable_fast_sdpa() -> None:
+    """Turn on PyTorch SDPA backends (Flash / mem-efficient / math).
+
+    CUDA uses FlashAttention-capable kernels when hardware allows. MPS uses
+    the SDPA fast path. Safe no-ops when a backend flag is missing.
+    """
+    cuda_sdp = getattr(torch.backends, "cuda", None)
+    if cuda_sdp is None:
+        return
+    for name, enabled in (
+        ("enable_flash_sdp", True),
+        ("enable_mem_efficient_sdp", True),
+        ("enable_math_sdp", True),
+    ):
+        fn = getattr(cuda_sdp, name, None)
+        if callable(fn):
+            try:
+                fn(enabled)
+            except Exception:
+                pass
+
+
+def enable_model_sdpa(model: Any) -> None:
+    """Force HuggingFace attention to SDPA on ``model`` (and nested text config)."""
+    setter = getattr(model, "set_attn_implementation", None)
+    if callable(setter):
+        try:
+            setter("sdpa")
+        except Exception:
+            pass
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return
+    for obj in (cfg, getattr(cfg, "text_config", None)):
+        if obj is None:
+            continue
+        if hasattr(obj, "_attn_implementation"):
+            try:
+                obj._attn_implementation = "sdpa"
+            except Exception:
+                pass
+
+
+def attn_implementation_name(model: Any) -> str:
+    """Best-effort attention backend label for logs."""
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return "unknown"
+    for obj in (cfg, getattr(cfg, "text_config", None)):
+        if obj is None:
+            continue
+        v = getattr(obj, "_attn_implementation", None) or getattr(
+            obj, "attn_implementation", None
+        )
+        if v:
+            return str(v)
+    return "unknown"
 
 
 @contextmanager

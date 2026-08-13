@@ -1,8 +1,8 @@
-"""Data package: BPE WikiText loaders for the FFF SLM.
+"""Data package: BPE WikiText loaders and offline distill caches.
 
 Import from ``data.dataset_loader`` directly to avoid ``python -m`` import cycles, e.g.::
 
-    from data.dataset_loader import BPEDataset, get_wikitext_data
+    from data.dataset_loader import BPEDataset, OfflineDistillDataset, get_wikitext_data
 """
 
 from __future__ import annotations
@@ -10,11 +10,15 @@ from __future__ import annotations
 __all__ = [
     "BPEDataset",
     "GPT2_VOCAB_SIZE",
+    "LOGITS_CACHE_DIR",
+    "OfflineDistillDataset",
     "build_wikitext_datasets",
     "decode_tokens",
     "encode_text",
     "get_gpt2_encoding",
     "get_wikitext_data",
+    "logits_cache_path",
+    "save_teacher_logits_cache",
 ]
 
 
