@@ -3,15 +3,20 @@
 
 Student
 -------
-``Qwen/Qwen2.5-Coder-1.5B-Instruct`` patched with :class:`FFFSwiGLUBlock`
+``Qwen/Qwen3.5-2B`` patched with :class:`FFFSwiGLUBlock`
 (depth=4 → 16 leaves). FP32 smart-init → BF16. STE hard-aware soft routing
-matches Triton Hard inference.
+matches Triton Hard inference. Fits RTX 3060 12GB comfortably with a 4-bit
+4B teacher.
 
 Teacher
 -------
-Default ``Qwen/Qwen2.5-Coder-7B-Instruct`` in bitsandbytes 4-bit
-(``bnb_4bit_compute_dtype=bfloat16``). Alternative CoT teacher:
-``deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`` (Qwen vocab → Top-K KL aligned).
+Default ``Qwen/Qwen3.5-4B`` in bitsandbytes 4-bit
+(``bnb_4bit_compute_dtype=bfloat16``). Same-family Top-K KL (vocab aligned).
+
+VRAM note
+---------
+Default: teacher 4B 4-bit + student 2B BF16 targets ~12GB cards with headroom.
+Larger pair: ``--teacher-name Qwen/Qwen3.5-9B --student-name Qwen/Qwen3.5-4B``.
 
 Data mixture (20% each)
 -----------------------
@@ -32,8 +37,10 @@ ChatML assistant turns for CoT::
 Memory engine
 -------------
 * Top-K KL (``K=200``) + feature matching on last hidden states
+* Freeze non-FFF backbone + AdamW8bit (fits RTX 3060 12GB)
 * Gradient checkpointing on the student
-* ``max_length=64``, ``batch_size=1``, ``grad_accum_steps=16``
+* Model context ``262144`` (256K); train micro-batch ``max_length=64``
+* ``batch_size=1``, ``grad_accum_steps=16``
 * ``max_steps=4000``, Cosine ``lr_leaf=2e-4``, ``lr_router=5e-5``
 
 Checkpoint
@@ -43,7 +50,8 @@ Checkpoint
 Example
 -------
     python train_fff_agent.py --device cuda --max-steps 4000
-    python train_fff_agent.py --teacher-name deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+    # Stronger pair (needs more VRAM):
+    python train_fff_agent.py --teacher-name Qwen/Qwen3.5-9B --student-name Qwen/Qwen3.5-4B --device cuda
     python train_fff_agent.py --smoke-synthetic-data --max-steps 20
 """
 
@@ -73,14 +81,20 @@ from device_utils import (
     resolve_device,
 )
 from fff_hf import (
+    CONTEXT_LENGTH_256K,
     annealed_tau,
+    apply_context_length,
     bf16_autocast,
     build_fff_student,
+    build_student_optimizer,
     build_student_param_groups,
+    encode_truncate_left,
     extract_teacher_topk,
     gather_student_leaf_probs,
     load_4bit_teacher,
     load_dense_teacher,
+    model_context_length,
+    model_vocab_size,
     resolve_compute_dtype,
     topk_kl_distill_loss,
 )
@@ -90,10 +104,10 @@ from fff_swiglu import (
 )
 
 CHECKPOINT_NAME = "fff_cot_agent.pt"
-DEFAULT_STUDENT = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
-DEFAULT_TEACHER = "Qwen/Qwen2.5-Coder-7B-Instruct"
-# Qwen-vocab CoT teacher alternative (pass via --teacher-name):
-#   deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+DEFAULT_STUDENT = "Qwen/Qwen3.5-2B"
+DEFAULT_TEACHER = "Qwen/Qwen3.5-4B"
+# Stronger pairs if VRAM allows:
+#   teacher 9B + student 4B, or teacher 9B + student 9B (≥24GB)
 
 DOMAIN_COT = "cot"
 DOMAIN_AGENT = "agent"
@@ -605,11 +619,13 @@ class MultiDomainChatMixture(IterableDataset[Tensor]):
             encoded: list[Tensor] = []
             for msgs in domain_messages[domain]:
                 text = messages_to_chatml(msgs, default_system=default_system)
-                ids = tokenizer.encode(text, add_special_tokens=False)
+                # Left-truncate to max_length inside the tokenizer (keeps assistant
+                # tail; avoids HF warnings when raw ChatML >> model_max_length).
+                ids = encode_truncate_left(
+                    tokenizer, text, max_length=self.max_length
+                )
                 if not ids:
                     continue
-                if len(ids) > self.max_length:
-                    ids = ids[-self.max_length :]
                 t = torch.full((self.max_length,), self.pad_id, dtype=torch.long)
                 t[: len(ids)] = torch.tensor(ids, dtype=torch.long)
                 encoded.append(t)
@@ -717,6 +733,7 @@ class UltimateConfig:
     ce_coef: float = 0.1
     feature_coef: float = 0.5
     kl_topk: int = 200
+    max_context_length: int = CONTEXT_LENGTH_256K
     max_length: int = 64
     batch_size: int = 1
     grad_accum_steps: int = 16
@@ -733,6 +750,8 @@ class UltimateConfig:
     checkpoint: str = CHECKPOINT_NAME
     use_bf16: bool = True
     teacher_4bit: bool = True
+    freeze_backbone: bool = True
+    adam_8bit: bool = True
     smoke_synthetic_data: bool = False
 
 
@@ -746,10 +765,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--teacher-name",
         type=str,
         default=d.teacher_name,
-        help=(
-            "4-bit teacher id (Qwen Coder 7B or "
-            "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B)"
-        ),
+        help="4-bit teacher id (default: Qwen/Qwen3.5-4B)",
     )
     p.add_argument("--fff-depth", type=int, default=d.fff_depth)
     p.add_argument("--init-tau", type=float, default=d.init_tau)
@@ -759,6 +775,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--ce-coef", type=float, default=d.ce_coef)
     p.add_argument("--feature-coef", type=float, default=d.feature_coef)
     p.add_argument("--kl-topk", type=int, default=d.kl_topk)
+    p.add_argument(
+        "--max-context-length",
+        type=int,
+        default=d.max_context_length,
+        help="Model/tokenizer context window (default 262144 = 256K)",
+    )
     p.add_argument("--max-length", type=int, default=d.max_length)
     p.add_argument("--block-size", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=d.batch_size)
@@ -778,6 +800,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint", type=str, default=d.checkpoint)
     p.add_argument("--fp32", action="store_true")
     p.add_argument("--no-4bit", action="store_true")
+    p.add_argument(
+        "--unfreeze-backbone",
+        action="store_true",
+        help="Train embeddings/attention/LM head too (needs ≫12GB VRAM)",
+    )
+    p.add_argument(
+        "--adam-fp32",
+        action="store_true",
+        help="Use full-precision AdamW instead of 8-bit (more VRAM)",
+    )
     p.add_argument("--smoke-synthetic-data", action="store_true")
     return p
 
@@ -811,6 +843,7 @@ def main() -> None:
         ce_coef=args.ce_coef,
         feature_coef=args.feature_coef,
         kl_topk=args.kl_topk,
+        max_context_length=args.max_context_length,
         max_length=max_length,
         batch_size=args.batch_size,
         grad_accum_steps=args.grad_accum_steps,
@@ -827,6 +860,8 @@ def main() -> None:
         checkpoint=args.checkpoint,
         use_bf16=not args.fp32,
         teacher_4bit=not args.no_4bit,
+        freeze_backbone=not args.unfreeze_backbone,
+        adam_8bit=not args.adam_fp32,
         smoke_synthetic_data=args.smoke_synthetic_data,
     )
 
@@ -848,6 +883,13 @@ def main() -> None:
     print(f"config: {asdict(cfg)}")
     print(f"student_dtype={compute_dtype} | kl_topk={cfg.kl_topk}")
     print(f"target leaf entropy H_uniform=log({n_leaves})={h_uniform:.4f}")
+    if "Qwen3.5-9B" in cfg.student_name or (
+        "Qwen3.5-9B" in cfg.teacher_name and "Qwen3.5-4B" in cfg.student_name
+    ):
+        print(
+            "VRAM tip: large teacher/student pairs may need ≥16–24GB. "
+            "Default is teacher Qwen/Qwen3.5-4B + student Qwen/Qwen3.5-2B for ~12GB."
+        )
     _warn_vocab_mismatch(cfg.teacher_name, cfg.student_name)
 
     AutoTokenizer = _require_tokenizer()
@@ -857,6 +899,7 @@ def main() -> None:
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    apply_context_length(tokenizer=tokenizer, n_ctx=cfg.max_context_length)
 
     print("\nBuilding 20% multi-domain mixture (incl. CoT <think>) ...")
     domain_messages: dict[str, list[list[dict[str, str]]]] = {}
@@ -900,18 +943,31 @@ def main() -> None:
         fff_depth=cfg.fff_depth,
         init_temp=cfg.init_tau,
         compute_dtype=compute_dtype,
+        freeze_backbone=cfg.freeze_backbone,
+    )
+    apply_context_length(teacher, n_ctx=cfg.max_context_length)
+    apply_context_length(student, tokenizer, n_ctx=cfg.max_context_length)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    print(
+        f"context_length={model_context_length(student):,} "
+        f"(train microbatch max_length={cfg.max_length})"
     )
 
     n_fff = sum(1 for _ in iter_fff_swiglu_blocks(student))
     n_train = sum(p.numel() for p in student.parameters() if p.requires_grad)
-    print(f"FFF SwiGLU blocks={n_fff} | student trainable={n_train:,}")
+    n_frozen = sum(p.numel() for p in student.parameters() if not p.requires_grad)
+    print(
+        f"FFF SwiGLU blocks={n_fff} | student trainable={n_train:,} | "
+        f"frozen={n_frozen:,}"
+    )
 
-    optimizer = torch.optim.AdamW(
+    optimizer = build_student_optimizer(
         build_student_param_groups(
             student, lr_leaf=cfg.lr_leaf, lr_router=cfg.lr_router
         ),
         weight_decay=cfg.weight_decay,
-        betas=(0.9, 0.95),
+        adam_8bit=cfg.adam_8bit,
     )
     n_opt_steps = max(
         (cfg.max_steps + cfg.grad_accum_steps - 1) // cfg.grad_accum_steps, 1
@@ -937,8 +993,7 @@ def main() -> None:
     log_count = 0
 
     print(
-        f"optimizer: AdamW leaf/other lr={cfg.lr_leaf:.2e} "
-        f"router lr={cfg.lr_router:.2e} | "
+        f"lr_leaf={cfg.lr_leaf:.2e} lr_router={cfg.lr_router:.2e} | "
         f"CosineAnnealingLR T_max={n_opt_steps} eta_min={cfg.min_lr:.2e}"
     )
 
@@ -952,8 +1007,8 @@ def main() -> None:
         batch = next(data_iter)
         input_ids = batch.to(device, non_blocking=True)
 
-        vocab_s = int(student.config.vocab_size)
-        vocab_t = int(getattr(teacher.config, "vocab_size", vocab_s))
+        vocab_s = model_vocab_size(student)
+        vocab_t = model_vocab_size(teacher)
         input_ids = input_ids.clamp(0, min(vocab_s, vocab_t) - 1)
         want_feat = cfg.feature_coef > 0.0
 
@@ -1014,7 +1069,10 @@ def main() -> None:
             del teacher_hidden
 
         if (step + 1) % cfg.grad_accum_steps == 0:
-            torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                (p for p in student.parameters() if p.requires_grad),
+                1.0,
+            )
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -1060,6 +1118,7 @@ def main() -> None:
                 "architecture": "fff_swiglu_cot_agent",
                 "domains": list(DOMAINS),
                 "compute_dtype": str(compute_dtype),
+                "max_context_length": int(cfg.max_context_length),
             }
             torch.save(payload, ckpt_path)
             tqdm.write(f"saved checkpoint → {ckpt_path}")

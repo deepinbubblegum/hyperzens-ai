@@ -45,17 +45,31 @@ from eval_fff_gpt2 import (
     _apply_repetition_penalty,
     _topk_topp_filter,
 )
-from fff_hf import load_student_from_checkpoint, resolve_compute_dtype
-from fff_swiglu import iter_fff_swiglu_blocks, warmup_fff_swiglu
+from fff_hf import (
+    CONTEXT_LENGTH_256K,
+    apply_context_length,
+    encode_truncate_left,
+    load_student_from_checkpoint,
+    model_context_length,
+    model_vocab_size,
+    resolve_compute_dtype,
+)
+from fff_swiglu import iter_fff_swiglu_blocks, set_fff_routing_mode, warmup_fff_swiglu
 from models.fff_hard_triton import is_triton_available
 
 DEFAULT_CHECKPOINT = Path("fff_cot_agent.pt")
-DEFAULT_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen3.5-2B"
 
 DEFAULT_TEMPERATURE = 0.6
 DEFAULT_TOP_P = 0.95
-DEFAULT_REPETITION_PENALTY = 1.2
-DEFAULT_MAX_NEW_TOKENS = 300
+DEFAULT_REPETITION_PENALTY = 1.15
+DEFAULT_MAX_NEW_TOKENS = 128
+
+SYSTEM_PROMPT_CHAT_TH = (
+    "คุณเป็นผู้ช่วยที่เป็นมิตร พูดภาษาไทยสุภาพ ชัดเจน "
+    "ถ้าผู้ใช้ทักทาย ให้ทักทายกลับสั้นๆ แล้วถามว่าให้ช่วยอะไรได้ "
+    "อย่าเขียนเรียงความ อย่าพูดถึงข้อจำกัดของ AI เอง ถ้าไม่ได้ถูกถาม"
+)
 
 SYSTEM_PROMPT_COT_TH = (
     "คุณเป็นผู้ช่วย AI ที่คิดทีละขั้นอย่างมีเหตุผล "
@@ -112,22 +126,114 @@ def print_cot_header(
     print()
 
 
+def _as_token_id_list(ids: Any) -> list[int] | None:
+    """Normalize ``apply_chat_template`` output to a 1-D list of token ids."""
+    if ids is None:
+        return None
+    if isinstance(ids, dict) or hasattr(ids, "keys"):
+        try:
+            ids = ids["input_ids"]
+        except Exception:  # noqa: BLE001
+            return None
+    if hasattr(ids, "tolist"):
+        ids = ids.tolist()
+    if isinstance(ids, list) and ids and isinstance(ids[0], list):
+        ids = ids[0]
+    if not isinstance(ids, list) or not ids:
+        return None
+    if not isinstance(ids[0], int):
+        try:
+            ids = [int(x) for x in ids]
+        except (TypeError, ValueError):
+            return None
+        return ids
+    return [int(x) for x in ids]
+
+
+def build_chat_input_ids(
+    tokenizer: Any,
+    history: list[dict[str, str]],
+    *,
+    system: str,
+    max_length: int,
+) -> list[int]:
+    """Tokenize ChatML via the tokenizer template (no string round-trip)."""
+    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    messages.extend(history)
+    max_length = max(int(max_length), 8)
+    kwargs: dict[str, Any] = {
+        "tokenize": True,
+        "add_generation_prompt": True,
+        "add_special_tokens": False,
+    }
+    raw: Any = None
+    try:
+        raw = tokenizer.apply_chat_template(
+            messages, enable_thinking=False, **kwargs
+        )
+    except TypeError:
+        try:
+            raw = tokenizer.apply_chat_template(messages, **kwargs)
+        except Exception:  # noqa: BLE001
+            raw = None
+    except Exception:  # noqa: BLE001
+        raw = None
+    ids = _as_token_id_list(raw)
+    if ids is None:
+        text = build_chat_prompt(tokenizer, history, system=system)
+        ids = encode_truncate_left(
+            tokenizer, text, max_length=max_length, add_special_tokens=False
+        )
+    if len(ids) > max_length:
+        ids = ids[-max_length:]
+    return ids
+
+
+def clean_reply_text(text: str) -> str:
+    """Drop leaked ChatML role lines the 2B model sometimes emits."""
+    text = text.strip()
+    for stop in ("<|im_end|>", "<|im_start|>", "<|endoftext|>"):
+        if stop in text:
+            text = text.split(stop)[0].strip()
+    for sep in ("\nassistant\n", "\nassistant:", "\nAssistant\n"):
+        if sep in text.lower() or sep in text:
+            # Keep the body after the last assistant marker.
+            parts = re.split(r"\nassistant\s*:?\s*\n", text, flags=re.I)
+            if len(parts) > 1:
+                text = parts[-1].strip()
+    text = re.sub(
+        r"^(?:user|assistant|system)\s*\n", "", text, count=1, flags=re.I
+    ).strip()
+    # A leading fake user turn: "....\nassistant\nreal reply"
+    text = re.sub(
+        r"^user\s*\n.*?\nassistant\s*\n", "", text, count=1, flags=re.I | re.S
+    ).strip()
+    return text
+
+
 def build_chat_prompt(
     tokenizer: Any,
     history: list[dict[str, str]],
     *,
-    system: str = SYSTEM_PROMPT_COT_TH,
+    system: str = SYSTEM_PROMPT_CHAT_TH,
 ) -> str:
     """Render multi-turn history with ChatML + assistant generation prompt."""
     messages: list[dict[str, str]] = [{"role": "system", "content": system}]
     messages.extend(history)
     if hasattr(tokenizer, "apply_chat_template"):
+        kwargs: dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
         try:
             return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
+                messages, enable_thinking=False, **kwargs
             )
+        except TypeError:
+            try:
+                return tokenizer.apply_chat_template(messages, **kwargs)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001
             pass
 
@@ -181,82 +287,162 @@ def generate_reply(
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     temperature: float = DEFAULT_TEMPERATURE,
     top_p: float = DEFAULT_TOP_P,
+    top_k: int = 20,
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
-    no_repeat_ngram_size: int = 3,
+    no_repeat_ngram_size: int = 0,
+    prompt_token_ids: list[int] | None = None,
 ) -> tuple[str, float, float, int]:
-    """Nucleus sample; return ``(text, tok/s, ms/token, n_new)``."""
+    """Sample a reply with KV cache; n-gram ban applies to **new tokens only**."""
     model.eval()
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-    vocab = int(model.config.vocab_size)
-    input_ids = input_ids.clamp(0, vocab - 1)
-    n_ctx = int(getattr(model.config, "max_position_embeddings", 2048))
+    if hasattr(model, "config"):
+        model.config.use_cache = True
+    n_ctx = model_context_length(model)
     max_prompt = max(n_ctx - max_new_tokens, 64)
-    if input_ids.size(1) > max_prompt:
-        input_ids = input_ids[:, -max_prompt:]
+    prompt_ids = prompt_token_ids
+    if prompt_ids is None:
+        prompt_ids = encode_truncate_left(
+            tokenizer, prompt, max_length=max_prompt, add_special_tokens=False
+        )
+    if not prompt_ids:
+        prompt_ids = [int(tokenizer.eos_token_id or 0)]
+    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    vocab = model_vocab_size(model)
+    tok_vocab = int(getattr(tokenizer, "vocab_size", vocab) or vocab)
+    vocab_cap = min(vocab, tok_vocab)
+    input_ids = input_ids.clamp(0, vocab_cap - 1)
+    attention_mask = torch.ones_like(input_ids)
 
-    generated: Tensor = input_ids
-    sample = temperature > 0
-    eos_id = tokenizer.eos_token_id
-    im_end_id: int | None = None
+    eos_ids: list[int] = []
+    if tokenizer.eos_token_id is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
     try:
         tid = tokenizer.convert_tokens_to_ids("<|im_end|>")
         if tid is not None and int(tid) >= 0:
-            im_end_id = int(tid)
+            eos_ids.append(int(tid))
+        tid = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        if tid is not None and int(tid) >= 0:
+            eos_ids.append(int(tid))
     except Exception:  # noqa: BLE001
-        im_end_id = None
+        pass
+    eos_ids = list(dict.fromkeys(eos_ids)) or None
 
+    sample = temperature > 0
     use_cuda = device.type == "cuda"
     if use_cuda:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
         torch.cuda.synchronize(device)
-        start.record()
+        t0 = time.perf_counter()
     else:
         t0 = time.perf_counter()
 
-    for _ in range(max_new_tokens):
-        cond = generated if generated.size(1) <= n_ctx else generated[:, -n_ctx:]
-        with amp_autocast(device):
-            logits = model(input_ids=cond).logits[:, -1, :].float()
-
-        logits = _apply_repetition_penalty(logits, generated, repetition_penalty)
-        logits = _apply_no_repeat_ngram(logits, generated, no_repeat_ngram_size)
-
-        if not sample:
-            next_id = torch.argmax(logits, dim=-1, keepdim=True)
-        else:
-            logits = logits / max(temperature, 1e-8)
-            logits = _topk_topp_filter(logits, top_k=0, top_p=top_p)
-            probs = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
-
-        generated = torch.cat([generated, next_id], dim=1)
-        tok = int(next_id.item())
-        if eos_id is not None and tok == int(eos_id):
-            break
-        if im_end_id is not None and tok == im_end_id:
-            break
+    generated = _generate_cached(
+        model,
+        input_ids,
+        attention_mask,
+        device,
+        max_new_tokens=max_new_tokens,
+        sample=sample,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+        vocab_cap=vocab_cap,
+        eos_ids=eos_ids,
+    )
 
     if use_cuda:
-        end.record()
         torch.cuda.synchronize(device)
-        elapsed_ms = float(start.elapsed_time(end))
-    else:
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    elapsed_ms = max((time.perf_counter() - t0) * 1000.0, 1e-6)
 
     prompt_len = int(input_ids.size(1))
     n_new = int(generated.size(1) - prompt_len)
-    elapsed_ms = max(elapsed_ms, 1e-6)
     tok_s = (n_new * 1000.0) / elapsed_ms
     ms_tok = elapsed_ms / max(n_new, 1)
     text = tokenizer.decode(
         generated[0, prompt_len:].tolist(),
         skip_special_tokens=True,
     ).strip()
-    for stop in ("<|im_end|>", "<|im_start|>"):
-        if stop in text:
-            text = text.split(stop)[0].strip()
+    text = clean_reply_text(text)
     return text, tok_s, ms_tok, n_new
+
+
+@torch.no_grad()
+def _generate_cached(
+    model: Any,
+    input_ids: Tensor,
+    attention_mask: Tensor,
+    device: torch.device,
+    *,
+    max_new_tokens: int,
+    sample: bool,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    no_repeat_ngram_size: int,
+    vocab_cap: int,
+    eos_ids: list[int] | None,
+) -> Tensor:
+    """Prefill once, then decode with ``past_key_values`` (KV cache)."""
+    prompt_len = int(input_ids.size(1))
+    generated = input_ids
+    attn = attention_mask
+    past = None
+    eos_set = set(eos_ids or [])
+    use_cache = True
+
+    for _ in range(max_new_tokens):
+        if use_cache and past is not None:
+            model_in = generated[:, -1:]
+        else:
+            model_in = generated
+
+        with amp_autocast(device):
+            try:
+                out = model(
+                    input_ids=model_in,
+                    attention_mask=attn,
+                    past_key_values=past if use_cache else None,
+                    use_cache=use_cache,
+                )
+                past = getattr(out, "past_key_values", None) if use_cache else None
+            except Exception:
+                use_cache = False
+                past = None
+                out = model(
+                    input_ids=generated,
+                    attention_mask=attn,
+                    use_cache=False,
+                )
+
+        logits = out.logits[:, -1, :].float()
+        if logits.size(-1) > vocab_cap:
+            logits[:, vocab_cap:] = float("-inf")
+
+        continuation = generated[:, prompt_len:]
+        if continuation.size(1) > 0:
+            logits = _apply_repetition_penalty(
+                logits, continuation, repetition_penalty
+            )
+            logits = _apply_no_repeat_ngram(
+                logits, continuation, no_repeat_ngram_size
+            )
+
+        if not sample:
+            next_id = torch.argmax(logits, dim=-1, keepdim=True)
+        else:
+            logits = logits / max(temperature, 1e-8)
+            logits = _topk_topp_filter(logits, top_k=top_k, top_p=top_p)
+            next_id = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+
+        generated = torch.cat([generated, next_id], dim=1)
+        attn = torch.cat(
+            [attn, torch.ones((1, 1), dtype=attn.dtype, device=device)], dim=1
+        )
+        if int(next_id.item()) in eos_set:
+            break
+
+    return generated
 
 
 def chat_loop(
@@ -269,6 +455,8 @@ def chat_loop(
     top_p: float,
     repetition_penalty: float,
     max_history_turns: int = 6,
+    top_k: int = 20,
+    system: str = SYSTEM_PROMPT_CHAT_TH,
 ) -> None:
     """Multi-turn CoT chat with styled ``<think>`` rendering."""
     history: list[dict[str, str]] = []
@@ -305,7 +493,12 @@ def chat_loop(
         if len(history) > max_msgs:
             history = history[-max_msgs:]
 
-        prompt = build_chat_prompt(tokenizer, history)
+        n_ctx = model_context_length(model)
+        max_prompt = max(n_ctx - max_new_tokens, 64)
+        prompt_ids = build_chat_input_ids(
+            tokenizer, history, system=system, max_length=max_prompt
+        )
+        prompt = ""
         try:
             reply, tok_s, ms_tok, n_new = generate_reply(
                 model,
@@ -315,7 +508,9 @@ def chat_loop(
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                top_k=top_k,
                 repetition_penalty=repetition_penalty,
+                prompt_token_ids=prompt_ids,
             )
         except KeyboardInterrupt:
             print("\n  (ยกเลิกการสร้างข้อความ)")
@@ -351,6 +546,41 @@ def build_argparser() -> argparse.ArgumentParser:
         "--repetition-penalty", type=float, default=DEFAULT_REPETITION_PENALTY
     )
     p.add_argument("--max-history-turns", type=int, default=6)
+    p.add_argument("--top-k", type=int, default=20)
+    p.add_argument(
+        "--greedy",
+        action="store_true",
+        help="Greedy decode (temperature=0) — cleaner if FFF is undertrained",
+    )
+    p.add_argument(
+        "--routing",
+        type=str,
+        default="triton",
+        choices=("triton", "hard", "soft", "sum"),
+        help=(
+            "FFF path: triton/hard = 1 leaf; soft = mixture; "
+            "sum = reconstruct original dense SwiGLU (sanity check)"
+        ),
+    )
+    p.add_argument(
+        "--smart-init",
+        action="store_true",
+        help=(
+            "Ignore trained FFF weights; keep Qwen MLP slices. "
+            "Use when distill checkpoint babbles (typical after max_length=64)."
+        ),
+    )
+    p.add_argument(
+        "--cot",
+        action="store_true",
+        help="Use the long CoT <think> system prompt (can make 2B ramble)",
+    )
+    p.add_argument(
+        "--max-context-length",
+        type=int,
+        default=CONTEXT_LENGTH_256K,
+        help="Override context window (default 262144 = 256K)",
+    )
     p.add_argument("--fp32", action="store_true")
     p.add_argument(
         "--force-hard",
@@ -381,21 +611,45 @@ def main() -> None:
     print(f"Triton available: {is_triton_available()}")
 
     ckpt_path = Path(args.checkpoint)
-    routing = "hard" if args.force_hard else "triton"
+    routing = "hard" if args.force_hard else str(args.routing)
+    smart_init = bool(args.smart_init)
+    if smart_init and not args.force_hard and args.routing == "triton":
+        routing = "sum"
+        print("  --smart-init: default routing=sum (original SwiGLU reconstruction)")
     student, ckpt = load_student_from_checkpoint(
         ckpt_path,
         device,
         dtype,
         model_name=args.model_name,
-        routing_mode=routing,
+        routing_mode="hard" if routing == "sum" else routing,
+        smart_init_only=smart_init,
+        noise_std=0.0 if smart_init else 1e-3,
     )
+    if routing == "sum":
+        set_fff_routing_mode(student, "sum")
+    if hasattr(student, "config"):
+        student.config.use_cache = True
     model_name = args.model_name or str(ckpt.get("model_name", DEFAULT_MODEL))
     routing_mode = next(iter_fff_swiglu_blocks(student)).routing_mode
+    step = ckpt.get("step")
+    train_cfg = ckpt.get("config") or {}
+    train_len = train_cfg.get("max_length")
+    print(f"checkpoint: {ckpt_path}  step={step}  model={model_name}")
+    if train_len is not None:
+        print(f"  trained max_length={train_len}")
+    if not smart_init:
+        print(
+            "  note: this distill used short ChatML windows — Triton often babbles.\n"
+            "  To chat with original Qwen quality:  python chat_fff_agent.py --smart-init"
+        )
 
     AutoTokenizer = _require_transformers()
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    n_ctx = int(ckpt.get("max_context_length", args.max_context_length))
+    apply_context_length(student, tokenizer, n_ctx=n_ctx)
+    print(f"context_length={model_context_length(student):,}")
 
     print("Dummy forward warmup ...")
     warmup_fff_swiglu(student, device)
@@ -412,10 +666,12 @@ def main() -> None:
         tokenizer,
         device,
         max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
+        temperature=0.0 if args.greedy else args.temperature,
         top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
         max_history_turns=args.max_history_turns,
+        top_k=args.top_k,
+        system=SYSTEM_PROMPT_COT_TH if args.cot else SYSTEM_PROMPT_CHAT_TH,
     )
 
 
