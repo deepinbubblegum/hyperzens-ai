@@ -264,7 +264,12 @@ def build_argparser() -> argparse.ArgumentParser:
         default=str(DEFAULT_CHECKPOINT),
         help="Path to fff_distill_checkpoint.pt",
     )
-    p.add_argument("--device", type=str, default="cuda", help="cuda (preferred) | auto | cpu")
+    p.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="auto (cuda>mps>cpu) | cuda | mps | cpu",
+    )
     p.add_argument("--tau", type=float, default=0.10, help="Soft-router τ buffer (unused in hard)")
     p.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
@@ -293,17 +298,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_argparser().parse_args()
-    try:
-        device = resolve_device(args.device)
-    except RuntimeError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        # Prefer CUDA for Triton; fall back gracefully.
-        if args.device.lower() == "cuda":
-            print("Falling back to auto device detection ...", file=sys.stderr)
-            device = resolve_device("auto")
-        else:
-            raise SystemExit(1) from exc
-
+    device = resolve_device(args.device)
     apply_hardware_optimizations(device)
     print_device_info(device)
 

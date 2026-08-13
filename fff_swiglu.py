@@ -980,7 +980,12 @@ def build_argparser() -> argparse.ArgumentParser:
         default=DEFAULT_MODELS[0],
         help=f"HF model id (default: {DEFAULT_MODELS[0]})",
     )
-    p.add_argument("--device", type=str, default="auto")
+    p.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="auto (cuda>mps>cpu) | cuda | mps | cpu",
+    )
     p.add_argument("--fff-depth", type=int, default=4)
     p.add_argument(
         "--routing",

@@ -890,7 +890,12 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Path to fff_cot_agent.pt",
     )
     p.add_argument("--model-name", type=str, default=None)
-    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="auto (cuda>mps>cpu) | cuda | mps | cpu",
+    )
     p.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     p.add_argument("--top-p", type=float, default=DEFAULT_TOP_P)
@@ -1035,16 +1040,7 @@ def main() -> None:
     if args.tiny_smoke:
         _run_tiny_agent_smoke(args)
         return
-    try:
-        device = resolve_device(args.device)
-    except RuntimeError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        if args.device.lower() == "cuda":
-            print("Falling back to auto device ...", file=sys.stderr)
-            device = resolve_device("auto")
-        else:
-            raise SystemExit(1) from exc
-
+    device = resolve_device(args.device)
     apply_hardware_optimizations(device)
     dtype = resolve_compute_dtype(device, use_bf16=not args.fp32)
     if dtype == torch.float32 and device.type == "cuda" and not args.fp32:

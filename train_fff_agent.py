@@ -746,7 +746,7 @@ class UltimateConfig:
     save_every: int = 500
     seed: int = 42
     max_samples_per_domain: int = 8_000
-    device: str = "cuda"
+    device: str = "auto"
     checkpoint: str = CHECKPOINT_NAME
     use_bf16: bool = True
     teacher_4bit: bool = True
@@ -796,7 +796,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-samples-per-domain", type=int, default=d.max_samples_per_domain
     )
-    p.add_argument("--device", type=str, default=d.device)
+    p.add_argument(
+        "--device",
+        type=str,
+        default=d.device,
+        help="auto (cuda>mps>cpu) | cuda | mps | cpu",
+    )
     p.add_argument("--checkpoint", type=str, default=d.checkpoint)
     p.add_argument("--fp32", action="store_true")
     p.add_argument("--no-4bit", action="store_true")

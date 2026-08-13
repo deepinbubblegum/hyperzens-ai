@@ -443,7 +443,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--eval-interval", type=int, default=d.eval_interval)
     p.add_argument("--eval-batches", type=int, default=d.eval_batches)
     p.add_argument("--seed", type=int, default=d.seed)
-    p.add_argument("--device", type=str, default=d.device)
+    p.add_argument(
+        "--device",
+        type=str,
+        default=d.device,
+        help="auto (cuda>mps>cpu) | cuda | mps | cpu",
+    )
     p.add_argument("--num-workers", type=int, default=d.num_workers)
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=d.compile_model)
     p.add_argument(

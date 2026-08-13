@@ -794,7 +794,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--save-every", type=int, default=d.save_every)
     p.add_argument("--seed", type=int, default=d.seed)
     p.add_argument("--max-train-chars", type=int, default=d.max_train_chars)
-    p.add_argument("--device", type=str, default=d.device)
+    p.add_argument(
+        "--device",
+        type=str,
+        default=d.device,
+        help="auto (cuda>mps>cpu) | cuda | mps | cpu",
+    )
     p.add_argument("--checkpoint", type=str, default=d.checkpoint)
     return p
 

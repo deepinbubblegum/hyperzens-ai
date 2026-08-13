@@ -338,7 +338,12 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Path to fff_distill_checkpoint.pt",
     )
     p.add_argument("--model-name", type=str, default=None, help="Override HF teacher id")
-    p.add_argument("--device", type=str, default="auto")
+    p.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="auto (cuda>mps>cpu) | cuda | mps | cpu",
+    )
     p.add_argument("--block-size", type=int, default=128)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--max-eval-batches", type=int, default=100)

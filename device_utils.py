@@ -1,15 +1,31 @@
 """Cross-platform device helpers for CUDA / MPS / CPU.
 
-Used by ``train.py``, ``infer.py``, and ``benchmark.py``.
+Used by training, inference, chat, and ``benchmark.py``.
+
+Resolution order for ``auto``: CUDA (Linux NVIDIA) → Apple MPS → CPU.
+Requesting ``cuda`` or ``mps`` when that backend is missing logs a warning
+and falls back instead of raising.
 """
 
 from __future__ import annotations
 
+import warnings
 from contextlib import contextmanager, nullcontext
 from typing import Iterator
 
 import torch
 from torch import Tensor
+
+
+def mps_is_available() -> bool:
+    """True when Apple Metal Performance Shaders can run tensors."""
+    mps = getattr(torch.backends, "mps", None)
+    if mps is None:
+        return False
+    try:
+        return bool(mps.is_available())
+    except Exception:  # noqa: BLE001 — some CPU-only wheels omit MPS fully
+        return False
 
 
 def get_device() -> torch.device:
@@ -19,26 +35,50 @@ def get_device() -> torch.device:
     """
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
+    if mps_is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
 
+def _warn_device_fallback(requested: str, chosen: torch.device) -> None:
+    """Print a visible CLI warning when the requested accelerator is missing."""
+    extra = " (Apple Silicon MPS)" if chosen.type == "mps" else ""
+    msg = (
+        f"{requested.upper()} requested but is not available on this machine; "
+        f"falling back to {chosen.type}{extra}."
+    )
+    warnings.warn(msg, UserWarning, stacklevel=3)
+    print(f"warning: {msg}", flush=True)
+
+
 def resolve_device(requested: str | None = "auto") -> torch.device:
-    """Resolve a CLI device string (``auto`` / ``cuda`` / ``mps`` / ``cpu``)."""
+    """Resolve a CLI device string (``auto`` / ``cuda`` / ``mps`` / ``cpu``).
+
+    ``auto``
+        CUDA if present, else MPS on Apple Silicon, else CPU.
+    ``cuda``
+        Use CUDA when available; otherwise warn and fall back to MPS or CPU.
+        Does **not** raise ``RuntimeError`` on macOS / CPU-only machines.
+    ``mps``
+        Use MPS when available; otherwise warn and fall back to CUDA or CPU.
+    ``cpu``
+        Always CPU.
+    """
     req = (requested or "auto").lower().strip()
     if req in {"", "auto"}:
         return get_device()
     if req == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA requested but torch.cuda.is_available() is False")
-        return torch.device("cuda")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        chosen = torch.device("mps") if mps_is_available() else torch.device("cpu")
+        _warn_device_fallback("cuda", chosen)
+        return chosen
     if req == "mps":
-        if not torch.backends.mps.is_available():
-            raise RuntimeError(
-                "MPS requested but torch.backends.mps.is_available() is False"
-            )
-        return torch.device("mps")
+        if mps_is_available():
+            return torch.device("mps")
+        chosen = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        _warn_device_fallback("mps", chosen)
+        return chosen
     if req == "cpu":
         return torch.device("cpu")
     raise ValueError(f"Unknown device {requested!r}; use auto|cuda|mps|cpu")
@@ -88,7 +128,7 @@ def amp_enabled(device: torch.device) -> bool:
 
 def mps_autocast_supported() -> bool:
     """Return True if ``torch.amp.autocast('mps')`` is usable on this build."""
-    if not torch.backends.mps.is_available():
+    if not mps_is_available():
         return False
     try:
         with torch.amp.autocast("mps"):
