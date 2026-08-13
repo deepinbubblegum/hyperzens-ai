@@ -23,8 +23,9 @@ plus ``input_ids`` / ``attention_mask`` so Phase 2 never reloads the teacher.
 --------------------
 Qwen3.6-35B is a multimodal MoE checkpoint (~18GB in 4-bit). bitsandbytes
 NF4 + Accelerate ``device_map="auto"`` with
-``max_memory={0: "10GiB", "cpu": "48GiB"}`` keeps ~2GB VRAM headroom and
-offloads the remaining ~8–12GB of 4-bit weights to system RAM.
+``max_memory={0: "6GiB", "cpu": "48GiB"}`` keeps ~6GB of 4-bit weights on the
+RTX 3060 and leaves ~5.6GB VRAM free for activations and CUDA allocator
+overhead. Remaining 4-bit layers offload to system RAM.
 Default micro-batch is 1 at ``T=2048`` (raise to 2 if VRAM allows).
 
 Example
@@ -38,6 +39,7 @@ Example
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import random
 import sys
@@ -92,7 +94,7 @@ DEFAULT_KL_TOPK: int = 50
 DEFAULT_MAX_LENGTH: int = 2048
 DEFAULT_MAX_SAMPLES: int = 8_000
 DEFAULT_BATCH_SIZE: int = 1
-DEFAULT_GPU_MAX_MEMORY: str = "10GiB"
+DEFAULT_GPU_MAX_MEMORY: str = "6GiB"
 DEFAULT_CPU_MAX_MEMORY: str = "48GiB"
 
 # Friendly CLI names → actual HuggingFace repo (Qwen3.6 has no *-Instruct repo).
@@ -229,10 +231,11 @@ def load_extract_teacher(
     ``BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=bfloat16)``
     plus Accelerate ``device_map='auto'`` and::
 
-        max_memory = {0: "10GiB", "cpu": "48GiB"}
+        max_memory = {0: "6GiB", "cpu": "48GiB"}
 
-    so RTX 3060 12GB keeps ~2GB VRAM headroom; leftover ~8–12GB of 4-bit
-    35B weights go to system RAM (PCIe offload during the forward).
+    so RTX 3060 12GB keeps ~6GB of 4-bit weights on GPU and ~5.6GB VRAM
+    free for activations / CUDA caching allocator. Remaining 35B 4-bit
+    layers offload to system RAM (PCIe during the forward).
 
     MPS / CPU path
     --------------
@@ -287,6 +290,9 @@ def load_extract_teacher(
         f"Loading 4-bit teacher `{model_name}` with device_map='auto' "
         f"max_memory={max_memory} (bnb_4bit_compute_dtype=bfloat16) ..."
     )
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     teacher = load_hf_causal_lm(
         model_name,
         quantization_config=bnb_cfg,
@@ -390,7 +396,7 @@ def extract_topk_for_ids(
     """Teacher forward over ``(N, T)`` ids → compact Top-K tensors on CPU.
 
     Uses a small micro-batch (default 1 at T=2048) so a 4-bit 35B teacher with CPU
-    offload stays under the 10GiB VRAM cap. On CUDA OOM the batch size is
+    offload stays under the 6GiB weight cap. On CUDA OOM the batch size is
     halved automatically down to 1.
 
     Parameters
@@ -520,7 +526,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--gpu-max-memory",
         type=str,
         default=DEFAULT_GPU_MAX_MEMORY,
-        help="Accelerate GPU cap for device_map=auto (default 10GiB on RTX 3060)",
+        help="Accelerate GPU cap for device_map=auto (default 6GiB on RTX 3060)",
     )
     p.add_argument(
         "--cpu-max-memory",
@@ -626,7 +632,7 @@ def main() -> None:
     if teacher_4bit:
         print(
             f"max_memory GPU={args.gpu_max_memory} CPU={args.cpu_max_memory} "
-            "(device_map=auto, ~10GiB VRAM + ~8–12GiB 4-bit weights on CPU)"
+            "(device_map=auto, ~6GiB weights on GPU, ~5.6GiB free for activations)"
         )
     print(f"output_dir={cache_dir}")
     n_dom = max(len(domains), 1)

@@ -11,6 +11,7 @@ temperature annealing, and checkpoint restore.
 
 from __future__ import annotations
 
+import gc
 import math
 import sys
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -195,6 +196,9 @@ def load_hf_causal_lm(
 
 def _from_pretrained_prefer_sdpa(loader: Any, model_name: str, kwargs: dict[str, Any]) -> Any:
     """``from_pretrained`` with SDPA, then retry without if the loader rejects it."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     try:
         return loader.from_pretrained(model_name, **kwargs)
     except (TypeError, ValueError):
@@ -202,6 +206,9 @@ def _from_pretrained_prefer_sdpa(loader: Any, model_name: str, kwargs: dict[str,
             raise
         print("  SDPA attn_implementation rejected; retrying default attention ...")
         fallback = {k: v for k, v in kwargs.items() if k != "attn_implementation"}
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return loader.from_pretrained(model_name, **fallback)
 
 
