@@ -62,8 +62,14 @@ DEFAULT_MODEL = "Qwen/Qwen3.5-2B"
 
 DEFAULT_TEMPERATURE = 0.6
 DEFAULT_TOP_P = 0.95
-DEFAULT_REPETITION_PENALTY = 1.2
-DEFAULT_MAX_NEW_TOKENS = 300
+DEFAULT_REPETITION_PENALTY = 1.15
+DEFAULT_MAX_NEW_TOKENS = 128
+
+SYSTEM_PROMPT_CHAT_TH = (
+    "คุณเป็นผู้ช่วยที่เป็นมิตร พูดภาษาไทยสุภาพ ชัดเจน "
+    "ถ้าผู้ใช้ทักทาย ให้ทักทายกลับสั้นๆ แล้วถามว่าให้ช่วยอะไรได้ "
+    "อย่าเขียนเรียงความ อย่าพูดถึงข้อจำกัดของ AI เอง ถ้าไม่ได้ถูกถาม"
+)
 
 SYSTEM_PROMPT_COT_TH = (
     "คุณเป็นผู้ช่วย AI ที่คิดทีละขั้นอย่างมีเหตุผล "
@@ -124,7 +130,7 @@ def build_chat_prompt(
     tokenizer: Any,
     history: list[dict[str, str]],
     *,
-    system: str = SYSTEM_PROMPT_COT_TH,
+    system: str = SYSTEM_PROMPT_CHAT_TH,
 ) -> str:
     """Render multi-turn history with ChatML + assistant generation prompt."""
     messages: list[dict[str, str]] = [{"role": "system", "content": system}]
@@ -361,6 +367,7 @@ def chat_loop(
     repetition_penalty: float,
     max_history_turns: int = 6,
     top_k: int = 20,
+    system: str = SYSTEM_PROMPT_CHAT_TH,
 ) -> None:
     """Multi-turn CoT chat with styled ``<think>`` rendering."""
     history: list[dict[str, str]] = []
@@ -397,7 +404,7 @@ def chat_loop(
         if len(history) > max_msgs:
             history = history[-max_msgs:]
 
-        prompt = build_chat_prompt(tokenizer, history)
+        prompt = build_chat_prompt(tokenizer, history, system=system)
         try:
             reply, tok_s, ms_tok, n_new = generate_reply(
                 model,
@@ -469,6 +476,11 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--cot",
+        action="store_true",
+        help="Use the long CoT <think> system prompt (can make 2B ramble)",
+    )
+    p.add_argument(
         "--max-context-length",
         type=int,
         default=CONTEXT_LENGTH_256K,
@@ -516,6 +528,7 @@ def main() -> None:
         model_name=args.model_name,
         routing_mode="hard" if routing == "sum" else routing,
         smart_init_only=smart_init,
+        noise_std=0.0 if smart_init else 1e-3,
     )
     if routing == "sum":
         set_fff_routing_mode(student, "sum")
@@ -563,6 +576,7 @@ def main() -> None:
         repetition_penalty=args.repetition_penalty,
         max_history_turns=args.max_history_turns,
         top_k=args.top_k,
+        system=SYSTEM_PROMPT_COT_TH if args.cot else SYSTEM_PROMPT_CHAT_TH,
     )
 
 

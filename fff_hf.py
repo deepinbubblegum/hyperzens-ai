@@ -490,6 +490,7 @@ def load_student_from_checkpoint(
     default_model: str = "Qwen/Qwen3.5-2B",
     max_context_length: int = CONTEXT_LENGTH_256K,
     smart_init_only: bool = False,
+    noise_std: float = 1e-3,
 ) -> tuple[Any, dict[str, Any]]:
     """Scaffold HF CausalLM → inject FFF SwiGLU → load ``student_state_dict``.
 
@@ -513,7 +514,7 @@ def load_student_from_checkpoint(
     print(f"  context_length={model_context_length(student):,}")
     print(f"Injecting FFF SwiGLU (depth={fff_depth}) ...")
     n = patch_model_with_fff_swiglu(
-        student, fff_depth=fff_depth, init_temp=init_tau
+        student, fff_depth=fff_depth, init_temp=init_tau, noise_std=noise_std
     )
     if smart_init_only:
         print(
