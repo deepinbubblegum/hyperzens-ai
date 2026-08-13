@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pre-compute teacher Top-K logits for offline FFF distillation (Phase 1).
 
-Loads **only** the teacher (default ``Qwen/Qwen2.5-32B-Instruct``), tokenizes
+Loads **only** the teacher (default ``Qwen/Qwen2.5-14B-Instruct``), tokenizes
 the multi-domain ChatML mixture (CoT / Agent / Code / Thai / English) at
 ``max_length=2048``, and writes compressed ``.pt`` shards::
 
@@ -18,30 +18,25 @@ Each shard stores, per token:
 
 plus ``input_ids`` / ``attention_mask`` so Phase 2 never reloads the teacher.
 
-32B on RTX 3060 12GB (CPU offload)
-----------------------------------
-Qwen2.5-32B-Instruct is a standard CausalLM (~18GB in 4-bit NF4). bitsandbytes
-+ Accelerate ``device_map="auto"`` with
-``max_memory={0: "6GiB", "cpu": "48GiB"}`` keeps ~6GB of 4-bit weights on the
-RTX 3060 and leaves ~5.6GB VRAM free for activations and CUDA allocator
-overhead. Remaining 4-bit layers offload to system RAM via
-``offload_folder="offload_cache"``.
-``bnb_4bit_use_double_quant=False`` avoids bitsandbytes ``nested_offset.item()``
-on Accelerate meta-device tensors during CPU offload.
-Loading uses ``AutoModelForCausalLM.from_pretrained`` only with
-``low_cpu_mem_usage=True``. Default micro-batch is 1 at ``T=2048``.
-
-14B high-speed (full GPU)
--------------------------
+14B on RTX 3060 12GB (full GPU, default)
+---------------------------------------
 ``Qwen/Qwen2.5-14B-Instruct`` 4-bit NF4 is ~8.5GB and fits entirely on the
-RTX 3060 12GB. Use ``device_map="cuda:0"`` with **no** ``max_memory`` CPU
-offload for maximum extraction speed.
+RTX 3060 12GB. Load with ``device_map={"": 0}`` (whole model on ``cuda:0``).
+bitsandbytes 4-bit is **incompatible** with Accelerate CPU-offload hooks
+(``Cannot copy out of meta tensor``), so 14B never uses ``max_memory`` or
+``offload_folder``. ``gc.collect()`` + ``torch.cuda.empty_cache()`` run
+immediately before ``from_pretrained``. Default micro-batch is 1 at ``T=2048``.
+
+32B (optional, CPU offload — fragile)
+-------------------------------------
+``Qwen/Qwen2.5-32B-Instruct`` still needs CPU offload on 12GB and may hit
+the bitsandbytes/Accelerate meta-tensor bug. Prefer the 14B default.
 
 Example
 -------
     python extract_teacher_logits.py --device cuda
-    python extract_teacher_logits.py --teacher_name Qwen/Qwen2.5-32B-Instruct
     python extract_teacher_logits.py --teacher_name Qwen/Qwen2.5-14B-Instruct
+    python extract_teacher_logits.py --teacher_name Qwen/Qwen2.5-32B-Instruct
     python extract_teacher_logits.py --kl-topk 50 --max-length 2048 --batch-size 1
     python extract_teacher_logits.py --smoke-test --smoke-synthetic-data
 """
@@ -95,8 +90,8 @@ from train_fff_agent import (
     messages_to_chatml,
 )
 
-DEFAULT_TEACHER: str = "Qwen/Qwen2.5-32B-Instruct"
-FAST_TEACHER: str = "Qwen/Qwen2.5-14B-Instruct"
+DEFAULT_TEACHER: str = "Qwen/Qwen2.5-14B-Instruct"
+LARGE_TEACHER: str = "Qwen/Qwen2.5-32B-Instruct"
 # Optional Qwen3.6 Hub id (image-text; not the Phase-1 default).
 HUB_TEACHER_35B: str = "Qwen/Qwen3.6-35B-A3B"
 DEFAULT_KL_TOPK: int = 50
@@ -107,12 +102,16 @@ DEFAULT_GPU_MAX_MEMORY: str = "6GiB"
 DEFAULT_CPU_MAX_MEMORY: str = "48GiB"
 DEFAULT_OFFLOAD_FOLDER: str = "offload_cache"
 
-# Friendly CLI names → actual HuggingFace repo (Qwen3.6 has no *-Instruct repo).
+# Friendly CLI names → actual HuggingFace repo.
 _TEACHER_HUB_ALIASES: dict[str, str] = {
-    "qwen/qwen2.5-14b-instruct": FAST_TEACHER,
-    "qwen/qwen2.5-14b": FAST_TEACHER,
-    "qwen2.5-14b-instruct": FAST_TEACHER,
-    "qwen2.5-14b": FAST_TEACHER,
+    "qwen/qwen2.5-14b-instruct": DEFAULT_TEACHER,
+    "qwen/qwen2.5-14b": DEFAULT_TEACHER,
+    "qwen2.5-14b-instruct": DEFAULT_TEACHER,
+    "qwen2.5-14b": DEFAULT_TEACHER,
+    "qwen/qwen2.5-32b-instruct": LARGE_TEACHER,
+    "qwen/qwen2.5-32b": LARGE_TEACHER,
+    "qwen2.5-32b-instruct": LARGE_TEACHER,
+    "qwen2.5-32b": LARGE_TEACHER,
     "qwen/qwen3.6-35b-instruct": HUB_TEACHER_35B,
     "qwen/qwen3.6-35b": HUB_TEACHER_35B,
     "qwen/qwen3.6-35b-a3b-instruct": HUB_TEACHER_35B,
@@ -124,8 +123,8 @@ _TEACHER_HUB_ALIASES: dict[str, str] = {
 def resolve_teacher_hub_id(name: str) -> str:
     """Map ``--teacher_name`` aliases to a loadable HuggingFace repo id.
 
-    Default teacher is ``Qwen/Qwen2.5-32B-Instruct`` (plain CausalLM).
-    ``Qwen/Qwen2.5-14B-Instruct`` (and short aliases) is the full-GPU fast path.
+    Default teacher is ``Qwen/Qwen2.5-14B-Instruct`` (4-bit, full GPU).
+    ``Qwen/Qwen2.5-32B-Instruct`` aliases map to the optional 32B checkpoint.
     Qwen3.6 ``*-Instruct`` aliases still map to ``Qwen/Qwen3.6-35B-A3B``.
     """
     raw = str(name).strip()
@@ -158,7 +157,7 @@ def _require_tokenizer() -> Any:
 
 
 def load_teacher_tokenizer(hub_id: str) -> Any:
-    """Load tokenizer for a CausalLM teacher (Qwen2.5-32B-Instruct by default).
+    """Load tokenizer for a CausalLM teacher (Qwen2.5-14B-Instruct by default).
 
     Uses ``AutoTokenizer`` first. Falls back to ``AutoProcessor.tokenizer``
     only if the checkpoint has no standalone tokenizer.
@@ -296,35 +295,30 @@ def load_extract_teacher(
 ) -> Any:
     """Load the extract teacher with 4-bit NF4 on CUDA.
 
-    32B CUDA (CPU offload)
-    ----------------------
-    ``BitsAndBytesConfig(..., bnb_4bit_use_double_quant=False)`` plus
-    Accelerate ``device_map='auto'`` and::
-
-        max_memory = {0: "6GiB", "cpu": "48GiB"}
-
-    Double-quant is **off** so bitsandbytes never calls ``nested_offset.item()``
-    on Accelerate meta-device tensors during CPU offload.
-    Disk spill uses ``offload_folder="offload_cache"``.
-
-    14B CUDA (full GPU)
-    -------------------
+    14B CUDA (full GPU, default)
+    ----------------------------
     ``Qwen/Qwen2.5-14B-Instruct`` 4-bit (~8.5 GiB) fits on RTX 3060 12GB.
-    Load with ``device_map="cuda:0"`` and no ``max_memory`` CPU offload.
+    Load with ``device_map={"": 0}`` so the whole model sits on GPU 0.
+    Do **not** pass ``max_memory`` or ``offload_folder`` — bitsandbytes 4-bit
+    cannot run under Accelerate CPU-offload hooks (meta-tensor copy errors).
+
+    32B CUDA (optional CPU offload)
+    -------------------------------
+    Larger teachers still use ``device_map='auto'`` + ``max_memory``; this
+    path is known-fragile with bitsandbytes.
 
     MPS / CPU path
     --------------
-    Dense ``bfloat16`` / ``float16`` (4-bit NF4 is CUDA-only). A 14B/32B dense
-    teacher will not fit on a laptop — use CUDA for Phase 1 extraction.
+    Dense ``bfloat16`` / ``float16`` (4-bit NF4 is CUDA-only).
     """
     if not use_4bit or device.type != "cuda" or not torch.cuda.is_available():
         print(
             f"Loading dense teacher `{model_name}` ({compute_dtype}) "
-            f"on {device} (no 4-bit CPU-offload path)."
+            f"on {device} (no 4-bit path)."
         )
         if any(tag in model_name.lower() for tag in ("14b", "32b", "35b")) and device.type != "cuda":
             print(
-                "warning: Qwen2.5 14B/32B extraction is intended for CUDA "
+                "warning: Qwen2.5 14B extraction is intended for CUDA "
                 "(RTX 3060 12GB). Dense weights will likely OOM here."
             )
         teacher = _from_pretrained_causal_lm(
@@ -349,6 +343,9 @@ def load_extract_teacher(
             "  pip install bitsandbytes"
         ) from extra
 
+    gc.collect()
+    torch.cuda.empty_cache()
+
     gpu_index = int(device.index) if device.index is not None else 0
     full_gpu = is_full_gpu_4bit_teacher(model_name)
     bnb_cfg = BitsAndBytesConfig(
@@ -364,10 +361,10 @@ def load_extract_teacher(
     }
 
     if full_gpu:
-        device_map = f"cuda:{gpu_index}"
+        device_map: Any = {"": gpu_index}
         print(
-            f"Loading 4-bit teacher `{model_name}` fully on {device_map} "
-            "(~8.5GiB NF4, no CPU offload, bnb_4bit_use_double_quant=False) ..."
+            f"Loading 4-bit teacher `{model_name}` on device_map={{'': {gpu_index}}} "
+            "(~8.5GiB NF4, no CPU offload / no max_memory / no offload_folder) ..."
         )
         teacher = _from_pretrained_causal_lm(
             model_name,
@@ -379,6 +376,10 @@ def load_extract_teacher(
         print(f"  hf_device_map: {summarize_device_map(teacher)}")
         return teacher
 
+    print(
+        "warning: bitsandbytes 4-bit + Accelerate CPU offload is known to fail "
+        "with meta-tensor copy errors. Prefer Qwen/Qwen2.5-14B-Instruct."
+    )
     max_memory: dict[Any, str] = {
         gpu_index: str(gpu_max_memory),
         "cpu": str(cpu_max_memory),
@@ -491,8 +492,8 @@ def extract_topk_for_ids(
 ) -> tuple[Tensor, Tensor]:
     """Teacher forward over ``(N, T)`` ids → compact Top-K tensors on CPU.
 
-    Uses a small micro-batch (default 1 at T=2048) so a 4-bit 32B teacher with CPU
-    offload stays under the 6GiB weight cap. On CUDA OOM the batch size is
+    Uses a small micro-batch (default 1 at T=2048) so a 4-bit 14B teacher
+    stays within RTX 3060 12GB VRAM. On CUDA OOM the batch size is
     halved automatically down to 1.
 
     Parameters
@@ -583,7 +584,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Pre-compute teacher Top-K logits for offline distillation "
-            "(32B 4-bit CPU offload, or 14B full-GPU)"
+            "(14B 4-bit on cuda:0; optional 32B CPU offload)"
         )
     )
     p.add_argument(
@@ -593,8 +594,8 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default=DEFAULT_TEACHER,
         help=(
-            "Teacher HF id (default: Qwen/Qwen2.5-32B-Instruct; "
-            "fast: Qwen/Qwen2.5-14B-Instruct)"
+            "Teacher HF id (default: Qwen/Qwen2.5-14B-Instruct; "
+            "optional: Qwen/Qwen2.5-32B-Instruct)"
         ),
     )
     p.add_argument(
@@ -711,7 +712,7 @@ def main() -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 72)
-    print("Extract teacher Top-K logits — Phase 1 (4-bit CausalLM)")
+    print("Extract teacher Top-K logits — Phase 1 (14B 4-bit on GPU 0)")
     print("=" * 72)
     print_device_info(device)
 
@@ -728,7 +729,7 @@ def main() -> None:
     )
     if teacher_4bit and full_gpu:
         print(
-            "device_map=cuda:0 (14B 4-bit ~8.5GiB fits RTX 3060; no CPU offload)"
+            'device_map={"": 0} (14B 4-bit ~8.5GiB on RTX 3060; no CPU offload)'
         )
     elif teacher_4bit:
         print(
@@ -765,7 +766,7 @@ def main() -> None:
         compute_dtype=compute_dtype,
         gpu_max_memory=str(args.gpu_max_memory),
         cpu_max_memory=str(args.cpu_max_memory),
-        offload_folder=DEFAULT_OFFLOAD_FOLDER,
+        offload_folder=None if full_gpu else DEFAULT_OFFLOAD_FOLDER,
     )
     enable_model_sdpa(teacher)
     teacher.eval()
@@ -829,7 +830,7 @@ def main() -> None:
                 "teacher_4bit": bool(teacher_4bit),
                 "teacher_requested": requested_teacher,
                 "device_map": (
-                    "cuda:0" if full_gpu else ("auto" if teacher_4bit else "none")
+                    {"": 0} if full_gpu else ("auto" if teacher_4bit else "none")
                 ),
                 "gpu_max_memory": str(args.gpu_max_memory) if teacher_4bit and not full_gpu else None,
                 "cpu_max_memory": str(args.cpu_max_memory) if teacher_4bit and not full_gpu else None,
