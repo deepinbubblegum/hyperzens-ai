@@ -461,6 +461,14 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--smart-init",
+        action="store_true",
+        help=(
+            "Ignore trained FFF weights; keep Qwen MLP slices. "
+            "Use when distill checkpoint babbles (typical after max_length=64)."
+        ),
+    )
+    p.add_argument(
         "--max-context-length",
         type=int,
         default=CONTEXT_LENGTH_256K,
@@ -497,12 +505,17 @@ def main() -> None:
 
     ckpt_path = Path(args.checkpoint)
     routing = "hard" if args.force_hard else str(args.routing)
+    smart_init = bool(args.smart_init)
+    if smart_init and not args.force_hard and args.routing == "triton":
+        routing = "sum"
+        print("  --smart-init: default routing=sum (original SwiGLU reconstruction)")
     student, ckpt = load_student_from_checkpoint(
         ckpt_path,
         device,
         dtype,
         model_name=args.model_name,
         routing_mode="hard" if routing == "sum" else routing,
+        smart_init_only=smart_init,
     )
     if routing == "sum":
         set_fff_routing_mode(student, "sum")
@@ -511,11 +524,15 @@ def main() -> None:
     model_name = args.model_name or str(ckpt.get("model_name", DEFAULT_MODEL))
     routing_mode = next(iter_fff_swiglu_blocks(student)).routing_mode
     step = ckpt.get("step")
+    train_cfg = ckpt.get("config") or {}
+    train_len = train_cfg.get("max_length")
     print(f"checkpoint: {ckpt_path}  step={step}  model={model_name}")
-    if step is None or int(step) < 500:
+    if train_len is not None:
+        print(f"  trained max_length={train_len}")
+    if not smart_init:
         print(
-            "  warning: FFF looks undertrained — hard/triton will babble. "
-            "Try: python chat_fff_agent.py --routing sum --greedy"
+            "  note: this distill used short ChatML windows — Triton often babbles.\n"
+            "  To chat with original Qwen quality:  python chat_fff_agent.py --smart-init"
         )
 
     AutoTokenizer = _require_transformers()

@@ -489,8 +489,14 @@ def load_student_from_checkpoint(
     routing_mode: str = "triton",
     default_model: str = "Qwen/Qwen3.5-2B",
     max_context_length: int = CONTEXT_LENGTH_256K,
+    smart_init_only: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
-    """Scaffold HF CausalLM → inject FFF SwiGLU → load ``student_state_dict``."""
+    """Scaffold HF CausalLM → inject FFF SwiGLU → load ``student_state_dict``.
+
+    ``smart_init_only=True`` keeps the dense-MLP slice init and **does not**
+    load trained FFF weights. Use when a short-context distill checkpoint
+    has collapsed language modeling.
+    """
     if not ckpt_path.exists():
         raise SystemExit(f"checkpoint not found: {ckpt_path}")
 
@@ -509,13 +515,19 @@ def load_student_from_checkpoint(
     n = patch_model_with_fff_swiglu(
         student, fff_depth=fff_depth, init_temp=init_tau
     )
-    missing, unexpected = student.load_state_dict(
-        ckpt["student_state_dict"], strict=False
-    )
-    if missing:
-        print(f"  warning: missing keys ({len(missing)}): {missing[:5]} ...")
-    if unexpected:
-        print(f"  warning: unexpected keys ({len(unexpected)}): {unexpected[:5]} ...")
+    if smart_init_only:
+        print(
+            "  smart_init_only=ON — skipping trained FFF weights "
+            "(uses original Qwen MLP slices)"
+        )
+    else:
+        missing, unexpected = student.load_state_dict(
+            ckpt["student_state_dict"], strict=False
+        )
+        if missing:
+            print(f"  warning: missing keys ({len(missing)}): {missing[:5]} ...")
+        if unexpected:
+            print(f"  warning: unexpected keys ({len(unexpected)}): {unexpected[:5]} ...")
 
     if dtype != torch.float32:
         print(f"Casting student → {dtype} ...")
