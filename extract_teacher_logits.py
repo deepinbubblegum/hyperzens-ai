@@ -24,8 +24,11 @@ plus ``input_ids`` / ``attention_mask`` so Phase 2 never reloads the teacher.
 RTX 3060 12GB. Load with ``device_map={"": 0}`` (whole model on ``cuda:0``).
 bitsandbytes 4-bit is **incompatible** with Accelerate CPU-offload hooks
 (``Cannot copy out of meta tensor``), so 14B never uses ``max_memory`` or
-``offload_folder``. ``gc.collect()`` + ``torch.cuda.empty_cache()`` run
-immediately before ``from_pretrained``. Default micro-batch is 1 at ``T=2048``.
+``offload_folder``. Sequences are **left-truncated** to ``--max_length``
+(default 2048) with **no global padding**. Each domain is sorted by length
+and micro-batched (default 4, auto up to 8) with padding only to that
+batch's max length (``pad_to_multiple_of=8``). ``attention_mask`` is passed
+to the teacher so SDPA ignores pads.
 
 32B (optional, CPU offload — fragile)
 -------------------------------------
@@ -37,7 +40,7 @@ Example
     python extract_teacher_logits.py --device cuda
     python extract_teacher_logits.py --teacher_name Qwen/Qwen2.5-14B-Instruct
     python extract_teacher_logits.py --teacher_name Qwen/Qwen2.5-32B-Instruct
-    python extract_teacher_logits.py --kl-topk 50 --max-length 2048 --batch-size 1
+    python extract_teacher_logits.py --kl-topk 50 --max-length 2048 --batch-size 4
     python extract_teacher_logits.py --smoke-test --smoke-synthetic-data
 """
 
@@ -97,7 +100,9 @@ HUB_TEACHER_35B: str = "Qwen/Qwen3.6-35B-A3B"
 DEFAULT_KL_TOPK: int = 50
 DEFAULT_MAX_LENGTH: int = 2048
 DEFAULT_MAX_SAMPLES: int = 8_000
-DEFAULT_BATCH_SIZE: int = 1
+DEFAULT_BATCH_SIZE: int = 4
+DEFAULT_MAX_BATCH_SIZE: int = 8
+PAD_TO_MULTIPLE: int = 8
 DEFAULT_GPU_MAX_MEMORY: str = "6GiB"
 DEFAULT_CPU_MAX_MEMORY: str = "48GiB"
 DEFAULT_OFFLOAD_FOLDER: str = "offload_cache"
@@ -182,6 +187,10 @@ def load_teacher_tokenizer(hub_id: str) -> Any:
         eos = getattr(tokenizer, "eos_token", None)
         if eos is not None:
             tokenizer.pad_token = eos
+    if getattr(tokenizer, "padding_side", None) is not None:
+        tokenizer.padding_side = "right"
+    if getattr(tokenizer, "truncation_side", None) is not None:
+        tokenizer.truncation_side = "left"
     return tokenizer
 
 
@@ -413,28 +422,154 @@ def tokenize_domain(
     max_length: int,
     pad_id: int,
     default_system: str = DEFAULT_SYSTEM,
-) -> tuple[Tensor, Tensor]:
-    """Encode ChatML rows to right-padded ``(N, T)`` int32 ids + uint8 mask.
+) -> list[list[int]]:
+    """Encode ChatML rows **without** padding; left-truncate to ``max_length``.
 
-    Left-truncates long traces so the assistant tail is kept
-    (same contract as ``MultiDomainChatMixture``).
+    Uses ``truncation=True, max_length=..., padding=False``. Empty encodings
+    are dropped. Returned sequences are variable-length (not stacked).
+
+    ``pad_id`` is unused here (collate pads later); kept for call-site stability.
     """
+    del pad_id
     max_length = max(int(max_length), 1)
-    rows: list[Tensor] = []
-    for msgs in messages_list:
-        text = messages_to_chatml(msgs, default_system=default_system)
-        ids = encode_truncate_left(tokenizer, text, max_length=max_length)
-        if not ids:
-            continue
-        row = torch.full((max_length,), int(pad_id), dtype=torch.int32)
-        n = min(len(ids), max_length)
-        row[:n] = torch.tensor(ids[:n], dtype=torch.int32)
-        rows.append(row)
-    if not rows:
+    texts = [
+        messages_to_chatml(msgs, default_system=default_system)
+        for msgs in messages_list
+    ]
+    prev_side = getattr(tokenizer, "truncation_side", "right")
+    seqs: list[list[int]] = []
+    try:
+        tokenizer.truncation_side = "left"
+        try:
+            enc = tokenizer(
+                texts,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max_length,
+                padding=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            seqs = [list(ids) for ids in enc["input_ids"] if ids]
+        except TypeError:
+            for text in texts:
+                ids = encode_truncate_left(tokenizer, text, max_length=max_length)
+                if ids:
+                    seqs.append(ids)
+    finally:
+        try:
+            tokenizer.truncation_side = prev_side
+        except Exception:
+            pass
+    if not seqs:
         raise ValueError("domain produced zero tokenized samples")
-    input_ids = torch.stack(rows, dim=0)
-    attention_mask = (input_ids != int(pad_id)).to(dtype=torch.uint8)
+    return seqs
+
+
+def sort_sequences_by_length(
+    sequences: list[list[int]],
+    *,
+    descending: bool = True,
+) -> list[list[int]]:
+    """Sort tokenized rows by ``len(input_ids)`` so batches share similar T."""
+    return sorted(sequences, key=len, reverse=bool(descending))
+
+
+def _ceil_to_multiple(length: int, multiple: int, cap: int) -> int:
+    """Round ``length`` up to ``multiple``, then clamp to ``[1, cap]``."""
+    length = max(int(length), 1)
+    cap = max(int(cap), 1)
+    multiple = max(int(multiple), 1)
+    padded = ((length + multiple - 1) // multiple) * multiple
+    return min(max(padded, 1), cap)
+
+
+def collate_dynamic_batch(
+    sequences: list[list[int]],
+    *,
+    pad_id: int,
+    max_length: int,
+    pad_multiple: int = PAD_TO_MULTIPLE,
+) -> tuple[Tensor, Tensor]:
+    """Right-pad a micro-batch to its own max length (``pad_to_multiple_of``).
+
+    Returns
+    -------
+    input_ids:
+        ``(B, T_batch)`` int64, ``T_batch = min(cap, ceil(max_len / multiple) * multiple)``.
+    attention_mask:
+        ``(B, T_batch)`` int64 0/1 for SDPA (padded positions are 0).
+    """
+    if not sequences:
+        raise ValueError("cannot collate an empty batch")
+    raw_max = max(len(s) for s in sequences)
+    seq_len = _ceil_to_multiple(raw_max, pad_multiple, max_length)
+    batch = len(sequences)
+    input_ids = torch.full((batch, seq_len), int(pad_id), dtype=torch.long)
+    attention_mask = torch.zeros((batch, seq_len), dtype=torch.long)
+    for i, ids in enumerate(sequences):
+        n = min(len(ids), seq_len)
+        if n <= 0:
+            continue
+        input_ids[i, :n] = torch.tensor(ids[:n], dtype=torch.long)
+        attention_mask[i, :n] = 1
     return input_ids, attention_mask
+
+
+def _plan_micro_batch(
+    sequences: list[list[int]],
+    start: int,
+    *,
+    max_batch: int,
+    token_budget: int,
+    max_length: int,
+    pad_multiple: int,
+) -> int:
+    """Grow a batch while ``T_pad * B <= token_budget`` (and ``B <= max_batch``)."""
+    n_seq = len(sequences)
+    if start >= n_seq:
+        return 0
+    max_batch = max(int(max_batch), 1)
+    token_budget = max(int(token_budget), 1)
+    batch_max = len(sequences[start])
+    size = 1
+    while start + size < n_seq and size < max_batch:
+        nxt = len(sequences[start + size])
+        pad_t = _ceil_to_multiple(max(batch_max, nxt), pad_multiple, max_length)
+        if pad_t * (size + 1) > token_budget:
+            break
+        batch_max = max(batch_max, nxt)
+        size += 1
+    return size
+
+
+def _right_pad_seq_dim(tensor: Tensor, target_t: int, *, fill: int | float) -> Tensor:
+    """Right-pad dim 1 of ``(B, T, ...)`` to ``target_t``."""
+    cur = int(tensor.size(1))
+    target_t = max(int(target_t), 1)
+    if cur == target_t:
+        return tensor
+    if cur > target_t:
+        return tensor[:, :target_t, ...].contiguous()
+    shape = list(tensor.shape)
+    shape[1] = target_t
+    out = tensor.new_full(tuple(shape), fill)
+    out[:, :cur, ...] = tensor
+    return out
+
+
+def length_stats(sequences: list[list[int]]) -> str:
+    """Compact min / median / mean / max length string for logs."""
+    lengths = sorted(len(s) for s in sequences)
+    n = len(lengths)
+    if n == 0:
+        return "n=0"
+    mean = sum(lengths) / n
+    mid = lengths[n // 2]
+    return (
+        f"n={n:,} len[min={lengths[0]} median={mid} mean={mean:.0f} "
+        f"max={lengths[-1]}]"
+    )
 
 
 def _is_oom(exc: BaseException) -> bool:
@@ -481,46 +616,54 @@ def _forward_topk_batch(
 @torch.no_grad()
 def extract_topk_for_ids(
     teacher: Any,
-    input_ids: Tensor,
-    attention_mask: Tensor,
+    sequences: list[list[int]],
     *,
+    pad_id: int,
     device: torch.device,
     kl_topk: int,
     batch_size: int,
+    max_batch_size: int,
+    max_length: int,
     value_dtype: torch.dtype,
     vocab_limit: int | None = None,
-) -> tuple[Tensor, Tensor]:
-    """Teacher forward over ``(N, T)`` ids → compact Top-K tensors on CPU.
+    pad_multiple: int = PAD_TO_MULTIPLE,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Teacher forward over variable-length rows with dynamic micro-batch padding.
 
-    Uses a small micro-batch (default 1 at T=2048) so a 4-bit 14B teacher
-    stays within RTX 3060 12GB VRAM. On CUDA OOM the batch size is
-    halved automatically down to 1.
+    Sequences must already be **sorted by length**. Each GPU micro-batch is
+    padded only to that batch's max length (rounded up to ``pad_multiple``),
+    never to a global ``T=2048``. ``attention_mask`` is passed into
+    ``teacher()`` so SDPA ignores pads. Results are right-padded to
+    ``max_length`` on CPU so Phase 2 still sees rectangular ``(N, T, K)``.
 
-    Parameters
-    ----------
-    input_ids:
-        ``(N, T)`` int token ids (CPU or device).
-    attention_mask:
-        ``(N, T)`` 0/1 mask.
-    kl_topk:
-        ``K`` in Top-K over the teacher vocab axis.
-    value_dtype:
-        Storage dtype for logit values (``float16`` or ``bfloat16``).
+    Micro-batch size starts from ``batch_size`` (default 4) and auto-grows
+    up to ``max_batch_size`` (default 8) while ``T_pad * B`` stays under a
+    token budget of ``batch_size * max_length``. CUDA OOM halves the budget.
 
     Returns
     -------
+    input_ids:
+        ``(N, T)`` int32 on CPU, ``T = max_length``.
+    attention_mask:
+        ``(N, T)`` uint8 on CPU.
     topk_indices:
         ``(N, T, K)`` int32 on CPU.
     topk_values:
         ``(N, T, K)`` ``value_dtype`` on CPU.
     """
-    n_samples = int(input_ids.size(0))
-    seq_len = int(input_ids.size(1))
+    n_samples = len(sequences)
+    if n_samples == 0:
+        raise ValueError("no sequences to extract")
+    cache_t = max(int(max_length), 1)
     k = max(int(kl_topk), 1)
-    micro = max(int(batch_size), 1)
+    max_bs = max(int(max_batch_size), 1)
+    token_budget = max(int(batch_size), 1) * cache_t
     v_limit = vocab_limit
     input_dev = teacher_input_device(teacher, device)
+    pad_multiple = max(int(pad_multiple), 1)
 
+    id_chunks: list[Tensor] = []
+    mask_chunks: list[Tensor] = []
     idx_chunks: list[Tensor] = []
     val_chunks: list[Tensor] = []
 
@@ -533,13 +676,29 @@ def extract_topk_for_ids(
     )
     start = 0
     while start < n_samples:
+        micro = _plan_micro_batch(
+            sequences,
+            start,
+            max_batch=max_bs,
+            token_budget=token_budget,
+            max_length=cache_t,
+            pad_multiple=pad_multiple,
+        )
         end = min(start + micro, n_samples)
-        ids = input_ids[start:end].to(device=input_dev, dtype=torch.long)
-        mask = attention_mask[start:end].to(device=input_dev, dtype=torch.long)
+        batch_seqs = sequences[start:end]
+        ids_cpu, mask_cpu = collate_dynamic_batch(
+            batch_seqs,
+            pad_id=pad_id,
+            max_length=cache_t,
+            pad_multiple=pad_multiple,
+        )
+        ids = ids_cpu.to(device=input_dev, dtype=torch.long)
+        mask = mask_cpu.to(device=input_dev, dtype=torch.long)
+        gpu_t = int(ids.size(1))
         if v_limit is not None:
             ids = ids.clamp(0, int(v_limit) - 1)
         try:
-            idx_cpu, val_cpu = _forward_topk_batch(
+            idx_b, val_b = _forward_topk_batch(
                 teacher,
                 ids,
                 mask,
@@ -549,35 +708,54 @@ def extract_topk_for_ids(
                 value_dtype=value_dtype,
             )
         except Exception as exc:
-            del ids, mask
+            del ids, mask, ids_cpu, mask_cpu
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+            gc.collect()
             if _is_oom(exc) and micro > 1:
-                micro = max(micro // 2, 1)
+                pad_t = _ceil_to_multiple(
+                    max(len(s) for s in batch_seqs), pad_multiple, cache_t
+                )
+                token_budget = max(pad_t * max(micro // 2, 1), pad_t)
                 print(
-                    f"  OOM at batch_size>{micro}; retrying with micro-batch={micro}"
+                    f"  OOM at B={micro} T={pad_t}; retrying with "
+                    f"token_budget={token_budget}"
                 )
                 continue
             raise
         del ids, mask
+        idx_cpu = _right_pad_seq_dim(idx_b, cache_t, fill=0)
+        val_cpu = _right_pad_seq_dim(val_b, cache_t, fill=0)
+        ids_out = _right_pad_seq_dim(ids_cpu, cache_t, fill=int(pad_id)).to(
+            dtype=torch.int32
+        )
+        mask_out = _right_pad_seq_dim(mask_cpu, cache_t, fill=0).to(dtype=torch.uint8)
+        del idx_b, val_b, ids_cpu, mask_cpu
+        id_chunks.append(ids_out)
+        mask_chunks.append(mask_out)
         idx_chunks.append(idx_cpu)
         val_chunks.append(val_cpu)
-        del idx_cpu, val_cpu
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        del ids_out, mask_out, idx_cpu, val_cpu
         pbar.update(end - start)
-        pbar.set_postfix_str(f"{end}/{n_samples} bs={micro}", refresh=False)
+        pbar.set_postfix_str(
+            f"{end}/{n_samples} B={micro} T={gpu_t} budget={token_budget}",
+            refresh=False,
+        )
         start = end
     pbar.close()
 
+    input_ids = torch.cat(id_chunks, dim=0)
+    attention_mask = torch.cat(mask_chunks, dim=0)
     topk_indices = torch.cat(idx_chunks, dim=0)
     topk_values = torch.cat(val_chunks, dim=0)
-    if tuple(topk_indices.shape) != (n_samples, seq_len, int(topk_indices.size(-1))):
+    del id_chunks, mask_chunks, idx_chunks, val_chunks
+    expected_nt = (n_samples, cache_t)
+    if tuple(topk_indices.shape[:2]) != expected_nt:
         raise RuntimeError(
             f"unexpected topk_indices shape {tuple(topk_indices.shape)} "
-            f"(expected {(n_samples, seq_len, 'K')})"
+            f"(expected {expected_nt + ('K',)})"
         )
-    return topk_indices, topk_values
+    return input_ids, attention_mask, topk_indices, topk_values
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -610,14 +788,25 @@ def build_argparser() -> argparse.ArgumentParser:
         dest="max_length",
         type=int,
         default=DEFAULT_MAX_LENGTH,
-        help="Sequence length T (default 2048)",
+        help="Cap / left-truncate length T (default 2048); GPU batches pad dynamically below this",
     )
     p.add_argument("--max-samples-per-domain", type=int, default=DEFAULT_MAX_SAMPLES)
     p.add_argument(
         "--batch-size",
+        "--micro-batch-size",
+        "--micro_batch_size",
+        dest="batch_size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
-        help="Teacher micro-batch (default 1 at T=2048; try 2 if VRAM allows)",
+        help="Teacher micro-batch (default 4; auto-grows with short sequences)",
+    )
+    p.add_argument(
+        "--max-batch-size",
+        "--max_batch_size",
+        dest="max_batch_size",
+        type=int,
+        default=DEFAULT_MAX_BATCH_SIZE,
+        help="Upper bound for auto-tuned micro-batch (default 8)",
     )
     p.add_argument(
         "--gpu-max-memory",
@@ -724,8 +913,9 @@ def main() -> None:
         f"dtype={compute_dtype} | store_values={value_dtype}"
     )
     print(
-        f"K={int(args.kl_topk)} | T={int(args.max_length)} | "
-        f"samples/domain={max_samples} | micro-batch={int(args.batch_size)}"
+        f"K={int(args.kl_topk)} | T_cap={int(args.max_length)} | "
+        f"samples/domain={max_samples} | micro-batch={int(args.batch_size)} "
+        f"(max {int(args.max_batch_size)}, dynamic pad x{PAD_TO_MULTIPLE})"
     )
     if teacher_4bit and full_gpu:
         print(
@@ -792,28 +982,29 @@ def main() -> None:
             max_samples=max_samples,
             smoke_synthetic=bool(args.smoke_synthetic_data),
         )
-        input_ids, attention_mask = tokenize_domain(
+        sequences = tokenize_domain(
             messages_list,
             tokenizer,
             max_length=int(args.max_length),
             pad_id=pad_id,
         )
-        n_tok = int(attention_mask.sum().item())
-        print(
-            f"[{domain}] tokenized N={int(input_ids.size(0)):,} "
-            f"T={int(input_ids.size(1))} non-pad tokens={n_tok:,}"
-        )
+        sequences = sort_sequences_by_length(sequences, descending=True)
+        n_tok = sum(len(s) for s in sequences)
+        print(f"[{domain}] tokenized {length_stats(sequences)} tokens={n_tok:,}")
 
-        topk_indices, topk_values = extract_topk_for_ids(
+        input_ids, attention_mask, topk_indices, topk_values = extract_topk_for_ids(
             teacher,
-            input_ids,
-            attention_mask,
+            sequences,
+            pad_id=pad_id,
             device=device,
             kl_topk=int(args.kl_topk),
             batch_size=int(args.batch_size),
+            max_batch_size=int(args.max_batch_size),
+            max_length=int(args.max_length),
             value_dtype=value_dtype,
             vocab_limit=vocab_t,
         )
+        del sequences
         save_teacher_logits_cache(
             dest,
             domain=domain,
@@ -837,6 +1028,10 @@ def main() -> None:
                 "bnb_4bit_use_double_quant": False,
                 "offload_folder": None if full_gpu else DEFAULT_OFFLOAD_FOLDER,
                 "n_non_pad": n_tok,
+                "dynamic_padding": True,
+                "pad_multiple": PAD_TO_MULTIPLE,
+                "batch_size": int(args.batch_size),
+                "max_batch_size": int(args.max_batch_size),
             },
         )
         size = dest.stat().st_size
