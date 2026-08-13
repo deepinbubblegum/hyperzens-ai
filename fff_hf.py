@@ -160,19 +160,52 @@ def load_hf_causal_lm(
 
 @contextmanager
 def bf16_autocast(device: torch.device) -> Iterator[None]:
-    """CUDA autocast in bfloat16 (Ampere+); no-op elsewhere."""
+    """Mixed-precision autocast: CUDA BF16, MPS BF16/FP16, otherwise no-op."""
     if device.type == "cuda":
-        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        dtype = (
+            torch.bfloat16
+            if torch.cuda.is_bf16_supported()
+            else torch.float16
+        )
+        with torch.amp.autocast(device_type="cuda", dtype=dtype):
             yield
         return
+    if device.type == "mps":
+        try:
+            with torch.amp.autocast(device_type="mps", dtype=_mps_half_dtype()):
+                yield
+            return
+        except Exception:
+            pass
     with nullcontext():
         yield
 
 
-def resolve_compute_dtype(device: torch.device, *, use_bf16: bool) -> torch.dtype:
-    """Pick parameter dtype: BF16 on CUDA when supported, else FP32."""
-    if use_bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported():
+def _mps_half_dtype() -> torch.dtype:
+    """Prefer bfloat16 on Apple Silicon; fall back to float16 if unsupported."""
+    try:
+        x = torch.zeros(2, device="mps", dtype=torch.bfloat16)
+        _ = x * x
         return torch.bfloat16
+    except Exception:  # noqa: BLE001 — older MPS builds reject bf16
+        return torch.float16
+
+
+def resolve_compute_dtype(device: torch.device, *, use_bf16: bool) -> torch.dtype:
+    """Pick parameter dtype: BF16/FP16 on GPU accelerators, else FP32.
+
+    * CUDA: ``bfloat16`` when the GPU supports it, else ``float16``.
+    * MPS (Mac M-series): ``bfloat16`` when the runtime accepts it, else ``float16``.
+    * CPU / ``use_bf16=False``: ``float32``.
+    """
+    if not use_bf16:
+        return torch.float32
+    if device.type == "cuda":
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+    if device.type == "mps":
+        return _mps_half_dtype()
     return torch.float32
 
 
@@ -275,19 +308,25 @@ def build_student_optimizer(
 
 
 def load_4bit_teacher(model_name: str, device: torch.device) -> Any:
-    """Load CausalLM teacher in bitsandbytes 4-bit (BF16 compute)."""
+    """Load CausalLM teacher in bitsandbytes 4-bit (BF16 compute).
+
+    4-bit NF4 requires CUDA. On MPS/CPU this falls back to a dense
+    ``bfloat16`` / ``float16`` teacher instead of raising.
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        dtype = resolve_compute_dtype(device, use_bf16=True)
+        print(
+            "CUDA not available for 4-bit NF4; loading dense teacher in "
+            f"{dtype}."
+        )
+        return load_dense_teacher(model_name, device, dtype=dtype)
+
     try:
         from transformers import BitsAndBytesConfig
     except ImportError as exc:
         raise SystemExit(
             "BitsAndBytesConfig missing — upgrade transformers"
         ) from exc
-
-    if device.type != "cuda":
-        raise SystemExit(
-            "4-bit teacher requires CUDA. Use --device cuda "
-            "(or pass --no-4bit with a smaller dense teacher)."
-        )
 
     try:
         import bitsandbytes  # noqa: F401
@@ -318,14 +357,19 @@ def load_4bit_teacher(model_name: str, device: torch.device) -> Any:
     return teacher
 
 
-def load_dense_teacher(model_name: str, device: torch.device) -> Any:
-    """FP32 dense teacher (caller may cast dtype)."""
-    print(f"Loading dense teacher `{model_name}` (float32) ...")
-    teacher = load_hf_causal_lm(model_name, dtype=torch.float32)
+def load_dense_teacher(
+    model_name: str,
+    device: torch.device,
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> Any:
+    """Dense teacher in ``dtype`` (BF16/FP16 on Mac MPS, FP32 otherwise)."""
+    print(f"Loading dense teacher `{model_name}` ({dtype}) ...")
+    teacher = load_hf_causal_lm(model_name, dtype=dtype)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
-    return teacher.to(device)
+    return teacher.to(device=device, dtype=dtype)
 
 
 def build_fff_student(

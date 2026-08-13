@@ -20,7 +20,7 @@ Larger pair: ``--teacher-name Qwen/Qwen3.5-9B --student-name Qwen/Qwen3.5-4B``.
 
 Data mixture (20% each)
 -----------------------
-1. **CoT reasoning** — Thai/English trajectories with ``<think>...</think>``
+1. **CoT reasoning** — ``RJTPP/medical-o1-reasoning-SFT-TH`` (8,000 samples, 20%)
 2. **Agent / tool use** — Hermes function-calling (``<tools>`` / ``<tool_call>``)
 3. **Coding** — ``flytech/python-codes-25k``
 4. **Thai conversation** — WangchanThaiInstruct
@@ -61,6 +61,7 @@ import argparse
 import math
 import os
 import random
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -132,7 +133,6 @@ DEFAULT_SYSTEM = (
 # Primary + fallback HF dataset ids per domain (20% mixture each).
 DOMAIN_DATASETS: dict[str, tuple[str, ...]] = {
     DOMAIN_COT: (
-        "FreedomIntelligence/phoenix-sft-thai-cot",
         "RJTPP/medical-o1-reasoning-SFT-TH",
         "FreedomIntelligence/medical-o1-reasoning-SFT",
         "Jnx03/kanitakorn-th-sft-v3",
@@ -874,6 +874,22 @@ def main() -> None:
     random.seed(cfg.seed)
     device = resolve_device(cfg.device)
     apply_hardware_optimizations(device)
+
+    # bitsandbytes 4-bit NF4 is CUDA-only. On macOS MPS / CPU, drop to native half.
+    if cfg.teacher_4bit and not torch.cuda.is_available():
+        cfg.teacher_4bit = False
+        host = "macOS detected" if sys.platform == "darwin" else "no NVIDIA GPU"
+        print(
+            f"CUDA not available ({host}). Auto-disabling 4-bit teacher "
+            "quantization and falling back to native bfloat16/float16."
+        )
+    if cfg.adam_8bit and not torch.cuda.is_available():
+        cfg.adam_8bit = False
+        print(
+            "CUDA not available. Auto-disabling 8-bit AdamW "
+            "(using full-precision AdamW)."
+        )
+
     compute_dtype = resolve_compute_dtype(device, use_bf16=cfg.use_bf16)
 
     n_leaves = 1 << cfg.fff_depth
@@ -938,9 +954,9 @@ def main() -> None:
     if cfg.teacher_4bit:
         teacher = load_4bit_teacher(cfg.teacher_name, device)
     else:
-        teacher = load_dense_teacher(cfg.teacher_name, device)
-        if compute_dtype != torch.float32:
-            teacher = teacher.to(dtype=compute_dtype)
+        teacher = load_dense_teacher(
+            cfg.teacher_name, device, dtype=compute_dtype
+        )
 
     student = build_fff_student(
         cfg.student_name,
