@@ -419,7 +419,7 @@ def load_student_from_checkpoint(
     *,
     model_name: str | None = None,
     routing_mode: str = "triton",
-    default_model: str = "Qwen/Qwen3.5-4B",
+    default_model: str = "Qwen/Qwen3.5-2B",
     max_context_length: int = CONTEXT_LENGTH_256K,
 ) -> tuple[Any, dict[str, Any]]:
     """Scaffold HF CausalLM → inject FFF SwiGLU → load ``student_state_dict``."""

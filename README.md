@@ -230,7 +230,7 @@ hyperzens-ai/
 ├── chat_fff_gpt2.py          # GPT-2 FFF interactive chat
 ├── fff_swiglu.py             # Modern LLM FFF (SwiGLU / GeGLU)
 ├── fff_hf.py                 # Shared HF / distill helpers
-├── train_fff_agent.py        # Qwen3.5-4B FFF agent distill → fff_cot_agent.pt
+├── train_fff_agent.py        # Qwen3.5-2B FFF agent distill → fff_cot_agent.pt
 ├── chat_fff_agent.py         # Agent CoT chat (Triton Hard)
 ├── train.py / infer.py       # TinyShakespeare char-LM
 ├── benchmark.py
@@ -288,12 +288,12 @@ python chat_fff_gpt2.py --checkpoint fff_distill_checkpoint.pt --device cuda
 **B) Multi-skill FFF agent (Thai / code / tools / CoT)**
 
 ```bash
-# Default: teacher Qwen3.5-9B (4-bit) + student Qwen3.5-4B (≈12GB VRAM)
+# Default: teacher Qwen3.5-4B (4-bit) + student Qwen3.5-2B (≈12GB VRAM)
 # Model context = 256K (262144); train micro-batch stays short (--max-length 64)
 python train_fff_agent.py --device cuda --max-steps 4000
 
-# ≥24GB VRAM: larger FFF student
-python train_fff_agent.py --student-name Qwen/Qwen3.5-9B --device cuda --max-steps 4000
+# Stronger pair (needs more VRAM)
+python train_fff_agent.py --teacher-name Qwen/Qwen3.5-9B --student-name Qwen/Qwen3.5-4B --device cuda --max-steps 4000
 
 python chat_fff_agent.py --checkpoint fff_cot_agent.pt --device cuda
 ```
@@ -551,7 +551,7 @@ hyperzens-ai/
 ├── eval_fff_gpt2.py          # PPL + ตัวอย่างข้อความ (GPT-2)
 ├── chat_fff_gpt2.py          # แชท GPT-2 FFF
 ├── fff_swiglu.py / fff_hf.py # ไลบรารีโมเดิร์น LLM
-├── train_fff_agent.py        # กลั่น Qwen3.5-4B agent → fff_cot_agent.pt
+├── train_fff_agent.py        # กลั่น Qwen3.5-2B agent → fff_cot_agent.pt
 ├── chat_fff_agent.py         # แชท CoT ไทย
 ├── train.py / infer.py       # TinyShakespeare
 └── benchmark.py
@@ -600,12 +600,12 @@ python chat_fff_gpt2.py --checkpoint fff_distill_checkpoint.pt --device cuda
 **B) FFF agent หลายทักษะ (ไทย / โค้ด / เครื่องมือ / CoT)**
 
 ```bash
-# ค่าเริ่มต้น: ครู Qwen3.5-9B (4-bit) + student Qwen3.5-4B (เหมาะ ~12GB)
+# ค่าเริ่มต้น: ครู Qwen3.5-4B (4-bit) + student Qwen3.5-2B (เหมาะ ~12GB)
 # Context โมเดล = 256K (262144); ตอนเทรนยังใช้ micro-batch สั้น (--max-length 64)
 python train_fff_agent.py --device cuda --max-steps 4000
 
-# VRAM ≥24GB: ใช้ student ใหญ่ขึ้น
-python train_fff_agent.py --student-name Qwen/Qwen3.5-9B --device cuda --max-steps 4000
+# คู่ใหญ่ขึ้น (ต้องมี VRAM มากขึ้น)
+python train_fff_agent.py --teacher-name Qwen/Qwen3.5-9B --student-name Qwen/Qwen3.5-4B --device cuda --max-steps 4000
 
 python chat_fff_agent.py --checkpoint fff_cot_agent.pt --device cuda
 ```

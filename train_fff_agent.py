@@ -3,19 +3,20 @@
 
 Student
 -------
-``Qwen/Qwen3.5-4B`` patched with :class:`FFFSwiGLUBlock`
+``Qwen/Qwen3.5-2B`` patched with :class:`FFFSwiGLUBlock`
 (depth=4 → 16 leaves). FP32 smart-init → BF16. STE hard-aware soft routing
-matches Triton Hard inference. Fits RTX 3060 12GB with a 4-bit 9B teacher.
+matches Triton Hard inference. Fits RTX 3060 12GB comfortably with a 4-bit
+4B teacher.
 
 Teacher
 -------
-Default ``Qwen/Qwen3.5-9B`` in bitsandbytes 4-bit
+Default ``Qwen/Qwen3.5-4B`` in bitsandbytes 4-bit
 (``bnb_4bit_compute_dtype=bfloat16``). Same-family Top-K KL (vocab aligned).
 
 VRAM note
 ---------
-Default: teacher 9B 4-bit + student 4B BF16 targets ~12GB cards.
-For more capacity use ``--student-name Qwen/Qwen3.5-9B`` (≥24GB).
+Default: teacher 4B 4-bit + student 2B BF16 targets ~12GB cards with headroom.
+Larger pair: ``--teacher-name Qwen/Qwen3.5-9B --student-name Qwen/Qwen3.5-4B``.
 
 Data mixture (20% each)
 -----------------------
@@ -48,8 +49,8 @@ Checkpoint
 Example
 -------
     python train_fff_agent.py --device cuda --max-steps 4000
-    # More capacity (≥24GB): larger FFF student
-    python train_fff_agent.py --student-name Qwen/Qwen3.5-9B --device cuda
+    # Stronger pair (needs more VRAM):
+    python train_fff_agent.py --teacher-name Qwen/Qwen3.5-9B --student-name Qwen/Qwen3.5-4B --device cuda
     python train_fff_agent.py --smoke-synthetic-data --max-steps 20
 """
 
@@ -101,10 +102,10 @@ from fff_swiglu import (
 )
 
 CHECKPOINT_NAME = "fff_cot_agent.pt"
-DEFAULT_STUDENT = "Qwen/Qwen3.5-4B"
-DEFAULT_TEACHER = "Qwen/Qwen3.5-9B"
-# Larger FFF student if VRAM ≥24GB: Qwen/Qwen3.5-9B
-# Tighter 12GB fallback: Qwen/Qwen3.5-2B
+DEFAULT_STUDENT = "Qwen/Qwen3.5-2B"
+DEFAULT_TEACHER = "Qwen/Qwen3.5-4B"
+# Stronger pairs if VRAM allows:
+#   teacher 9B + student 4B, or teacher 9B + student 9B (≥24GB)
 
 DOMAIN_COT = "cot"
 DOMAIN_AGENT = "agent"
@@ -760,7 +761,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--teacher-name",
         type=str,
         default=d.teacher_name,
-        help="4-bit teacher id (default: Qwen/Qwen3.5-9B)",
+        help="4-bit teacher id (default: Qwen/Qwen3.5-4B)",
     )
     p.add_argument("--fff-depth", type=int, default=d.fff_depth)
     p.add_argument("--init-tau", type=float, default=d.init_tau)
@@ -866,10 +867,12 @@ def main() -> None:
     print(f"config: {asdict(cfg)}")
     print(f"student_dtype={compute_dtype} | kl_topk={cfg.kl_topk}")
     print(f"target leaf entropy H_uniform=log({n_leaves})={h_uniform:.4f}")
-    if "Qwen3.5-9B" in cfg.student_name and "Qwen3.5-9B" in cfg.teacher_name:
+    if "Qwen3.5-9B" in cfg.student_name or (
+        "Qwen3.5-9B" in cfg.teacher_name and "Qwen3.5-4B" in cfg.student_name
+    ):
         print(
-            "VRAM tip: 9B teacher (4-bit) + 9B student (BF16) usually needs ≥24GB. "
-            "Default student is Qwen/Qwen3.5-4B for ~12GB cards."
+            "VRAM tip: large teacher/student pairs may need ≥16–24GB. "
+            "Default is teacher Qwen/Qwen3.5-4B + student Qwen/Qwen3.5-2B for ~12GB."
         )
     _warn_vocab_mismatch(cfg.teacher_name, cfg.student_name)
 
