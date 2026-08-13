@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
-"""Interactive CLI text generation — distilled FFF Student (Triton Hard CUDA).
+"""Interactive CLI text generation — distilled Multi-Tree CMM student.
 
-Loads ``fff_distill_checkpoint.pt``, swaps GPT-2 MLPs for :class:`FFFBlock`
-in Triton hard-routing mode, warms CUDA kernels, then opens a prompt loop.
+Loads ``fff_distill_checkpoint.pt``, rebuilds GPT-2 MLPs as Multi-Tree CMM
+(:class:`~models.fff_layer.FastFeedforwardLinear` with ``K`` trees of depth
+``d_sub``), then runs hard routing:
+
+- CUDA: Triton hard CMM (one kernel invocation per tree, then sum)
+- CPU: ``cmm_hard_forward_cpu`` when the C++ extension is available
+- Fallback: batched PyTorch hard walk
+
+``num_trees`` (``K``) and ``depth_per_tree`` (``d_sub``) are parsed from the
+checkpoint (top-level keys, nested ``config``, or ``router_weights`` shapes).
+Legacy single-tree checkpoints (``fff_depth`` only) load as ``K = 1``.
 
 Example
 -------
     python chat_fff_gpt2.py --checkpoint fff_distill_checkpoint.pt --device cuda
+    python chat_fff_gpt2.py --checkpoint fff_distill_checkpoint.pt --device cpu
 """
 
 from __future__ import annotations
@@ -41,6 +51,11 @@ from train_fff_gpt2 import (
     _require_transformers,
 )
 from models.fff_hard_triton import is_triton_available
+from models.fff_layer import (
+    cmm_hparams_from_checkpoint,
+    is_cmm_cpp_available,
+    is_fff_cpp_available,
+)
 
 DEFAULT_CHECKPOINT = Path("fff_distill_checkpoint.pt")
 
@@ -72,27 +87,28 @@ def _device_display_name(device: torch.device) -> str:
     return "CPU"
 
 
-def _fff_active_ratio_pct(student: Any) -> tuple[int, int, float]:
-    """Return ``(depth, n_leaves, hard_active/stored %)`` from the first FFF block.
+def _fff_active_ratio_pct(student: Any) -> tuple[int, int, int, float]:
+    """Return ``(num_trees, depth, leaves_per_tree, hard_active/stored %)``.
 
-    Hard routing evaluates ``depth`` routers + 1 leaf out of ``2^depth`` leaves,
-    so the leaf activation share is ``1/L`` (e.g. 6.25% at depth 4, 3.125% at
-    depth 5). The reported percentage uses stored vs hard-active param counts.
+    Hard CMM evaluates ``K · (depth`` routers ``+ 1`` leaf). The percentage
+    uses stored vs hard-active param counts from the first FFF/CMM block.
     """
     block = next(iter_fff_blocks(student), None)
     if block is None:
-        return 0, 0, 0.0
+        return 0, 0, 0, 0.0
     layer = block.fff
     stats = layer.active_params_per_token()
     stored = max(int(stats["stored_total"]), 1)
     active = int(stats["hard_active_per_token"])
     pct = 100.0 * active / stored
-    return int(layer.depth), int(layer.num_leaves), pct
+    n_trees = int(getattr(layer, "num_trees", 1))
+    return n_trees, int(layer.depth), int(layer.num_leaves), pct
 
 
 def print_welcome(
     *,
     model_name: str,
+    num_trees: int,
     fff_depth: int,
     n_leaves: int,
     active_pct: float,
@@ -101,14 +117,14 @@ def print_welcome(
     ckpt_path: Path,
     step: Any,
 ) -> None:
-    """Stylish terminal header with model / FFF / device info."""
+    """Stylish terminal header with model / CMM / device info."""
     gpu = _device_display_name(device)
-    leaf_share = 100.0 / max(n_leaves, 1)
+    n_leaves_total = max(num_trees, 1) * max(n_leaves, 1)
     width = 72
     bar = "═" * width
     print()
     print(f"╔{bar}╗")
-    title = " Hyperzens FFF — Standalone Triton Inference "
+    title = " Hyperzens CMM — Multi-Tree Hard Inference "
     pad = width - len(title)
     print(f"║{title}{' ' * pad}║")
     print(f"╠{bar}╣")
@@ -120,10 +136,11 @@ def print_welcome(
     row("Model", model_name)
     row("Checkpoint", str(ckpt_path))
     row("Train step", str(step) if step is not None else "n/a")
-    row("FFF depth", f"{fff_depth}  (leaves={n_leaves})")
+    row("CMM trees K", str(num_trees))
+    row("Depth / tree", f"{fff_depth}  (leaves/tree={n_leaves}, total={n_leaves_total})")
     row(
         "Active param ratio",
-        f"{active_pct:.3f}% hard/stored  ·  leaf share {leaf_share:.3f}% (1/{n_leaves})",
+        f"{active_pct:.3f}% hard/stored  ·  {num_trees}/{n_leaves_total} leaves",
     )
     row("Routing", routing)
     row("Device", f"{device} — {gpu}")
@@ -239,7 +256,7 @@ def print_completion(metrics: GenMetrics) -> None:
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Interactive FFF Triton inference (distilled student)"
+        description="Interactive Multi-Tree CMM inference (distilled GPT-2 student)"
     )
     p.add_argument(
         "--checkpoint",
@@ -258,6 +275,18 @@ def build_argparser() -> argparse.ArgumentParser:
         "--force-hard",
         action="store_true",
         help="Use PyTorch hard routing even if Triton is available",
+    )
+    p.add_argument(
+        "--num-trees",
+        type=int,
+        default=None,
+        help="Override checkpoint CMM forest size K",
+    )
+    p.add_argument(
+        "--depth-per-tree",
+        type=int,
+        default=None,
+        help="Override checkpoint per-tree depth d_sub",
     )
     return p
 
@@ -282,22 +311,44 @@ def main() -> None:
     if not ckpt_path.exists():
         raise SystemExit(f"checkpoint not found: {ckpt_path}")
 
-    print("\nLoading distilled FFF student ...")
+    print("\nLoading distilled FFF/CMM student ...")
     student, ckpt = load_student_from_checkpoint(ckpt_path, device)
     model_name = str(ckpt.get("model_name", "gpt2"))
-    fff_depth = int(ckpt.get("fff_depth", 4))
+    num_trees, fff_depth = cmm_hparams_from_checkpoint(ckpt)
+    print(
+        f"  CMM architecture: K={num_trees} trees, "
+        f"d_sub={fff_depth} (leaves/tree={1 << fff_depth})"
+    )
+    if args.num_trees is not None or args.depth_per_tree is not None:
+        # Rebuild if CLI overrides disagree with the loaded architecture.
+        want_k = int(args.num_trees) if args.num_trees is not None else num_trees
+        want_d = int(args.depth_per_tree) if args.depth_per_tree is not None else fff_depth
+        layer0 = next(iter_fff_blocks(student)).fff
+        if want_k != int(layer0.num_trees) or want_d != int(layer0.depth):
+            print(
+                f"  CLI override trees={want_k} depth={want_d} "
+                f"(checkpoint had K={num_trees} d={fff_depth}) — architecture "
+                "must match the checkpoint; ignoring override."
+            )
+        else:
+            num_trees, fff_depth = want_k, want_d
     set_student_temperature(student, float(args.tau))
 
-    routing = "hard (PyTorch)"
+    routing = "hard (PyTorch CMM)"
+    cpu_cmm = is_cmm_cpp_available() if num_trees > 1 else is_fff_cpp_available()
     if device.type == "cuda" and is_triton_available() and not args.force_hard:
         set_student_routing_mode(student, "triton")
-        routing = "triton (CUDA Hard)"
-        print("Routing mode: Triton CUDA Hard")
+        routing = "triton (CUDA Hard CMM)"
+        print("Routing mode: Triton CUDA Hard CMM")
         warmup_student_triton(student, device)
+    elif device.type == "cpu" and cpu_cmm and not args.force_hard:
+        set_student_routing_mode(student, "hard_cpp")
+        routing = "hard_cpp (CMM CPU)"
+        print("Routing mode: C++ Multi-Tree CMM")
     else:
         set_student_routing_mode(student, "hard")
         if device.type == "cuda" and not is_triton_available():
-            print("Triton unavailable — using PyTorch hard routing")
+            print("Triton unavailable — using PyTorch hard CMM")
         else:
             print(f"Routing mode: {routing}")
 
@@ -310,13 +361,14 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    depth, n_leaves, active_pct = _fff_active_ratio_pct(student)
+    n_trees, depth, n_leaves, active_pct = _fff_active_ratio_pct(student)
     if depth == 0:
-        depth, n_leaves = fff_depth, 1 << fff_depth
-        active_pct = 100.0 / n_leaves
+        n_trees, depth, n_leaves = num_trees, fff_depth, 1 << fff_depth
+        active_pct = 100.0 * n_trees / max(n_trees * n_leaves, 1)
 
     print_welcome(
         model_name=model_name,
+        num_trees=n_trees,
         fff_depth=depth,
         n_leaves=n_leaves,
         active_pct=active_pct,

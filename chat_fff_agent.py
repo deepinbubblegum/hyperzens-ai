@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
-"""Interactive Thai CoT chatbot for distilled FFF-SwiGLU (``fff_cot_agent.pt``).
+"""Interactive Thai CoT + tool-using agent for distilled FFF-SwiGLU.
 
-Loads the Ultimate CoT student in Triton Hard Mode and renders
-``<think>...</think>`` trajectories with dimmed terminal styling, then the
-final answer in bright text.
+Loads ``fff_cot_agent.pt`` (Triton Hard when available) and runs a
+**Hermes-style agent loop**:
 
-Generation
-----------
-``do_sample=True``, ``temperature=0.6``, ``top_p=0.95``,
-``repetition_penalty=1.2``, ``max_new_tokens=300``.
+1. Generate with KV cache.
+2. If the reply contains ``<tool_call>`` blocks, execute sandboxed local
+   tools (``agent_tools.py``) and inject a clipped ``<tool_response>``.
+3. Generate again until a final answer (or ``--max-tool-rounds``).
+4. Compact history: keep the user turn + final answer only — tool traces
+   never accumulate across turns.
+
+Renders ``<think>`` and tool rounds with dimmed terminal styling.
 
 Commands
 --------
     /clear   — reset conversation history
-    /raw     — toggle showing raw ``<think>`` tags
+    /raw     — toggle showing raw ``<think>`` / tool tags
+    /tools   — list sandboxed tools
     /exit    — quit
 
 Example
 -------
     python chat_fff_agent.py --checkpoint fff_cot_agent.pt --device cuda
+    python chat_fff_agent.py --no-tools
 """
 
 from __future__ import annotations
@@ -34,6 +39,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from agent_tools import (
+    ToolRegistry,
+    ToolResult,
+    build_system_prompt,
+    format_tool_response_message,
+    isolate_tool_phase,
+    parse_tool_calls,
+)
 from device_utils import (
     amp_autocast,
     apply_hardware_optimizations,
@@ -64,6 +77,10 @@ DEFAULT_TEMPERATURE = 0.6
 DEFAULT_TOP_P = 0.95
 DEFAULT_REPETITION_PENALTY = 1.15
 DEFAULT_MAX_NEW_TOKENS = 128
+DEFAULT_MAX_TOOL_ROUNDS = 4
+DEFAULT_MAX_PROMPT_TOKENS = 3072
+DEFAULT_MAX_STORED_THINK_CHARS = 400
+_TOOL_STOP = ("</tool_call>",)
 
 SYSTEM_PROMPT_CHAT_TH = (
     "คุณเป็นผู้ช่วยที่เป็นมิตร พูดภาษาไทยสุภาพ ชัดเจน "
@@ -76,6 +93,13 @@ SYSTEM_PROMPT_COT_TH = (
     "สำหรับคำถามที่ต้องใช้การวิเคราะห์ ให้เขียนกระบวนการคิดไว้ใน "
     "<think>...</think> ก่อน แล้วตามด้วยคำตอบสุดท้ายที่ชัดเจน "
     "พูดภาษาไทยได้อย่างเป็นธรรมชาติ และสุภาพ"
+)
+
+SYSTEM_PROMPT_AGENT_TH = (
+    "คุณเป็นผู้ช่วย AI บนเครื่องผู้ใช้ ใช้เครื่องมือท้องถิ่นเมื่อต้องอ่านไฟล์ "
+    "ดูโฟลเดอร์ ดูสถานะระบบ หรือรันคำสั่ง inspect พื้นฐาน "
+    "อย่าแต่งผลลัพธ์ของเครื่องมือเอง — เรียก <tool_call> แล้วรอ <tool_response> "
+    "ก่อนสรุปคำตอบสุดท้าย สุภาพ ชัดเจน พูดไทยได้"
 )
 
 _THINK_RE = re.compile(
@@ -122,7 +146,7 @@ def print_cot_header(
         f"  สุ่มข้อความ: T={DEFAULT_TEMPERATURE}  top_p={DEFAULT_TOP_P}  "
         f"rep={DEFAULT_REPETITION_PENALTY}  max_new={DEFAULT_MAX_NEW_TOKENS}"
     )
-    print("  คำสั่ง    : /clear  |  /raw  |  /exit")
+    print("  คำสั่ง    : /clear  |  /raw  |  /tools  |  /exit")
     print()
 
 
@@ -259,22 +283,141 @@ def split_think_answer(text: str) -> tuple[str | None, str]:
 
 
 def print_styled_reply(text: str, *, show_raw: bool) -> None:
-    """Dim thought process; bright final answer."""
+    """Dim thought process and tool traces; bright final answer."""
     if show_raw:
         print(f"\033[96mผู้ช่วย\033[0m > {text}")
         return
 
     thought, answer = split_think_answer(text)
+    tool_calls = parse_tool_calls(text)
+    if tool_calls and not answer:
+        answer = ""
     print("\033[96mผู้ช่วย\033[0m")
     if thought:
         print("  \033[2m\033[90m┌─ ความคิด (think)\033[0m")
         for line in thought.splitlines() or [thought]:
             print(f"  \033[2m\033[90m│ {line}\033[0m")
         print("  \033[2m\033[90m└─\033[0m")
-    if answer:
-        print(f"  \033[1m\033[97m{answer}\033[0m")
-    elif not thought:
+    if tool_calls:
+        print("  \033[2m\033[90m┌─ tool_call\033[0m")
+        for call in tool_calls:
+            args = ", ".join(f"{k}={v!r}" for k, v in call.arguments.items())
+            print(f"  \033[2m\033[90m│ {call.name}({args})\033[0m")
+        print("  \033[2m\033[90m└─\033[0m")
+    visible = answer
+    if tool_calls:
+        visible = _THINK_RE.sub("", visible)
+        visible = re.sub(
+            r"<tool_call>.*?</tool_call>", "", visible, flags=re.DOTALL | re.I
+        ).strip()
+    if visible:
+        print(f"  \033[1m\033[97m{visible}\033[0m")
+    elif not thought and not tool_calls:
         print(f"  \033[1m\033[97m{text.strip()}\033[0m")
+
+
+def compact_assistant_for_history(
+    text: str,
+    *,
+    max_think_chars: int = DEFAULT_MAX_STORED_THINK_CHARS,
+) -> str:
+    """Store a short think + final answer; drop tool traces from memory.
+
+    Tool payloads are re-injected only during the in-turn working buffer.
+    Persisting them would grow the ChatML window linearly with every call.
+    """
+    thought, answer = split_think_answer(text)
+    answer = re.sub(
+        r"<tool_call>.*?</tool_call>", "", answer, flags=re.DOTALL | re.I
+    ).strip()
+    answer = re.sub(
+        r"<tool_response>.*?</tool_response>", "", answer, flags=re.DOTALL | re.I
+    ).strip()
+    if thought:
+        if len(thought) > max_think_chars:
+            thought = thought[:max_think_chars] + "…"
+        return f"<think>\n{thought}\n</think>\n{answer}".strip()
+    return answer or text.strip()
+
+
+def _chatml_token_len(
+    tokenizer: Any,
+    history: list[dict[str, str]],
+    *,
+    system: str,
+) -> int:
+    """Token count of the ChatML prompt (no left-truncation)."""
+    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    messages.extend(history)
+    try:
+        raw = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+            enable_thinking=False,
+        )
+    except TypeError:
+        try:
+            raw = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                add_special_tokens=False,
+            )
+        except Exception:  # noqa: BLE001
+            raw = None
+    except Exception:  # noqa: BLE001
+        raw = None
+    ids = _as_token_id_list(raw)
+    if ids is not None:
+        return len(ids)
+    text = build_chat_prompt(tokenizer, history, system=system)
+    try:
+        return len(tokenizer.encode(text, add_special_tokens=False))
+    except Exception:  # noqa: BLE001
+        return max(len(text) // 2, 1)
+
+
+def fit_history_to_budget(
+    tokenizer: Any,
+    history: list[dict[str, str]],
+    *,
+    system: str,
+    max_tokens: int,
+) -> list[dict[str, str]]:
+    """Drop oldest turns until the ChatML prompt fits ``max_tokens``.
+
+    Always keeps the most recent user turn (and anything after it — the
+    in-flight tool traces) so the current question cannot be dropped.
+    """
+    if not history:
+        return history
+    hist = list(history)
+    max_tokens = max(int(max_tokens), 64)
+    while len(hist) > 2 and _chatml_token_len(tokenizer, hist, system=system) > max_tokens:
+        # Drop the oldest user+assistant pair when possible.
+        if hist[0]["role"] == "user" and len(hist) >= 4:
+            hist = hist[2:]
+        else:
+            hist = hist[1:]
+    return hist
+
+
+def _print_tool_round(results: list[ToolResult]) -> None:
+    """Live, dimmed tool I/O so the user sees progress without raw dumps."""
+    for r in results:
+        flag = "ok" if r.ok else "err"
+        trunc = " truncated" if r.truncated else ""
+        print(
+            f"  \033[2m\033[33m⚙ {r.name} [{flag}] "
+            f"{r.elapsed_ms:.0f} ms{trunc}\033[0m"
+        )
+        preview = r.payload.strip().splitlines()
+        for line in preview[:4]:
+            print(f"  \033[2m\033[90m  {line[:120]}\033[0m")
+        if len(preview) > 4:
+            print(f"  \033[2m\033[90m  … {len(preview) - 4} more lines\033[0m")
 
 
 @torch.no_grad()
@@ -291,8 +434,17 @@ def generate_reply(
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     no_repeat_ngram_size: int = 0,
     prompt_token_ids: list[int] | None = None,
+    stop_substrings: tuple[str, ...] = (),
 ) -> tuple[str, float, float, int]:
-    """Sample a reply with KV cache; n-gram ban applies to **new tokens only**."""
+    """Sample a reply with KV cache; n-gram ban applies to **new tokens only**.
+
+    Parameters
+    ----------
+    stop_substrings:
+        If a decoded continuation contains any of these strings (e.g.
+        ``</tool_call>``), generation stops so the model cannot hallucinate
+        a ``<tool_response>``. Empty = no extra stops.
+    """
     model.eval()
     if hasattr(model, "config"):
         model.config.use_cache = True
@@ -336,6 +488,7 @@ def generate_reply(
 
     generated = _generate_cached(
         model,
+        tokenizer,
         input_ids,
         attention_mask,
         device,
@@ -348,6 +501,7 @@ def generate_reply(
         no_repeat_ngram_size=no_repeat_ngram_size,
         vocab_cap=vocab_cap,
         eos_ids=eos_ids,
+        stop_substrings=stop_substrings,
     )
 
     if use_cuda:
@@ -369,6 +523,7 @@ def generate_reply(
 @torch.no_grad()
 def _generate_cached(
     model: Any,
+    tokenizer: Any,
     input_ids: Tensor,
     attention_mask: Tensor,
     device: torch.device,
@@ -382,14 +537,20 @@ def _generate_cached(
     no_repeat_ngram_size: int,
     vocab_cap: int,
     eos_ids: list[int] | None,
+    stop_substrings: tuple[str, ...] = (),
 ) -> Tensor:
-    """Prefill once, then decode with ``past_key_values`` (KV cache)."""
+    """Prefill once, then decode with ``past_key_values`` (KV cache).
+
+    Stops on EOS ids **or** when the decoded continuation contains a stop
+    substring (used to cut generation at ``</tool_call>``).
+    """
     prompt_len = int(input_ids.size(1))
     generated = input_ids
     attn = attention_mask
     past = None
     eos_set = set(eos_ids or [])
     use_cache = True
+    stops = tuple(s.lower() for s in stop_substrings if s)
 
     for _ in range(max_new_tokens):
         if use_cache and past is not None:
@@ -441,8 +602,175 @@ def _generate_cached(
         )
         if int(next_id.item()) in eos_set:
             break
+        if stops:
+            piece = tokenizer.decode(
+                generated[0, prompt_len:].tolist(),
+                skip_special_tokens=False,
+            ).lower()
+            if any(s in piece for s in stops):
+                break
 
     return generated
+
+
+def _prompt_budget(model: Any, max_new_tokens: int, max_prompt_tokens: int) -> int:
+    """Effective prompt cap: model window minus decode budget, then CLI cap.
+
+    The checkpoint advertises 256K but a low-resource PC cannot materialize
+    that many KV slots. ``max_prompt_tokens`` is the practical ceiling.
+    """
+    n_ctx = model_context_length(model)
+    room = max(int(n_ctx) - int(max_new_tokens), 64)
+    return max(min(room, int(max_prompt_tokens)), 64)
+
+
+def _generate_once(
+    model: Any,
+    tokenizer: Any,
+    device: torch.device,
+    working: list[dict[str, str]],
+    *,
+    system: str,
+    max_prompt: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    stop_substrings: tuple[str, ...] = (),
+) -> tuple[str, float, float, int]:
+    """Tokenize ``working`` ChatML and sample one continuation."""
+    working = fit_history_to_budget(
+        tokenizer, working, system=system, max_tokens=max_prompt
+    )
+    prompt_ids = build_chat_input_ids(
+        tokenizer, working, system=system, max_length=max_prompt
+    )
+    return generate_reply(
+        model,
+        tokenizer,
+        "",
+        device,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        prompt_token_ids=prompt_ids,
+        stop_substrings=stop_substrings,
+    )
+
+
+def run_agent_turn(
+    model: Any,
+    tokenizer: Any,
+    device: torch.device,
+    history: list[dict[str, str]],
+    user_text: str,
+    *,
+    system: str,
+    tools: ToolRegistry | None,
+    max_tool_rounds: int,
+    max_new_tokens: int,
+    max_prompt_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+) -> tuple[str, float, float, int]:
+    """One user turn: generate → optional tool loop → compact into ``history``.
+
+    In-flight tool traces live only in a working copy. After the final
+    answer, ``history`` stores ``[user, compact assistant]`` so the next
+    turn does not replay kilobytes of ``<tool_response>``.
+
+    Returns
+    -------
+    reply, tok_s, ms_tok, n_new
+        Aggregated decode stats across all generate rounds this turn.
+    """
+    max_prompt = _prompt_budget(model, max_new_tokens, max_prompt_tokens)
+    working: list[dict[str, str]] = [
+        *history,
+        {"role": "user", "content": user_text},
+    ]
+    stop = _TOOL_STOP if tools is not None else ()
+    total_new = 0
+    total_ms = 0.0
+    final_reply = ""
+    reply = ""
+
+    def _accumulate(n_new: int, ms_tok: float) -> None:
+        nonlocal total_new, total_ms
+        total_new += int(n_new)
+        total_ms += float(n_new) * float(ms_tok)
+
+    if tools is None:
+        reply, _tok_s, ms_tok, n_new = _generate_once(
+            model,
+            tokenizer,
+            device,
+            working,
+            system=system,
+            max_prompt=max_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+        )
+        _accumulate(n_new, ms_tok)
+        final_reply = reply
+    else:
+        for round_i in range(max(int(max_tool_rounds), 0) + 1):
+            allow_tools = round_i < int(max_tool_rounds)
+            reply, _tok_s, ms_tok, n_new = _generate_once(
+                model,
+                tokenizer,
+                device,
+                working,
+                system=system,
+                max_prompt=max_prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                stop_substrings=stop if allow_tools else (),
+            )
+            _accumulate(n_new, ms_tok)
+            reply = isolate_tool_phase(reply) if allow_tools else reply
+            calls = parse_tool_calls(reply) if allow_tools else []
+            if not calls:
+                final_reply = reply
+                break
+            results = tools.execute_all(calls)
+            _print_tool_round(results)
+            working.append({"role": "assistant", "content": reply})
+            working.append(
+                {
+                    "role": "user",
+                    "content": format_tool_response_message(results),
+                }
+            )
+        else:
+            final_reply = compact_assistant_for_history(reply)
+            if parse_tool_calls(reply):
+                final_reply = (
+                    final_reply
+                    or "ครบจำนวนรอบเครื่องมือแล้ว — สรุปจากข้อมูลที่มีในบทสนทนา"
+                )
+
+    history.append({"role": "user", "content": user_text})
+    history.append(
+        {
+            "role": "assistant",
+            "content": compact_assistant_for_history(final_reply),
+        }
+    )
+    avg_ms = total_ms / max(total_new, 1)
+    avg_tok_s = (total_new * 1000.0) / max(total_ms, 1e-6)
+    return final_reply, avg_tok_s, avg_ms, total_new
 
 
 def chat_loop(
@@ -457,10 +785,25 @@ def chat_loop(
     max_history_turns: int = 6,
     top_k: int = 20,
     system: str = SYSTEM_PROMPT_CHAT_TH,
+    tools: ToolRegistry | None = None,
+    max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
+    max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS,
 ) -> None:
-    """Multi-turn CoT chat with styled ``<think>`` rendering."""
+    """Multi-turn CoT chat with optional Hermes tool loop + history compaction."""
     history: list[dict[str, str]] = []
     show_raw = False
+    system = build_system_prompt(system, tools)
+    if tools is not None:
+        print(
+            f"  เครื่องมือ : {', '.join(tools.names())}  "
+            f"(workspace={tools.workspace})"
+        )
+        print(
+            f"  งบบริบท  : max_prompt={max_prompt_tokens} tok  "
+            f"max_tool_rounds={max_tool_rounds}  "
+            f"tool_clip={tools.max_output_chars} chars"
+        )
+        print()
 
     while True:
         try:
@@ -487,45 +830,54 @@ def chat_loop(
             show_raw = not show_raw
             print(f"  (แสดง raw tags = {show_raw})")
             continue
+        if cmd in {"/tools", "tools"}:
+            if tools is None:
+                print("  (เครื่องมือปิดอยู่ — รันโดยไม่ใส่ --no-tools)")
+            else:
+                print(f"  workspace: {tools.workspace}")
+                for spec in tools.specs():
+                    params = ", ".join(
+                        f"{k}: {v}" for k, v in spec.parameters.items()
+                    )
+                    print(f"  - {spec.name}({params})")
+                    print(f"      {spec.description}")
+            continue
 
-        history.append({"role": "user", "content": text})
         max_msgs = max_history_turns * 2
         if len(history) > max_msgs:
             history = history[-max_msgs:]
 
-        n_ctx = model_context_length(model)
-        max_prompt = max(n_ctx - max_new_tokens, 64)
-        prompt_ids = build_chat_input_ids(
-            tokenizer, history, system=system, max_length=max_prompt
-        )
-        prompt = ""
         try:
-            reply, tok_s, ms_tok, n_new = generate_reply(
+            reply, tok_s, ms_tok, n_new = run_agent_turn(
                 model,
                 tokenizer,
-                prompt,
                 device,
+                history,
+                text,
+                system=system,
+                tools=tools,
+                max_tool_rounds=max_tool_rounds,
                 max_new_tokens=max_new_tokens,
+                max_prompt_tokens=max_prompt_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
-                prompt_token_ids=prompt_ids,
             )
         except KeyboardInterrupt:
             print("\n  (ยกเลิกการสร้างข้อความ)")
-            history.pop()
             continue
         except Exception as exc:  # noqa: BLE001
             print(f"  ข้อผิดพลาด: {exc}")
-            history.pop()
             continue
 
-        history.append({"role": "assistant", "content": reply})
+        if len(history) > max_msgs:
+            history = history[-max_msgs:]
+
         print_styled_reply(reply, show_raw=show_raw)
         print(
             f"  \033[90m[{n_new} tokens · {tok_s:.1f} tok/s · "
-            f"{ms_tok:.1f} ms/token]\033[0m"
+            f"{ms_tok:.1f} ms/token · hist={len(history)//2} turns]\033[0m"
         )
 
 
@@ -547,6 +899,38 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--max-history-turns", type=int, default=6)
     p.add_argument("--top-k", type=int, default=20)
+    p.add_argument(
+        "--no-tools",
+        action="store_true",
+        help="Disable the local tool loop (plain chat)",
+    )
+    p.add_argument(
+        "--max-tool-rounds",
+        type=int,
+        default=DEFAULT_MAX_TOOL_ROUNDS,
+        help="Max tool-call rounds per user turn (default 4)",
+    )
+    p.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        default=DEFAULT_MAX_PROMPT_TOKENS,
+        help=(
+            "Practical ChatML prompt cap (default 3072). "
+            "Does not allocate the advertised 256K window."
+        ),
+    )
+    p.add_argument(
+        "--workspace",
+        type=str,
+        default=".",
+        help="Sandbox root for read_file / list_dir / run_shell",
+    )
+    p.add_argument(
+        "--tool-output-chars",
+        type=int,
+        default=2400,
+        help="Clip each tool payload to this many characters",
+    )
     p.add_argument(
         "--greedy",
         action="store_true",
@@ -581,6 +965,20 @@ def build_argparser() -> argparse.ArgumentParser:
         default=CONTEXT_LENGTH_256K,
         help="Override context window (default 262144 = 256K)",
     )
+    p.add_argument(
+        "--tiny-smoke",
+        action="store_true",
+        help=(
+            "Skip checkpoint / HF weights; run one generate via a tiny CMM "
+            "stand-in (verifies the agent loop after FFF layer changes)"
+        ),
+    )
+    p.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="One-shot user message then exit (skip the interactive loop)",
+    )
     p.add_argument("--fp32", action="store_true")
     p.add_argument(
         "--force-hard",
@@ -590,8 +988,53 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 
+def _run_tiny_agent_smoke(args: argparse.Namespace) -> None:
+    """One-shot ``run_agent_turn`` on a tiny CMM stand-in (no HF checkpoint).
+
+    Verifies the agent generate / history path after Multi-Tree CMM layer
+    changes. Does not alter :func:`run_agent_turn` itself.
+    """
+    from sanity_cmm import TinyCmmCausalLM, TinyTokenizer
+
+    device = torch.device("cpu")
+    model = TinyCmmCausalLM()
+    model.eval()
+    tokenizer = TinyTokenizer()
+    history: list[dict[str, str]] = []
+    prompt = args.prompt or "Say hello in one short sentence."
+    print("Tiny CMM agent smoke (no checkpoint) ...")
+    reply, tok_s, ms_tok, n_new = run_agent_turn(
+        model,
+        tokenizer,
+        device,
+        history,
+        prompt,
+        system="You are a test agent.",
+        tools=None,
+        max_tool_rounds=0,
+        max_new_tokens=min(int(args.max_new_tokens), 16),
+        max_prompt_tokens=64,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        repetition_penalty=1.0,
+    )
+    print(f"prompt: {prompt}")
+    print(f"reply:  {reply!r}")
+    print(
+        f"  [{n_new} tokens · {tok_s:.1f} tok/s · {ms_tok:.1f} ms/token · "
+        f"hist={len(history)}]"
+    )
+    if n_new < 1:
+        raise SystemExit("tiny smoke produced no tokens")
+    print("agent loop OK — no dimension mismatch")
+
+
 def main() -> None:
     args = build_argparser().parse_args()
+    if args.tiny_smoke:
+        _run_tiny_agent_smoke(args)
+        return
     try:
         device = resolve_device(args.device)
     except RuntimeError as exc:
@@ -661,6 +1104,43 @@ def main() -> None:
         dtype=dtype,
     )
 
+    tools: ToolRegistry | None = None
+    if not args.no_tools:
+        tools = ToolRegistry(
+            Path(args.workspace),
+            max_output_chars=int(args.tool_output_chars),
+        )
+        if args.cot:
+            system = SYSTEM_PROMPT_COT_TH
+        else:
+            system = SYSTEM_PROMPT_AGENT_TH
+    else:
+        system = SYSTEM_PROMPT_COT_TH if args.cot else SYSTEM_PROMPT_CHAT_TH
+
+    if args.prompt is not None:
+        history: list[dict[str, str]] = []
+        reply, tok_s, ms_tok, n_new = run_agent_turn(
+            student,
+            tokenizer,
+            device,
+            history,
+            args.prompt,
+            system=system,
+            tools=tools,
+            max_tool_rounds=args.max_tool_rounds,
+            max_new_tokens=args.max_new_tokens,
+            max_prompt_tokens=args.max_prompt_tokens,
+            temperature=0.0 if args.greedy else args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            repetition_penalty=args.repetition_penalty,
+        )
+        print_styled_reply(reply, show_raw=False)
+        print(
+            f"  [{n_new} tokens · {tok_s:.1f} tok/s · {ms_tok:.1f} ms/token]"
+        )
+        return
+
     chat_loop(
         student,
         tokenizer,
@@ -671,7 +1151,10 @@ def main() -> None:
         repetition_penalty=args.repetition_penalty,
         max_history_turns=args.max_history_turns,
         top_k=args.top_k,
-        system=SYSTEM_PROMPT_COT_TH if args.cot else SYSTEM_PROMPT_CHAT_TH,
+        system=system,
+        tools=tools,
+        max_tool_rounds=args.max_tool_rounds,
+        max_prompt_tokens=args.max_prompt_tokens,
     )
 
 

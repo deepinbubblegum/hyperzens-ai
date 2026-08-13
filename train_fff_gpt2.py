@@ -109,7 +109,9 @@ class FFFBlock(nn.Module):
     d_model:
         Residual width ``D`` (GPT-2 Small = 768).
     fff_depth:
-        Tree depth; leaves = ``2**fff_depth``.
+        Per-tree depth; leaves per tree = ``2**fff_depth``.
+    num_trees:
+        Parallel CMM trees ``K`` (default ``1`` = classic FFF).
     init_temp:
         Initial soft-routing temperature ``τ``.
     dropout:
@@ -120,6 +122,7 @@ class FFFBlock(nn.Module):
         self,
         d_model: int,
         fff_depth: int = 4,
+        num_trees: int = 1,
         init_temp: float = 1.0,
         dropout: float = 0.1,
     ) -> None:
@@ -128,6 +131,7 @@ class FFFBlock(nn.Module):
             d_model,
             d_model,
             depth=fff_depth,
+            num_trees=num_trees,
             init_temp=init_temp,
         )
         self.dropout = nn.Dropout(dropout)
@@ -283,11 +287,17 @@ def init_fff_from_dense_mlp(
         leaf_w = leaf_w + noise_std * torch.randn_like(leaf_w)
         leaf_b = leaf_b + noise_std * torch.randn_like(leaf_b)
 
-    fff.leaf_weights.copy_(leaf_w.to(dtype=dtype))
-    fff.leaf_biases.copy_(leaf_b.to(dtype=dtype))
+    fff.leaf_weights.copy_(leaf_w.to(dtype=dtype).unsqueeze(0).expand_as(fff.leaf_weights).contiguous())
+    fff.leaf_biases.copy_(leaf_b.to(dtype=dtype).unsqueeze(0).expand_as(fff.leaf_biases).contiguous())
+    if fff.num_trees > 1 and noise_std > 0.0:
+        # Independent symmetry-breaking noise per extra tree (tree 0 already noised).
+        extra = noise_std * torch.randn_like(fff.leaf_weights[1:])
+        fff.leaf_weights.data[1:] = fff.leaf_weights.data[1:] + extra
 
-    # Routers: small orthogonal rows / matrix (symmetry-breaking random splits).
-    nn.init.orthogonal_(fff.router_weights, gain=float(router_gain))
+    # Routers: small orthogonal rows per tree (QR / ``nn.init.orthogonal_``).
+    with torch.no_grad():
+        for k in range(fff.num_trees):
+            nn.init.orthogonal_(fff.router_weights[k], gain=float(router_gain))
     nn.init.zeros_(fff.router_biases)
 
 
@@ -311,6 +321,7 @@ def build_fff_student_from_teacher(
     teacher: Any,
     *,
     fff_depth: int = 4,
+    num_trees: int = 1,
     init_temp: float = 1.0,
     fff_init_std: float = 0.02,
     leaf_noise_std: float = 0.001,
@@ -333,9 +344,11 @@ def build_fff_student_from_teacher(
     d_model = int(config.n_embd)
     dropout = float(config.resid_pdrop)
     n_leaves = 1 << int(fff_depth)
+    n_trees = max(int(num_trees), 1)
     print(
-        f"Smart FFF init from Teacher MLP: depth={fff_depth} "
-        f"leaves={n_leaves} leaf_noise={leaf_noise_std} router_gain={router_gain} "
+        f"Smart FFF/CMM init from Teacher MLP: trees={n_trees} "
+        f"depth={fff_depth} leaves/tree={n_leaves} "
+        f"leaf_noise={leaf_noise_std} router_gain={router_gain} "
         f"(STE hard-aware training, no √L leaf scale)"
     )
 
@@ -345,6 +358,7 @@ def build_fff_student_from_teacher(
         fff_block = FFFBlock(
             d_model=d_model,
             fff_depth=fff_depth,
+            num_trees=n_trees,
             init_temp=init_temp,
             dropout=dropout,
         )
@@ -398,6 +412,9 @@ def gather_student_leaf_probs(student: Any) -> Tensor:
     for fff_block in iter_fff_blocks(student):
         p = fff_block.leaf_probs()
         if p is not None:
+            if p.ndim == 3:
+                # CMM: (N, K, L) → (N·K, L) so entropy is per-tree mixture.
+                p = p.reshape(-1, p.size(-1))
             chunks.append(p)
     if not chunks:
         raise RuntimeError("no leaf probs cached — run a soft student forward first")
@@ -718,6 +735,7 @@ def build_student_param_groups(
 class DistillConfig:
     model_name: str = "gpt2"
     fff_depth: int = 4
+    num_trees: int = 1
     init_tau: float = 1.0
     min_tau: float = 0.1
     fff_init_std: float = 0.02
@@ -746,6 +764,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="GPT-2 → FFF knowledge distillation")
     p.add_argument("--model-name", type=str, default=d.model_name)
     p.add_argument("--fff-depth", type=int, default=d.fff_depth)
+    p.add_argument(
+        "--num-trees",
+        type=int,
+        default=d.num_trees,
+        help="CMM forest size K (1 = classic single-tree FFF)",
+    )
     p.add_argument("--init-tau", type=float, default=d.init_tau)
     p.add_argument("--min-tau", type=float, default=d.min_tau)
     p.add_argument("--fff-init-std", type=float, default=d.fff_init_std)
@@ -785,6 +809,7 @@ def main() -> None:
     cfg = DistillConfig(
         model_name=args.model_name,
         fff_depth=args.fff_depth,
+        num_trees=args.num_trees,
         init_tau=args.init_tau,
         min_tau=args.min_tau,
         fff_init_std=args.fff_init_std,
@@ -844,6 +869,7 @@ def main() -> None:
     student = build_fff_student_from_teacher(
         teacher,
         fff_depth=cfg.fff_depth,
+        num_trees=cfg.num_trees,
         init_temp=cfg.init_tau,
         fff_init_std=cfg.fff_init_std,
     ).to(device)
@@ -969,6 +995,8 @@ def main() -> None:
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "fff_depth": cfg.fff_depth,
+                "num_trees": cfg.num_trees,
+                "depth_per_tree": cfg.fff_depth,
                 "model_name": cfg.model_name,
             }
             torch.save(payload, ckpt_path)

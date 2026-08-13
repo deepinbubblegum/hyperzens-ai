@@ -1,18 +1,28 @@
-"""Fast Feedforward (FFF) linear layer — Belcak & Wattenhofer.
+"""Fast Feedforward / Multi-Tree CMM linear layer — Belcak & Wattenhofer.
 
-A complete binary decision tree of ``depth`` replaces a dense linear map.
-Internal nodes route; leaves apply local affine transforms.
+Replaces a dense linear map with ``K`` independent binary trees of depth
+``d`` (UltraFastBERT / Conditional Matrix Multiplication):
 
-Tree indexing (heap / breadth-first, 0-based):
+    y = Σ_{k=1}^{K} (x W_{k, ℓ_k} + b_{k, ℓ_k})
+
+``K = 1`` is the original single-tree FFF (checkpoint-compatible).
+
+Tree indexing (heap / breadth-first, 0-based, **per tree**):
     - Root: 0
     - Left child of ``i``: ``2*i + 1``
     - Right child of ``i``: ``2*i + 2``
     - Leaf heap indices: ``[2^d - 1, 2^{d+1} - 2]``
     - Contiguous leaf id: ``heap_index - (2^d - 1)``
 
-Hard routing on CPU can use a JIT-compiled C++ extension
-(``csrc/fff_hard.cpp``) via :meth:`forward_hard_cpp`, with automatic
-fallback to the pure-PyTorch path if the toolchain is unavailable.
+Parameter layout (tree-major, matches ``csrc/fff_hard.cpp``)::
+
+    router_weights : (K, R, D_in)      R = 2^d - 1
+    router_biases  : (K, R)
+    leaf_weights   : (K, L, D_in, D_out)   L = 2^d
+    leaf_biases    : (K, L, D_out)
+
+Hard routing on CPU uses ``cmm_hard_forward_cpu`` (falls back to the
+legacy ``fff_hard_forward_cpu`` when ``K = 1`` and the symbol is missing).
 """
 
 from __future__ import annotations
@@ -56,12 +66,22 @@ def _load_fff_hard_ext(*, verbose: bool = False) -> Any | None:
         return None
     _fff_hard_load_attempted = True
 
-    # 1) Prefer a setuptools-built extension (`pip install -e .` / setup.py).
+    # Prefer a setuptools-built extension, but skip stale single-tree builds
+    # that predate ``cmm_hard_forward_cpu``.
+    installed: Any | None = None
     try:
-        import fff_hard_cpp as installed  # type: ignore[import-not-found]
+        import fff_hard_cpp as installed_mod  # type: ignore[import-not-found]
 
-        _fff_hard_ext = installed
-        return _fff_hard_ext
+        installed = installed_mod
+        if callable(getattr(installed, "cmm_hard_forward_cpu", None)):
+            _fff_hard_ext = installed
+            return _fff_hard_ext
+        warnings.warn(
+            "Installed fff_hard_cpp lacks cmm_hard_forward_cpu; "
+            "JIT-compiling Multi-Tree CMM from csrc/fff_hard.cpp. "
+            "Rebuild permanently with: pip install -e . --no-build-isolation",
+            stacklevel=2,
+        )
     except ImportError:
         pass
 
@@ -71,6 +91,9 @@ def _load_fff_hard_ext(*, verbose: bool = False) -> Any | None:
             f"FFF C++ hard kernel source missing: {_FFF_HARD_SRC}",
             stacklevel=2,
         )
+        if installed is not None:
+            _fff_hard_ext = installed
+            return _fff_hard_ext
         return None
 
     try:
@@ -82,6 +105,9 @@ def _load_fff_hard_ext(*, verbose: bool = False) -> Any | None:
             "using PyTorch hard routing",
             stacklevel=2,
         )
+        if installed is not None:
+            _fff_hard_ext = installed
+            return _fff_hard_ext
         return None
 
     # Shared aggressive flags with setup.py
@@ -106,7 +132,8 @@ def _load_fff_hard_ext(*, verbose: bool = False) -> Any | None:
         fff_hard_jit_ldflags = lambda: []  # type: ignore[assignment,misc]
 
     # Keep build artifacts inside the repo (avoids home-cache permission issues).
-    build_dir = _CSRC_DIR / ".build" / "fff_hard_cpp"
+    jit_name = "fff_hard_cmm" if installed is not None else "fff_hard_cpp"
+    build_dir = _CSRC_DIR / ".build" / jit_name
     build_dir.mkdir(parents=True, exist_ok=True)
 
     # Ensure venv ``ninja`` is on PATH (PyTorch looks up the binary by name).
@@ -131,7 +158,7 @@ def _load_fff_hard_ext(*, verbose: bool = False) -> Any | None:
             if verbose:
                 print(f"[fff_hard] JIT compile attempt ({label}): cflags={cflags} ldflags={ldflags}")
             _fff_hard_ext = load(
-                name="fff_hard_cpp",
+                name=jit_name,
                 sources=[str(_FFF_HARD_SRC)],
                 extra_cflags=cflags,
                 extra_ldflags=ldflags,
@@ -151,6 +178,9 @@ def _load_fff_hard_ext(*, verbose: bool = False) -> Any | None:
         "falling back to PyTorch hard routing",
         stacklevel=2,
     )
+    if installed is not None:
+        _fff_hard_ext = installed
+        return _fff_hard_ext
     return None
 
 
@@ -159,42 +189,116 @@ def is_fff_cpp_available() -> bool:
     return _load_fff_hard_ext() is not None
 
 
+def is_cmm_cpp_available() -> bool:
+    """Return ``True`` if the native module exports ``cmm_hard_forward_cpu``."""
+    ext = _load_fff_hard_ext()
+    return callable(getattr(ext, "cmm_hard_forward_cpu", None))
+
+
 def fff_cpp_load_error() -> BaseException | None:
     """Last C++ extension load error (if any), else ``None``."""
     _load_fff_hard_ext()
     return _fff_hard_load_error
 
 
-class FastFeedforwardLinear(nn.Module):
-    """Fast Feedforward linear layer with soft (train) and hard (infer) routing.
+def _infer_cmm_hparams_from_state(
+    ckpt: dict[str, Any],
+) -> tuple[int, int] | None:
+    """Infer ``(K, d)`` from the first ``router_weights`` tensor in a checkpoint.
 
-    Replaces ``y = x W + b`` with a depth-``d`` binary tree:
-        - ``2^d - 1`` router (internal) nodes
-        - ``2^d`` leaf affine maps
+    Tree-major CMM stores ``(K, R, D_in)`` with ``R = 2^d - 1``. Legacy
+    single-tree FFF stores ``(R, D_in)`` (``K = 1``).
+    """
+    sd = ckpt.get("student_state_dict")
+    if not isinstance(sd, dict):
+        sd = ckpt.get("state_dict")
+    if not isinstance(sd, dict):
+        return None
+    for key, tensor in sd.items():
+        if not str(key).endswith("router_weights"):
+            continue
+        if not hasattr(tensor, "ndim") or not hasattr(tensor, "shape"):
+            continue
+        if tensor.ndim == 3:
+            num_trees, num_routers, _ = (int(s) for s in tensor.shape)
+        elif tensor.ndim == 2:
+            num_trees, num_routers = 1, int(tensor.shape[0])
+        else:
+            continue
+        depth = int(round(math.log2(num_routers + 1)))
+        if (1 << depth) - 1 == num_routers and depth >= 1:
+            return max(num_trees, 1), depth
+    return None
+
+
+def cmm_hparams_from_checkpoint(ckpt: dict[str, Any]) -> tuple[int, int]:
+    """Read ``(num_trees, depth_per_tree)`` from a GPT-2 FFF / CMM checkpoint.
+
+    Accepts both new keys (``num_trees``, ``depth_per_tree``) and legacy
+    ``fff_depth`` (treated as ``depth_per_tree`` with ``num_trees=1``).
+    Nested ``config`` dicts are consulted as a fallback. When metadata is
+    missing, shapes of ``router_weights`` in ``student_state_dict`` are used.
+    """
+    cfg = ckpt.get("config") if isinstance(ckpt.get("config"), dict) else {}
+    cfg = cfg or {}
+    num_trees = ckpt.get("num_trees", cfg.get("num_trees"))
+    depth = ckpt.get("depth_per_tree", cfg.get("depth_per_tree"))
+    if depth is None:
+        depth = ckpt.get("fff_depth", cfg.get("fff_depth"))
+
+    inferred = _infer_cmm_hparams_from_state(ckpt)
+    if inferred is not None:
+        inf_k, inf_d = inferred
+        if num_trees is None:
+            num_trees = inf_k
+        if depth is None:
+            depth = inf_d
+
+    if num_trees is None:
+        num_trees = 1
+    if depth is None:
+        depth = 4
+    return max(int(num_trees), 1), max(int(depth), 1)
+
+
+class FastFeedforwardLinear(nn.Module):
+    """Multi-tree CMM layer with soft (train) and hard (infer) routing.
+
+    ``K`` independent trees of depth ``d`` replace ``y = x W + b``. Each tree
+    has ``2^d - 1`` routers and ``2^d`` leaf affines. The layer output is the
+    **sum** of the K selected (hard) or mixed (soft) leaf maps, so
+    ``D_out`` stays aligned with GPT-2 / Transformer residuals.
 
     Soft mode (training)
     --------------------
-    At router ``n``, the right-child probability is
-        ``c_n(x) = σ( (w_nᵀ x + b_n) / τ )``
-    Path probability of leaf ``ℓ`` is the product of ``c`` / ``(1-c)`` along
-    the unique root→leaf path. Output is the mixture
-        ``y = Σ_ℓ P(ℓ | x) · (x W_ℓ + b_ℓ)``
+    Tree ``k`` uses a differentiable path mixture
+        ``c_{k,n}(x) = σ( (w_{k,n}ᵀ x + b_{k,n}) / τ )``
+        ``P_k(ℓ | x) = Π_{n ∈ path(ℓ)} c or (1-c)``
+        ``y = Σ_k Σ_ℓ P_k(ℓ|x) · (x W_{k,ℓ} + b_{k,ℓ})``
+    STE (:meth:`forward_soft_ste`) uses a hard one-hot per tree in forward
+    and ``∂softmax`` in backward (Hard / C++-aligned).
 
     Hard mode (inference)
     ---------------------
-    Traverse with the threshold ``(w_nᵀ x + b_n) > 0`` (right if true, else
-    left). Only the selected leaf is evaluated — ``O(depth)`` routers + 1 leaf.
+    Each tree walks with ``(wᵀ x + b) > 0`` (right if true). Only the
+    winning leaf of each tree is evaluated — ``K · (d`` router dots ``+ 1``
+    leaf GEMV). CPU delegates to ``cmm_hard_forward_cpu``.
 
     Parameters
     ----------
     in_features:
         Input dim ``D_in``.
     out_features:
-        Output dim ``D_out``.
+        Output dim ``D_out`` (after summing the K trees).
     depth:
-        Tree depth ``d``. Leaves = ``2^d``, routers = ``2^d - 1``.
+        Per-tree depth ``d``. Alias of ``depth_per_tree`` (legacy name).
     init_temp:
         Initial temperature ``τ`` for soft sigmoid decisions.
+    num_trees:
+        Number of parallel trees ``K`` (default ``1`` = classic FFF).
+    depth_per_tree:
+        If set, overrides ``depth``. Must match ``depth`` when both given
+        and ``depth`` is not the default used only as a positional alias.
     """
 
     def __init__(
@@ -203,10 +307,19 @@ class FastFeedforwardLinear(nn.Module):
         out_features: int,
         depth: int = 4,
         init_temp: float = 1.0,
+        *,
+        num_trees: int = 1,
+        depth_per_tree: int | None = None,
     ) -> None:
         super().__init__()
+        if depth_per_tree is not None:
+            if int(depth_per_tree) < 1:
+                raise ValueError(f"depth_per_tree must be >= 1, got {depth_per_tree}")
+            depth = int(depth_per_tree)
         if depth < 1:
             raise ValueError(f"depth must be >= 1, got {depth}")
+        if num_trees < 1:
+            raise ValueError(f"num_trees must be >= 1, got {num_trees}")
         if in_features < 1 or out_features < 1:
             raise ValueError("in_features and out_features must be >= 1")
         if init_temp <= 0.0:
@@ -214,42 +327,44 @@ class FastFeedforwardLinear(nn.Module):
 
         self.in_features: int = in_features
         self.out_features: int = out_features
-        self.depth: int = depth
-        self.num_leaves: int = 1 << depth  # 2^depth
-        self.num_routers: int = self.num_leaves - 1  # 2^depth - 1
+        self.num_trees: int = int(num_trees)
+        self.depth: int = int(depth)
+        self.depth_per_tree: int = self.depth
+        self.num_leaves: int = 1 << self.depth  # 2^d per tree
+        self.num_routers: int = self.num_leaves - 1  # 2^d - 1 per tree
 
-        # Routers: (R, D_in), biases (R,)
-        self.router_weights = nn.Parameter(torch.empty(self.num_routers, in_features))
-        self.router_biases = nn.Parameter(torch.empty(self.num_routers))
-
-        # Leaves: (L, D_in, D_out), biases (L, D_out)
-        self.leaf_weights = nn.Parameter(
-            torch.empty(self.num_leaves, in_features, out_features)
+        # Tree-major layout — matches csrc/fff_hard.cpp CmmLayout.
+        self.router_weights = nn.Parameter(
+            torch.empty(self.num_trees, self.num_routers, in_features)
         )
-        self.leaf_biases = nn.Parameter(torch.empty(self.num_leaves, out_features))
+        self.router_biases = nn.Parameter(
+            torch.empty(self.num_trees, self.num_routers)
+        )
+        self.leaf_weights = nn.Parameter(
+            torch.empty(
+                self.num_trees, self.num_leaves, in_features, out_features
+            )
+        )
+        self.leaf_biases = nn.Parameter(
+            torch.empty(self.num_trees, self.num_leaves, out_features)
+        )
 
-        # Not a Parameter — annealing is driven externally via set_temperature.
         self.register_buffer(
             "temperature",
             torch.tensor(float(init_temp)),
             persistent=True,
         )
 
-        # Precomputed path tables for fully vectorized soft routing (no depth loop).
-        # path_router_idx[ℓ, k] = heap router index on leaf ℓ's path at level k.
-        # path_go_right[ℓ, k]   = True iff leaf ℓ takes the right child at level k.
-        # leaf_router_inc[ℓ, r] = 1 if leaf ℓ's path visits router r.
+        # Path tables are identical across trees (same complete binary shape).
         path_router_idx, path_go_right, leaf_router_inc = self._build_path_tables(
-            depth, self.num_leaves, self.num_routers
+            self.depth, self.num_leaves, self.num_routers
         )
         self.register_buffer("path_router_idx", path_router_idx, persistent=False)
         self.register_buffer("path_go_right", path_go_right, persistent=False)
         self.register_buffer("leaf_router_inc", leaf_router_inc, persistent=False)
 
-        # Cached soft-routing stats for compute_balance_loss() after forward_soft.
-        # _last_node_decisions: (N, R) — c_n(x) for every router (batched).
-        # _last_reach_probs:    (N, R) — prob of visiting each router.
-        # _last_leaf_probs:     (N, L) — mixture weights over leaves.
+        # Soft-routing caches. K=1 squeezes the tree axis so legacy callers
+        # still see ``(N, L)`` / ``(N, R)``.
         self._last_node_decisions: Tensor | None = None
         self._last_reach_probs: Tensor | None = None
         self._last_leaf_probs: Tensor | None = None
@@ -313,9 +428,41 @@ class FastFeedforwardLinear(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"depth={self.depth}, num_routers={self.num_routers}, "
-            f"num_leaves={self.num_leaves}, temperature={float(self.temperature):.4g}"
+            f"num_trees={self.num_trees}, depth_per_tree={self.depth}, "
+            f"num_routers={self.num_routers}, num_leaves={self.num_leaves}, "
+            f"temperature={float(self.temperature):.4g}"
         )
+
+    def _cache_soft_stats(
+        self,
+        leaf_probs: Tensor,
+        node_decisions: Tensor,
+        reach_probs: Tensor,
+    ) -> None:
+        """Store mixture stats; squeeze the tree axis when ``K = 1``."""
+        if self.num_trees == 1:
+            self._last_leaf_probs = leaf_probs.squeeze(1)
+            self._last_node_decisions = node_decisions.squeeze(1)
+            self._last_reach_probs = reach_probs.squeeze(1)
+        else:
+            self._last_leaf_probs = leaf_probs
+            self._last_node_decisions = node_decisions
+            self._last_reach_probs = reach_probs
+
+    def _flat_balance_stats(self) -> tuple[Tensor, Tensor]:
+        """Return ``(node_decisions, leaf_probs)`` as ``(N*, R)`` / ``(N*, L)``."""
+        if self._last_node_decisions is None or self._last_leaf_probs is None:
+            raise RuntimeError(
+                "compute_balance_loss() requires a prior forward_soft() call "
+                "to cache routing statistics"
+            )
+        decisions = self._last_node_decisions
+        leaf_probs = self._last_leaf_probs
+        if decisions.ndim == 3:
+            decisions = decisions.reshape(-1, self.num_routers)
+        if leaf_probs.ndim == 3:
+            leaf_probs = leaf_probs.reshape(-1, self.num_leaves)
+        return decisions, leaf_probs
 
     # ------------------------------------------------------------------
     # Public forward
@@ -331,8 +478,7 @@ class FastFeedforwardLinear(nn.Module):
         mode:
             ``"soft"`` — differentiable path mixture (training).
             ``"hard"`` — discrete tree walk, single leaf (PyTorch).
-            ``"hard_cpp"`` — same semantics via CPU C++ kernel (falls back
-            to PyTorch if the extension is unavailable or ``x`` is not CPU).
+            ``"hard_cpp"`` — discrete CMM via CPU C++ (``cmm_hard_forward_cpu``).
             ``"triton"`` — fused CUDA Triton kernel (falls back to PyTorch hard
             if Triton/CUDA is unavailable).
             ``"triton_int8"`` / ``"triton_int4"`` — Triton hard routing with
@@ -365,17 +511,15 @@ class FastFeedforwardLinear(nn.Module):
     # ------------------------------------------------------------------
 
     def forward_soft(self, x: Tensor) -> Tensor:
-        """Soft mixture over all leaves via **vectorized log-space** path products.
+        """Soft multi-tree CMM — independent mixture per tree, then sum.
 
         Math
         ----
-        ``c_n = σ((w_nᵀ x + b_n) / τ)`` — P(go right | node n).
-        For every leaf ``ℓ`` in parallel:
-            ``log P(ℓ|x) = Σ_{k∈path(ℓ)} logsigmoid(±z_{r_k})``
-        then ``y = Σ_ℓ P(ℓ|x) · (x W_ℓ + b_ℓ)``.
-
-        Implementation is fully batched (no Python depth/leaf loops): gather path
-        logits with index tables, sum in log-space, ``softmax`` over leaves.
+        For each tree ``k`` independently:
+            ``c_{k,n} = σ((w_{k,n}ᵀ x + b_{k,n}) / τ)``
+            ``log P_k(ℓ|x) = Σ_{n∈path(ℓ)} logsigmoid(±z_{k,n})``
+            ``y_k = Σ_ℓ P_k(ℓ|x) · (x W_{k,ℓ} + b_{k,ℓ})``
+        ``y = Σ_k y_k``.
 
         Shapes
         ------
@@ -383,41 +527,20 @@ class FastFeedforwardLinear(nn.Module):
         returns: ``(..., D_out)``
         """
         flat, leading = self._flatten_input(x)
-        # flat: (N, D_in)
-
         leaf_probs, node_decisions, reach_probs = self._soft_leaf_probs(flat)
-        # leaf_probs:     (N, L)
-        # node_decisions: (N, R)
-        # reach_probs:    (N, R)
+        self._cache_soft_stats(leaf_probs, node_decisions, reach_probs)
 
-        self._last_leaf_probs = leaf_probs
-        self._last_node_decisions = node_decisions
-        self._last_reach_probs = reach_probs
-
-        # Batched leaf affine via bmm: (L, N, D_in) @ (L, D_in, D_out) → (L, N, D_out)
-        flat_b = flat.unsqueeze(0).expand(self.num_leaves, -1, -1)
-        leaf_out = torch.bmm(flat_b, self.leaf_weights).transpose(0, 1)
-        # leaf_out: (N, L, D_out)
+        # leaf_out: (N, K, L, D_out) — contract D_in (`i`) across every leaf.
+        leaf_out = torch.einsum("ni,klio->nklo", flat, self.leaf_weights)
         leaf_out = leaf_out + self.leaf_biases.unsqueeze(0)
-
-        # Soft-weighted sum over leaves → (N, D_out)
-        y = torch.bmm(leaf_probs.unsqueeze(1), leaf_out).squeeze(1)
+        y = torch.einsum("nkl,nklo->no", leaf_probs, leaf_out)
         return y.view(*leading, self.out_features)
 
     def forward_soft_ste(self, x: Tensor) -> Tensor:
-        """Straight-Through Estimator (STE) hard-aware soft training.
+        """STE hard-aware CMM: one winning leaf **per tree** in forward.
 
-        Forward uses a hard one-hot leaf mask (same single-leaf semantics as
-        hard / Triton inference). Backward treats the mask as soft mixture
-        probabilities so router gradients still flow:
-
-            ``logits`` = log-path scores (routers already divided by ``τ``)
-            ``p = softmax(logits)``
-            ``m_hard = one_hot(argmax(logits))``
-            ``m = (m_hard - p).detach() + p``
-            ``y = Σ_ℓ m_ℓ · ((m_ℓ · x) W_ℓ + m_ℓ b_ℓ)``
-
-        Caches ``_last_leaf_probs = p`` (soft) for entropy / load-balance.
+        Backward treats the per-tree mask as soft mixture probabilities so
+        router gradients still flow. Matches hard / C++ inference as ``τ → 0``.
 
         Shapes
         ------
@@ -426,31 +549,27 @@ class FastFeedforwardLinear(nn.Module):
         """
         flat, leading = self._flatten_input(x)
         log_leaf, node_decisions = self._soft_leaf_logits(flat)
-        # Routers already use ``/ τ``; leaf softmax matches :meth:`forward_soft`.
+        # log_leaf: (N, K, L)
         prob_soft = F.softmax(log_leaf, dim=-1)
-        reach_probs = prob_soft @ self.leaf_router_inc
-
-        self._last_leaf_probs = prob_soft
-        self._last_node_decisions = node_decisions
-        self._last_reach_probs = reach_probs
+        reach_probs = torch.matmul(prob_soft, self.leaf_router_inc)
+        self._cache_soft_stats(prob_soft, node_decisions, reach_probs)
 
         mask_hard = F.one_hot(
             torch.argmax(log_leaf, dim=-1),
             num_classes=self.num_leaves,
         ).to(dtype=prob_soft.dtype)
-        # STE: forward == hard one-hot; backward == ∂softmax.
         mask = (mask_hard - prob_soft).detach() + prob_soft
 
-        # Mask tokens per leaf so only the winning leaf is active in forward.
-        # masked_in: (N, L, D_in); leaf_out: (N, L, D_out)
-        masked_in = flat.unsqueeze(1) * mask.unsqueeze(-1)
-        leaf_out = torch.einsum("nli,lio->nlo", masked_in, self.leaf_weights)
+        # masked_in: (N, K, L, D_in) — only the winning leaf of each tree
+        # is nonzero in forward; grads flow through ``mask``.
+        masked_in = flat.unsqueeze(1).unsqueeze(1) * mask.unsqueeze(-1)
+        leaf_out = torch.einsum("nkli,klio->nklo", masked_in, self.leaf_weights)
         leaf_out = leaf_out + self.leaf_biases.unsqueeze(0) * mask.unsqueeze(-1)
-        y = leaf_out.sum(dim=1)
+        y = leaf_out.sum(dim=(1, 2))
         return y.view(*leading, self.out_features)
 
     def _soft_leaf_logits(self, flat: Tensor) -> tuple[Tensor, Tensor]:
-        """Log-path scores and router decisions for soft / STE routing.
+        """Log-path scores and router decisions for every tree.
 
         Parameters
         ----------
@@ -460,29 +579,23 @@ class FastFeedforwardLinear(nn.Module):
         Returns
         -------
         log_leaf:
-            ``(N, L)`` — unnormalized log-path scores (routers already ``/ τ``).
+            ``(N, K, L)`` — unnormalized log-path scores (routers already ``/ τ``).
         node_decisions:
-            ``(N, R)`` — clamped right-child sigmoid at every router.
+            ``(N, K, R)`` — clamped right-child sigmoid at every router.
         """
         eps = 1e-7
-
-        # All router logits at once: (N, R) — batch matmul via F.linear
         router_logits = (
-            F.linear(flat, self.router_weights, self.router_biases)
-            / self.temperature
-        )
+            torch.einsum("nd,krd->nkr", flat, self.router_weights)
+            + self.router_biases.unsqueeze(0)
+        ) / self.temperature
         node_decisions = torch.sigmoid(router_logits).clamp(min=eps, max=1.0 - eps)
 
-        # Log-space edge weights for every router (N, R)
         log_c = F.logsigmoid(router_logits)
         log_not_c = F.logsigmoid(-router_logits)
-
-        # Gather path routers for all leaves in one shot: (N, L, depth)
-        idx = self.path_router_idx
-        log_c_path = log_c[:, idx]
-        log_not_c_path = log_not_c[:, idx]
-
-        go_right = self.path_go_right.unsqueeze(0)  # (1, L, depth)
+        idx = self.path_router_idx  # (L, depth)
+        log_c_path = log_c[:, :, idx]  # (N, K, L, depth)
+        log_not_c_path = log_not_c[:, :, idx]
+        go_right = self.path_go_right.view(1, 1, self.num_leaves, self.depth)
         log_edges = torch.where(go_right, log_c_path, log_not_c_path)
         log_leaf = log_edges.sum(dim=-1)
         return log_leaf, node_decisions
@@ -490,25 +603,20 @@ class FastFeedforwardLinear(nn.Module):
     def _soft_leaf_probs(
         self, flat: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Vectorized leaf mixture: parallel log-path products over the batch.
-
-        Parameters
-        ----------
-        flat:
-            ``(N, D_in)``
+        """Vectorized per-tree leaf mixtures.
 
         Returns
         -------
         leaf_probs:
-            ``(N, L)`` — row-stochastic mixture weights.
+            ``(N, K, L)`` — row-stochastic over leaves, independently per tree.
         node_decisions:
-            ``(N, R)`` — clamped right-child sigmoid at every router.
+            ``(N, K, R)``.
         reach_probs:
-            ``(N, R)`` — soft visit mass per router (= ``leaf_probs @ incidence``).
+            ``(N, K, R)`` — ``leaf_probs @ incidence``.
         """
         log_leaf, node_decisions = self._soft_leaf_logits(flat)
         leaf_probs = torch.softmax(log_leaf, dim=-1)
-        reach_probs = leaf_probs @ self.leaf_router_inc
+        reach_probs = torch.matmul(leaf_probs, self.leaf_router_inc)
         return leaf_probs, node_decisions, reach_probs
 
     # ------------------------------------------------------------------
@@ -516,14 +624,13 @@ class FastFeedforwardLinear(nn.Module):
     # ------------------------------------------------------------------
 
     def forward_hard(self, x: Tensor) -> Tensor:
-        """Hard tree traversal — evaluate only the selected leaf.
+        """Hard multi-tree CMM — one leaf per tree, then sum.
 
-        For each sample, walk ``depth`` routers with the rule
-            ``go_right = (w_nᵀ x + b_n) > 0``
-        then apply ``y = x W_ℓ* + b_ℓ*`` for the chosen leaf ``ℓ*``.
+        For each tree ``k`` walk ``depth`` routers with
+            ``go_right = (w_{k,n}ᵀ x + b_{k,n}) > 0``
+        then ``y = Σ_k (x W_{k,ℓ_k} + b_{k,ℓ_k})``.
 
-        Cost per sample: ``depth`` router dots + 1 leaf matvec (``O(log L)``),
-        not ``O(L)``.
+        Cost per token: ``K · (depth`` router dots ``+ 1`` leaf GEMV).
 
         Shapes
         ------
@@ -532,38 +639,37 @@ class FastFeedforwardLinear(nn.Module):
         """
         flat, leading = self._flatten_input(x)
         n_batch = flat.shape[0]
-
-        # Batched path indices (vectorized if-else equivalent).
-        # node_ids start at root 0; after `depth` steps they are leaf heap ids.
-        node_ids = torch.zeros(n_batch, dtype=torch.long, device=flat.device)
+        k_idx = (
+            torch.arange(self.num_trees, device=flat.device)
+            .view(1, -1)
+            .expand(n_batch, self.num_trees)
+            .contiguous()
+        )
+        node_ids = torch.zeros(
+            n_batch, self.num_trees, dtype=torch.long, device=flat.device
+        )
 
         for _ in range(self.depth):
-            # Gather active router params: (N, D_in), (N,)
-            w = self.router_weights[node_ids]
-            b = self.router_biases[node_ids]
-            # logit_n = w_nᵀ x + b_n
-            logits = torch.einsum("ni,ni->n", flat, w) + b
-            go_right = logits > 0  # hard threshold (matches τ → 0 soft limit)
-            # left: 2i+1, right: 2i+2
+            w = self.router_weights[k_idx, node_ids]  # (N, K, D_in)
+            b = self.router_biases[k_idx, node_ids]  # (N, K)
+            logits = torch.einsum("ni,nki->nk", flat, w) + b
+            go_right = logits > 0
             node_ids = (node_ids << 1) + 1 + go_right.to(torch.long)
 
-        # Map heap leaf index → contiguous leaf id in [0, L)
-        leaf_ids = node_ids - (self.num_leaves - 1)  # (N,)
-
-        # Selected leaf transforms: (N, D_in, D_out), (N, D_out)
-        w_leaf = self.leaf_weights[leaf_ids]
-        b_leaf = self.leaf_biases[leaf_ids]
-        y = torch.einsum("ni,nio->no", flat, w_leaf) + b_leaf
+        leaf_ids = node_ids - (self.num_leaves - 1)
+        w_leaf = self.leaf_weights[k_idx, leaf_ids]  # (N, K, D_in, D_out)
+        b_leaf = self.leaf_biases[k_idx, leaf_ids]  # (N, K, D_out)
+        # Contract D_in (`i`): y[n,k] = x[n] @ W[n,k]  (not a reduction over i).
+        y_k = torch.einsum("ni,nkio->nko", flat, w_leaf) + b_leaf
+        y = y_k.sum(dim=1)
         return y.view(*leading, self.out_features)
 
     def forward_hard_cpp(self, x: Tensor) -> Tensor:
-        """Hard routing via the JIT C++ CPU kernel (exact PyTorch semantics).
+        """Hard CMM via the JIT C++ CPU kernel (exact PyTorch hard semantics).
 
-        Falls back to :meth:`forward_hard` when:
-        * the C++ extension failed to compile / load, or
-        * ``x`` is not on CPU (GPU callers keep the PyTorch path).
-
-        Inputs are forced contiguous float32 for the native kernel.
+        Prefers ``cmm_hard_forward_cpu`` (tree-major ``(K, …)`` tensors,
+        ``reduce=sum``). Falls back to legacy ``fff_hard_forward_cpu`` when
+        ``K = 1`` and the new symbol is missing, then to :meth:`forward_hard`.
         """
         flat, leading = self._flatten_input(x)
         if flat.device.type != "cpu":
@@ -573,16 +679,25 @@ class FastFeedforwardLinear(nn.Module):
         if ext is None:
             return self.forward_hard(x)
 
-        # Match C++ contract: float32 contiguous (N, D_in).
         flat_f = flat.float().contiguous()
-        y = ext.fff_hard_forward_cpu(
-            flat_f,
-            self.router_weights.detach().float().contiguous(),
-            self.router_biases.detach().float().contiguous(),
-            self.leaf_weights.detach().float().contiguous(),
-            self.leaf_biases.detach().float().contiguous(),
-            int(self.depth),
-        )
+        wr = self.router_weights.detach().float().contiguous()
+        br = self.router_biases.detach().float().contiguous()
+        wl = self.leaf_weights.detach().float().contiguous()
+        bl = self.leaf_biases.detach().float().contiguous()
+        depth = int(self.depth)
+
+        cmm_fn = getattr(ext, "cmm_hard_forward_cpu", None)
+        try:
+            if cmm_fn is not None:
+                y = cmm_fn(flat_f, wr, br, wl, bl, depth, 0)
+            elif self.num_trees == 1 and hasattr(ext, "fff_hard_forward_cpu"):
+                y = ext.fff_hard_forward_cpu(
+                    flat_f, wr[0], br[0], wl[0], bl[0], depth
+                )
+            else:
+                return self.forward_hard(x)
+        except Exception:
+            return self.forward_hard(x)
         return y.to(dtype=flat.dtype).view(*leading, self.out_features)
 
     def forward_hard_triton(self, x: Tensor) -> Tensor:
@@ -599,7 +714,6 @@ class FastFeedforwardLinear(nn.Module):
 
         try:
             from models.fff_hard_triton import (
-                _as_compute_tensor,
                 fff_hard_forward_triton,
                 is_triton_available,
             )
@@ -614,18 +728,63 @@ class FastFeedforwardLinear(nn.Module):
         dt = flat.dtype
         dispatch_n = int(x.shape[0]) if x.ndim >= 2 else int(flat.shape[0])
         try:
-            y = fff_hard_forward_triton(
+            y = self._triton_hard_sum(
+                fff_hard_forward_triton,
                 flat if flat.is_contiguous() else flat.contiguous(),
-                _as_compute_tensor(self.router_weights.detach(), dt),
-                _as_compute_tensor(self.router_biases.detach(), dt),
-                _as_compute_tensor(self.leaf_weights.detach(), dt),
-                _as_compute_tensor(self.leaf_biases.detach(), dt),
-                int(self.depth),
+                dt,
                 dispatch_n=dispatch_n,
             )
         except (RuntimeError, TypeError, ValueError):
             return self.forward_hard(x)
         return y.view(*leading, self.out_features)
+
+    def _triton_hard_sum(
+        self,
+        kernel_fn: Any,
+        flat: Tensor,
+        dt: torch.dtype,
+        *,
+        dispatch_n: int,
+        qstate: Any | None = None,
+    ) -> Tensor:
+        """Run the single-tree Triton kernel once per CMM tree and sum.
+
+        Existing Triton kernels expect 2-D routers / 3-D leaves. Each tree
+        is a contiguous slab in the tree-major layout, so we slice ``k``
+        without a copy when the storage is already contiguous.
+        """
+        from models.fff_hard_triton import _as_compute_tensor
+
+        y_acc: Tensor | None = None
+        for k in range(self.num_trees):
+            wr = _as_compute_tensor(self.router_weights[k].detach(), dt)
+            br = _as_compute_tensor(self.router_biases[k].detach(), dt)
+            bl = _as_compute_tensor(self.leaf_biases[k].detach(), dt)
+            if qstate is None:
+                wl = _as_compute_tensor(self.leaf_weights[k].detach(), dt)
+                y_k = kernel_fn(
+                    flat,
+                    wr,
+                    br,
+                    wl,
+                    bl,
+                    int(self.depth),
+                    dispatch_n=dispatch_n,
+                )
+            else:
+                # Quant packs are single-tree today; K>1 falls back upstream.
+                y_k = kernel_fn(
+                    flat,
+                    wr,
+                    br,
+                    qstate,
+                    bl,
+                    int(self.depth),
+                    dispatch_n=dispatch_n,
+                )
+            y_acc = y_k if y_acc is None else y_acc + y_k
+        assert y_acc is not None
+        return y_acc
 
     def forward_hard_triton_quant(
         self,
@@ -693,13 +852,26 @@ class FastFeedforwardLinear(nn.Module):
 
         dt = flat.dtype
         dispatch_n = int(x.shape[0]) if x.ndim >= 2 else int(flat.shape[0])
+        if self.num_trees != 1:
+            # Quant packs are single-tree; CMM K>1 uses dequant + PyTorch hard.
+            from models.fff_quant import dequantize_leaf_weights
+
+            w_fp = dequantize_leaf_weights(qstate).to(
+                device=flat.device, dtype=flat.dtype
+            )
+            saved = self.leaf_weights.data
+            try:
+                self.leaf_weights.data = w_fp
+                return self.forward_hard(x)
+            finally:
+                self.leaf_weights.data = saved
         try:
             y = fff_hard_forward_triton_quant(
                 flat if flat.is_contiguous() else flat.contiguous(),
-                _as_compute_tensor(self.router_weights.detach(), dt),
-                _as_compute_tensor(self.router_biases.detach(), dt),
+                _as_compute_tensor(self.router_weights[0].detach(), dt),
+                _as_compute_tensor(self.router_biases[0].detach(), dt),
                 qstate,
-                _as_compute_tensor(self.leaf_biases.detach(), dt),
+                _as_compute_tensor(self.leaf_biases[0].detach(), dt),
                 int(self.depth),
                 dispatch_n=dispatch_n,
             )
@@ -743,16 +915,20 @@ class FastFeedforwardLinear(nn.Module):
                 f"expected x shape ({self.in_features},), got {tuple(x.shape)}"
             )
 
-        node = 0
-        for _ in range(self.depth):
-            logit = torch.dot(self.router_weights[node], x) + self.router_biases[node]
-            if bool(logit > 0):
-                node = 2 * node + 2  # right
-            else:
-                node = 2 * node + 1  # left
-
-        leaf = node - (self.num_leaves - 1)
-        return x @ self.leaf_weights[leaf] + self.leaf_biases[leaf]
+        y = x.new_zeros(self.out_features)
+        for k in range(self.num_trees):
+            node = 0
+            wr = self.router_weights[k]
+            br = self.router_biases[k]
+            for _ in range(self.depth):
+                logit = torch.dot(wr[node], x) + br[node]
+                if bool(logit > 0):
+                    node = 2 * node + 2
+                else:
+                    node = 2 * node + 1
+            leaf = node - (self.num_leaves - 1)
+            y = y + x @ self.leaf_weights[k, leaf] + self.leaf_biases[k, leaf]
+        return y
 
     @torch.no_grad()
     def trace_hard_path(self, x: Tensor) -> dict[str, list[int] | int]:
@@ -780,30 +956,43 @@ class FastFeedforwardLinear(nn.Module):
                 f"expected x shape ({self.in_features},), got {tuple(x.shape)}"
             )
 
-        router_ids: list[int] = []
-        node = 0
-        for _ in range(self.depth):
-            router_ids.append(node)
-            logit = torch.dot(self.router_weights[node], x) + self.router_biases[node]
-            if bool(logit > 0):
-                node = 2 * node + 2
-            else:
-                node = 2 * node + 1
-
-        leaf_id = node - (self.num_leaves - 1)
+        per_tree: list[dict[str, list[int] | int]] = []
         all_routers = set(range(self.num_routers))
         all_leaves = set(range(self.num_leaves))
-        return {
-            "router_ids": router_ids,
-            "leaf_id": leaf_id,
-            "skipped_router_ids": sorted(all_routers - set(router_ids)),
-            "skipped_leaf_ids": sorted(all_leaves - {leaf_id}),
-        }
+        for k in range(self.num_trees):
+            router_ids: list[int] = []
+            node = 0
+            wr = self.router_weights[k]
+            br = self.router_biases[k]
+            for _ in range(self.depth):
+                router_ids.append(node)
+                logit = torch.dot(wr[node], x) + br[node]
+                if bool(logit > 0):
+                    node = 2 * node + 2
+                else:
+                    node = 2 * node + 1
+            leaf_id = node - (self.num_leaves - 1)
+            per_tree.append(
+                {
+                    "router_ids": router_ids,
+                    "leaf_id": leaf_id,
+                    "skipped_router_ids": sorted(all_routers - set(router_ids)),
+                    "skipped_leaf_ids": sorted(all_leaves - {leaf_id}),
+                }
+            )
+        # K=1 keeps the historical flat keys so infer.py verification still works.
+        out: dict[str, list[int] | int] = dict(per_tree[0])
+        if self.num_trees > 1:
+            out["num_trees"] = self.num_trees  # type: ignore[assignment]
+        return out
 
     def active_params_per_token(self) -> dict[str, int]:
         """Stored vs hard-active parameter counts for this layer."""
         return self.count_active_params(
-            self.depth, self.in_features, self.out_features
+            self.depth,
+            self.in_features,
+            self.out_features,
+            num_trees=self.num_trees,
         )
 
     # ------------------------------------------------------------------
@@ -834,17 +1023,7 @@ class FastFeedforwardLinear(nn.Module):
         Tensor
             Scalar ``L_mse + L_ent + L_leaf``.
         """
-        if (
-            self._last_node_decisions is None
-            or self._last_leaf_probs is None
-        ):
-            raise RuntimeError(
-                "compute_balance_loss() requires a prior forward_soft() call "
-                "to cache routing statistics"
-            )
-
-        decisions = self._last_node_decisions  # (N, R)
-        leaf_probs = self._last_leaf_probs  # (N, L)
+        decisions, leaf_probs = self._flat_balance_stats()
 
         # Batch-average right-child probability per router: (R,)
         p_avg = decisions.mean(dim=0).clamp(min=eps, max=1.0 - eps)
@@ -892,11 +1071,12 @@ class FastFeedforwardLinear(nn.Module):
         if active_leaf_threshold is None:
             active_leaf_threshold = 0.5 / float(self.num_leaves)
 
-        mean_leaf = self._last_leaf_probs.mean(dim=0)  # (L,)
+        decisions, leaf_probs = self._flat_balance_stats()
+        mean_leaf = leaf_probs.mean(dim=0)  # (L,)
         active = mean_leaf > active_leaf_threshold
         leaf_utilization_pct = float(active.float().mean().item() * 100.0)
 
-        p_avg = self._last_node_decisions.mean(dim=0)  # (R,)
+        p_avg = decisions.mean(dim=0)  # (R,)
         router_split_ratios = [float(v) for v in p_avg.detach().cpu().tolist()]
         router_split_ratio_mean = float(p_avg.mean().item())
         router_split_ratio_std = float(p_avg.std(unbiased=False).item())
@@ -928,6 +1108,7 @@ class FastFeedforwardLinear(nn.Module):
             "leaf_entropy_norm": leaf_entropy_norm,
             "balance_loss": balance,
             "num_leaves": float(self.num_leaves),
+            "num_trees": float(self.num_trees),
             "num_active_leaves": float(active.sum().item()),
             "temperature": float(self.temperature.item()),
         }
@@ -948,6 +1129,50 @@ class FastFeedforwardLinear(nn.Module):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        prefix: str,
+        local_metadata: Any,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        """Upgrade legacy single-tree 2-D/3-D weights to tree-major ``(K, …)``.
+
+        Old checkpoints stored ``router_weights`` as ``(R, D_in)`` and
+        ``leaf_weights`` as ``(L, D_in, D_out)``. When this module has
+        ``K = 1``, unsqueeze a leading tree axis so ``load_state_dict`` matches.
+        """
+        rw = prefix + "router_weights"
+        if rw in state_dict and state_dict[rw].ndim == 2 and self.router_weights.ndim == 3:
+            if self.num_trees != 1:
+                error_msgs.append(
+                    f"{rw}: legacy 2-D FFF weights cannot load into num_trees="
+                    f"{self.num_trees} (expected K=1 unsqueeze)"
+                )
+            else:
+                state_dict[rw] = state_dict[rw].unsqueeze(0)
+                rb = prefix + "router_biases"
+                lw = prefix + "leaf_weights"
+                lb = prefix + "leaf_biases"
+                if rb in state_dict and state_dict[rb].ndim == 1:
+                    state_dict[rb] = state_dict[rb].unsqueeze(0)
+                if lw in state_dict and state_dict[lw].ndim == 3:
+                    state_dict[lw] = state_dict[lw].unsqueeze(0)
+                if lb in state_dict and state_dict[lb].ndim == 2:
+                    state_dict[lb] = state_dict[lb].unsqueeze(0)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def _flatten_input(self, x: Tensor) -> tuple[Tensor, torch.Size]:
         """Collapse leading dims to a batch: ``(..., D_in) → (N, D_in)``."""
         if x.shape[-1] != self.in_features:
@@ -960,24 +1185,36 @@ class FastFeedforwardLinear(nn.Module):
         return flat, leading
 
     def leaf_usage(self) -> Tensor:
-        """Mean soft leaf occupancy from the last soft forward — shape ``(L,)``."""
+        """Mean soft leaf occupancy from the last soft forward — shape ``(L,)``.
+
+        Averages over the batch and, when ``K > 1``, over trees.
+        """
         if self._last_leaf_probs is None:
             raise RuntimeError("leaf_usage() requires a prior forward_soft() call")
-        return self._last_leaf_probs.mean(dim=0)
+        _, leaf_probs = self._flat_balance_stats()
+        return leaf_probs.mean(dim=0)
 
     @staticmethod
-    def count_active_params(depth: int, in_features: int, out_features: int) -> dict[str, int]:
-        """Parameter counts for soft (all) vs hard (one path) evaluation.
+    def count_active_params(
+        depth: int,
+        in_features: int,
+        out_features: int,
+        num_trees: int = 1,
+    ) -> dict[str, int]:
+        """Parameter counts for soft (all) vs hard (one path per tree).
 
-        Soft / stored: all routers + all leaves.
-        Hard / active per token: ``depth`` routers + 1 leaf.
+        Soft / stored: all routers + all leaves across ``K`` trees.
+        Hard / active per token: ``K · (depth`` routers ``+ 1`` leaf).
         """
+        num_trees = max(int(num_trees), 1)
         num_leaves = 1 << depth
         num_routers = num_leaves - 1
-        router_params = num_routers * (in_features + 1)
-        leaf_params = num_leaves * (in_features * out_features + out_features)
-        hard_routers = depth * (in_features + 1)
-        hard_leaf = in_features * out_features + out_features
+        router_params = num_trees * num_routers * (in_features + 1)
+        leaf_params = num_trees * num_leaves * (
+            in_features * out_features + out_features
+        )
+        hard_routers = num_trees * depth * (in_features + 1)
+        hard_leaf = num_trees * (in_features * out_features + out_features)
         return {
             "stored_total": router_params + leaf_params,
             "hard_active_per_token": hard_routers + hard_leaf,
@@ -986,6 +1223,8 @@ class FastFeedforwardLinear(nn.Module):
             / max(hard_routers + hard_leaf, 1),
             "num_routers": num_routers,
             "num_leaves": num_leaves,
+            "num_trees": num_trees,
+            "num_leaves_total": num_trees * num_leaves,
         }
 
 
@@ -1010,13 +1249,38 @@ def _demo_shapes() -> None:
     assert torch.allclose(y_hard, y_cpp, atol=1e-5, rtol=1e-5), (
         (y_hard - y_cpp).abs().max().item()
     )
-    # Soft → hard agreement at low temperature (near one-hot mixture)
+    # Soft → hard agreement at low temperature (peak routers so MAP = greedy).
+    with torch.no_grad():
+        layer.router_weights.mul_(50.0)
     layer.set_temperature(1e-4)
     y_s = layer.forward_soft(x0.unsqueeze(0)).squeeze(0)
+    y_b = layer.forward_hard(x0.unsqueeze(0)).squeeze(0)
     assert torch.allclose(y_s, y_b, atol=1e-3), (y_s - y_b).abs().max()
     print(
-        f"OK — soft/hard/cpp shapes agree; cpp_available={is_fff_cpp_available()}"
+        f"OK — K=1 soft/hard/cpp shapes agree; "
+        f"cpp_available={is_fff_cpp_available()} "
+        f"cmm_cpp={is_cmm_cpp_available()}"
     )
+
+    forest = FastFeedforwardLinear(32, 64, depth=3, num_trees=4, init_temp=1.0)
+    y_f_soft = forest(x, mode="soft")
+    y_f_hard = forest(x, mode="hard")
+    y_f_cpp = forest(x, mode="hard_cpp")
+    assert y_f_soft.shape == (8, 16, 64)
+    assert y_f_hard.shape == y_f_cpp.shape == (8, 16, 64)
+    y_f_seq = forest.forward_hard_sequential(x0)
+    y_f_b = forest.forward_hard(x0.unsqueeze(0)).squeeze(0)
+    assert torch.allclose(y_f_seq, y_f_b, atol=1e-5), (y_f_seq - y_f_b).abs().max()
+    assert torch.allclose(y_f_hard, y_f_cpp, atol=1e-5, rtol=1e-5)
+    with torch.no_grad():
+        forest.router_weights.mul_(50.0)
+    forest.set_temperature(1e-4)
+    y_f_s = forest.forward_soft(x0.unsqueeze(0)).squeeze(0)
+    y_f_b = forest.forward_hard(x0.unsqueeze(0)).squeeze(0)
+    assert torch.allclose(y_f_s, y_f_b, atol=1e-3), (y_f_s - y_f_b).abs().max()
+    y_f_ste = forest.forward_soft_ste(x0.unsqueeze(0)).squeeze(0)
+    assert torch.allclose(y_f_ste, y_f_b, atol=1e-3), (y_f_ste - y_f_b).abs().max()
+    print("OK — CMM K=4 d=3 soft/STE/hard/cpp agree")
 
 
 if __name__ == "__main__":

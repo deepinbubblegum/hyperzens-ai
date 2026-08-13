@@ -35,7 +35,7 @@ import os
 import sys
 import time
 import tracemalloc
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -49,7 +49,7 @@ from device_utils import (
     print_device_info,
     resolve_device,
 )
-from models.fff_layer import is_fff_cpp_available
+from models.fff_layer import is_cmm_cpp_available, is_fff_cpp_available
 from models.fff_hard_triton import is_triton_available, warmup_fff_model_triton
 from models.transformer import FFFConfig, FFFTransformer, StandardTransformer
 
@@ -498,6 +498,219 @@ def print_comparison_table(
     )
 
 
+def print_cmm_compare_table(
+    single: ModelBenchResult,
+    cmm: ModelBenchResult,
+    *,
+    single_label: str,
+    cmm_label: str,
+) -> None:
+    """ASCII summary: single-tree FFF vs Multi-Tree CMM."""
+    names = [single_label, cmm_label]
+    results = [single, cmm]
+    col0 = 34
+    col_w = 28
+    sep = "+" + "-" * col0 + ("+" + "-" * col_w) * 2 + "+"
+    header = "|" + _cell("Metric", col0)
+    for name in names:
+        header += "|" + _cell(name, col_w)
+    header += "|"
+
+    def row(metric: str, values: list[str]) -> str:
+        line = "|" + _cell(metric, col0)
+        for v in values:
+            line += "|" + _cell(v, col_w)
+        return line + "|"
+
+    speedup = cmm.multi.tokens_per_s / max(single.multi.tokens_per_s, 1e-12)
+    rows = [
+        ("Total Parameters", [_fmt_int(r.param.total_params) for r in results]),
+        (
+            "Active Params / Token",
+            [_fmt_pct(r.param.active_pct) for r in results],
+        ),
+        (
+            "Active Params (abs)",
+            [_fmt_int(r.param.active_params_per_token) for r in results],
+        ),
+        (
+            "FFN Active / Stored",
+            [
+                f"{_fmt_int(r.param.ffn_active)} / {_fmt_int(r.param.ffn_stored)}"
+                for r in results
+            ],
+        ),
+        (
+            "Latency 1-thread",
+            [_fmt_ms(r.single.ms_per_token) for r in results],
+        ),
+        (
+            "Throughput 1-thread",
+            [_fmt_tps(r.single.tokens_per_s) for r in results],
+        ),
+        (
+            f"Latency {results[0].multi.threads}-thread",
+            [_fmt_ms(r.multi.ms_per_token) for r in results],
+        ),
+        (
+            f"Throughput {results[0].multi.threads}-thread",
+            [_fmt_tps(r.multi.tokens_per_s) for r in results],
+        ),
+        (
+            "CMM speedup vs single-tree",
+            ["1.00x", f"{speedup:.2f}x"],
+        ),
+        (
+            "Peak RAM (gen, abs)",
+            [_fmt_mb(r.memory.peak_generate_mb) for r in results],
+        ),
+        (
+            "Δ RAM vs run baseline",
+            [
+                _fmt_mb(r.memory.peak_generate_mb - r.memory.baseline_mb)
+                for r in results
+            ],
+        ),
+        (
+            "RSS after load",
+            [_fmt_mb(r.memory.after_load_mb) for r in results],
+        ),
+    ]
+    print()
+    print(sep)
+    print(header)
+    print(sep)
+    for metric, values in rows:
+        print(row(metric, values))
+    print(sep)
+    print(
+        "Memory backend: "
+        + " | ".join(f"{n}={r.memory.backend}" for n, r in zip(names, results))
+    )
+
+
+def benchmark_fff_architecture(
+    device: torch.device,
+    config: FFFConfig,
+    prompt: Tensor,
+    n_tokens: int,
+    warmup: int,
+    cpu_count: int,
+    *,
+    label: str,
+    prefer_cpp: bool,
+) -> ModelBenchResult:
+    """Load one FFF/CMM architecture, time hard (C++ when requested) generation."""
+    use_cpp = prefer_cpp and device.type == "cpu" and is_fff_cpp_available()
+    if prefer_cpp and device.type == "cpu" and config.num_trees > 1:
+        use_cpp = use_cpp and is_cmm_cpp_available()
+
+    def factory() -> FFFTransformer:
+        m = FFFTransformer(config).to(device)
+        m.eval()
+        return m
+
+    step_builder = make_fff_cpp_step if use_cpp else make_fff_step
+    backend = "C++ hard" if use_cpp else "PyTorch hard"
+    print(f"\nBenchmarking {label} ({backend})...")
+
+    model, step, mem = measure_memory_and_load(
+        factory,
+        step_builder,
+        prompt,
+        config.block_size,
+        gen_tokens=min(32, n_tokens),
+    )
+    param = param_report_fff(model)
+    param = ModelParamReport(
+        name=label,
+        total_params=param.total_params,
+        active_params_per_token=param.active_params_per_token,
+        active_pct=param.active_pct,
+        ffn_stored=param.ffn_stored,
+        ffn_active=param.ffn_active,
+    )
+    single = benchmark_speed(
+        step, prompt, config.block_size, n_tokens, warmup, num_threads=1
+    )
+    multi = benchmark_speed(
+        step,
+        prompt,
+        config.block_size,
+        n_tokens,
+        warmup,
+        num_threads=cpu_count,
+    )
+    print(
+        f"  params={param.total_params:,} | "
+        f"active/token={param.active_params_per_token:,} "
+        f"({param.active_pct:.1f}%) | "
+        f"speed={multi.tokens_per_s:.2f} tok/s | "
+        f"latency={multi.ms_per_token:.3f} ms | "
+        f"peak_RAM={mem.peak_generate_mb:.1f} MB | "
+        f"backend={backend}"
+    )
+    del model
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
+    return ModelBenchResult(param=param, memory=mem, single=single, multi=multi)
+
+
+def run_cmm_compare_on_device(
+    device: torch.device,
+    base: FFFConfig,
+    prompt_cpu: Tensor,
+    n_tokens: int,
+    warmup: int,
+    cpu_count: int,
+    *,
+    single_depth: int,
+    cmm_trees: int,
+    cmm_depth: int,
+) -> None:
+    """Single-tree FFF vs Multi-Tree CMM on ``device`` (C++ hard on CPU)."""
+    apply_hardware_optimizations(device)
+    prompt = prompt_cpu.to(device)
+    prefer_cpp = device.type == "cpu"
+
+    cfg_single = replace(base, fff_depth=int(single_depth), num_trees=1)
+    cfg_cmm = replace(base, fff_depth=int(cmm_depth), num_trees=int(cmm_trees))
+    single_label = f"FFF d={cfg_single.fff_depth} K=1"
+    cmm_label = f"CMM K={cfg_cmm.num_trees} d_sub={cfg_cmm.fff_depth}"
+
+    print("\n" + "=" * 72)
+    print(f"CMM architecture compare on {device} — {device_label(device)}")
+    print(f"  {single_label}  vs  {cmm_label}")
+    print("=" * 72)
+
+    single = benchmark_fff_architecture(
+        device,
+        cfg_single,
+        prompt,
+        n_tokens,
+        warmup,
+        cpu_count,
+        label=single_label,
+        prefer_cpp=prefer_cpp,
+    )
+    cmm = benchmark_fff_architecture(
+        device,
+        cfg_cmm,
+        prompt,
+        n_tokens,
+        warmup,
+        cpu_count,
+        label=cmm_label,
+        prefer_cpp=prefer_cpp,
+    )
+    print_cmm_compare_table(
+        single, cmm, single_label=single_label, cmm_label=cmm_label
+    )
+
+
 # ---------------------------------------------------------------------------
 # Config / CLI
 # ---------------------------------------------------------------------------
@@ -519,6 +732,38 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--n-layer", type=int, default=8)
     p.add_argument("--n-head", type=int, default=8)
     p.add_argument("--fff-depth", type=int, default=6)
+    p.add_argument(
+        "--num-trees",
+        type=int,
+        default=1,
+        help="CMM forest size K (default 1 = classic single-tree FFF)",
+    )
+    p.add_argument(
+        "--cmm-compare",
+        action="store_true",
+        help=(
+            "Compare single-tree FFF (d=8, K=1) vs Multi-Tree CMM "
+            "(K=8, d_sub=4): tok/s, ms/token, peak RAM"
+        ),
+    )
+    p.add_argument(
+        "--single-tree-depth",
+        type=int,
+        default=8,
+        help="Per-tree depth for the single-tree FFF side of --cmm-compare",
+    )
+    p.add_argument(
+        "--cmm-trees",
+        type=int,
+        default=8,
+        help="K for the CMM side of --cmm-compare (default 8)",
+    )
+    p.add_argument(
+        "--cmm-depth",
+        type=int,
+        default=4,
+        help="d_sub for the CMM side of --cmm-compare (default 4)",
+    )
     p.add_argument("--block-size", type=int, default=256)
     p.add_argument("--vocab-size", type=int, default=50257)
     p.add_argument("--dropout", type=float, default=0.0)
@@ -1485,6 +1730,7 @@ def main() -> None:
     print_device_info(primary)
     print(f"logical_cpus={cpu_count} | psutil={'yes' if _HAS_PSUTIL else 'NO (tracemalloc fallback)'}")
     print(f"FFF C++ hard extension: {'available' if is_fff_cpp_available() else 'UNAVAILABLE (PyTorch fallback)'}")
+    print(f"FFF C++ CMM kernel: {'available' if is_cmm_cpp_available() else 'UNAVAILABLE (stale .so or JIT failed)'}")
     print(f"FFF Triton CUDA kernel: {'available' if is_triton_available() else 'UNAVAILABLE (pip install triton)'}")
     if not _HAS_PSUTIL:
         print(
@@ -1511,6 +1757,7 @@ def main() -> None:
             block_size=args.block_size,
             dropout=args.dropout,
             fff_depth=args.fff_depth,
+            num_trees=max(int(args.num_trees), 1),
             init_temp=1.0,
             tie_weights=True,
             bias=False,
@@ -1518,7 +1765,8 @@ def main() -> None:
 
     print(
         f"config: V={config.vocab_size} D={config.n_embd} L={config.n_layer} "
-        f"H={config.n_head} T={config.block_size} fff_depth={config.fff_depth}"
+        f"H={config.n_head} T={config.block_size} "
+        f"fff_depth={config.fff_depth} num_trees={config.num_trees}"
     )
     print(
         f"tokens: warmup={args.warmup} timed={args.n_tokens} "
@@ -1529,6 +1777,27 @@ def main() -> None:
     prompt_cpu = torch.randint(
         0, config.vocab_size, (1, args.prompt_len), dtype=torch.long
     )
+
+    if args.cmm_compare:
+        compare_dev = torch.device("cpu")
+        if primary.type != "cpu":
+            print(
+                f"  --cmm-compare uses CPU C++ hard routing "
+                f"(primary device was {primary})"
+            )
+        run_cmm_compare_on_device(
+            compare_dev,
+            config,
+            prompt_cpu,
+            args.n_tokens,
+            args.warmup,
+            cpu_count,
+            single_depth=args.single_tree_depth,
+            cmm_trees=args.cmm_trees,
+            cmm_depth=args.cmm_depth,
+        )
+        torch.set_num_threads(cpu_count)
+        return
 
     # Primary device (auto GPU or forced)
     _dense_p, fff_primary, _cpp_p = run_pair_on_device(

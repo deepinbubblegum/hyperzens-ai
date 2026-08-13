@@ -45,6 +45,7 @@ from train_fff_gpt2 import (
     _require_transformers,
 )
 from models.fff_hard_triton import is_triton_available, warmup_fff_hard_triton
+from models.fff_layer import cmm_hparams_from_checkpoint
 
 
 DEFAULT_CHECKPOINT = Path("fff_distill_checkpoint.pt")
@@ -64,7 +65,7 @@ def load_student_from_checkpoint(
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model_name = str(ckpt.get("model_name", "gpt2"))
-    fff_depth = int(ckpt.get("fff_depth", 4))
+    num_trees, fff_depth = cmm_hparams_from_checkpoint(ckpt)
     cfg = ckpt.get("config") or {}
     init_tau = float(cfg.get("init_tau", 1.0))
 
@@ -73,6 +74,7 @@ def load_student_from_checkpoint(
     student = build_fff_student_from_teacher(
         teacher,
         fff_depth=fff_depth,
+        num_trees=num_trees,
         init_temp=init_tau,
         fff_init_std=0.02,
     )

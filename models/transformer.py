@@ -44,7 +44,9 @@ class FFFConfig:
     bias:
         If ``True``, use biases in attention projections and norms that support it.
     fff_depth:
-        Tree depth ``d`` for each FFF block (leaves = ``2^d``).
+        Per-tree depth ``d`` for each FFF / CMM block (leaves per tree = ``2^d``).
+    num_trees:
+        Parallel CMM trees ``K`` (``1`` = classic single-tree FFF).
     init_temp:
         Initial soft-routing temperature ``τ`` for all FFF layers.
     rope_theta:
@@ -60,7 +62,8 @@ class FFFConfig:
     block_size: int = 256
     dropout: float = 0.0
     bias: bool = False
-    fff_depth: int = 6  # 2^6 = 64 leaves per FFF block
+    fff_depth: int = 6  # 2^6 = 64 leaves per tree
+    num_trees: int = 1  # K=1 → original FFF; K>1 → UltraFastBERT CMM
     init_temp: float = 1.0
     rope_theta: float = 10_000.0
     tie_weights: bool = True
@@ -76,6 +79,8 @@ class FFFConfig:
             raise ValueError(f"block_size must be >= 1, got {self.block_size}")
         if self.fff_depth < 1:
             raise ValueError(f"fff_depth must be >= 1, got {self.fff_depth}")
+        if self.num_trees < 1:
+            raise ValueError(f"num_trees must be >= 1, got {self.num_trees}")
         if self.init_temp <= 0.0:
             raise ValueError(f"init_temp must be > 0, got {self.init_temp}")
 
@@ -243,6 +248,7 @@ class TransformerBlock(nn.Module):
             in_features=config.n_embd,
             out_features=config.n_embd,
             depth=config.fff_depth,
+            num_trees=config.num_trees,
             init_temp=config.init_temp,
         )
         self.fff_dropout = nn.Dropout(config.dropout)
