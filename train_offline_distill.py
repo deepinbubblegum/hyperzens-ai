@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-"""Ultra-fast **offline** FFF student distillation (no teacher in the loop).
+"""Ultra-fast **offline** FFF student distillation (Phase 2, no teacher in RAM).
 
 Reads precomputed Top-K teacher logits from ``data/logits_cache/``
-(``extract_teacher_logits.py``) and trains **only** the FFF-SwiGLU student
-(``Qwen/Qwen3.5-2B``). Loss is the same Top-K KL + CE − leaf entropy used
-online, but ``teacher_topk_val`` / ``teacher_topk_idx`` come from disk.
+(``extract_teacher_logits.py``, typically ``T=2048``, ``K=50``) and trains
+**only** the FFF-SwiGLU student (``Qwen/Qwen3.5-7B``). Loss is Top-K KL + CE
+− leaf entropy against cached ``topk_indices`` / ``topk_values``.
 
-Student / optimizer (unchanged from online distill)
----------------------------------------------------
-* FFF depth=4 (16 leaves), STE soft routing, τ anneal ``1.0 → 0.10``
-* Freeze non-FFF backbone
+Student / optimizer
+-------------------
+* Base: ``Qwen/Qwen3.5-7B`` (hidden/MLP widths auto-detected from ``text_config``)
+* CMM FFF: ``num_trees=12``, ``depth_per_tree=5`` (32 leaves / tree)
+* STE soft routing, τ anneal ``1.0 → 0.10``
+* Freeze non-FFF backbone + gradient checkpointing
 * AdamW8bit on CUDA (AdamW FP32 on MPS/CPU)
+* CUDA 12GB: 10GiB VRAM cap + CPU offload of frozen layers
 * ``lr_leaf=2e-4``, ``lr_router=5e-5``, Cosine ``eta_min=2e-5``
 * ``batch_size=1``, ``grad_accum_steps=4``, ``max_steps=4000``
 * Device ``auto`` → CUDA / MPS / CPU
 
-Example
--------
-    python extract_teacher_logits.py --device auto
-    python train_offline_distill.py --device auto
-    python train_offline_distill.py --smoke-test
+Pipeline
+--------
+    python extract_teacher_logits.py --device cuda --max-length 2048
+    python train_offline_distill.py --device cuda
+    python train_offline_distill.py --student_name Qwen/Qwen3.5-7B --smoke-test
 """
 
 from __future__ import annotations
@@ -65,18 +68,23 @@ from fff_hf import (
     enable_fast_sdpa,
     enable_model_sdpa,
     gather_student_leaf_probs,
+    infer_model_input_device,
     model_context_length,
     model_vocab_size,
     resolve_compute_dtype,
     topk_kl_distill_loss,
 )
 from fff_swiglu import (
+    adapt_fff_swiglu_dims,
+    get_text_config,
     iter_fff_swiglu_blocks,
     set_fff_temperature,
 )
 
 CHECKPOINT_NAME = "fff_offline_distill.pt"
-DEFAULT_STUDENT = "Qwen/Qwen3.5-2B"
+DEFAULT_STUDENT = "Qwen/Qwen3.5-7B"
+DEFAULT_NUM_TREES = 12
+DEFAULT_DEPTH_PER_TREE = 5
 
 
 @dataclass
@@ -84,7 +92,8 @@ class OfflineDistillConfig:
     """Hyperparameters matching online ``UltimateConfig`` (minus teacher)."""
 
     student_name: str = DEFAULT_STUDENT
-    fff_depth: int = 4
+    fff_depth: int = DEFAULT_DEPTH_PER_TREE
+    num_trees: int = DEFAULT_NUM_TREES
     init_tau: float = 1.0
     min_tau: float = 0.10
     kl_temperature: float = 2.0
@@ -107,9 +116,12 @@ class OfflineDistillConfig:
     logits_cache: str = str(LOGITS_CACHE_DIR)
     use_bf16: bool = True
     freeze_backbone: bool = True
+    gradient_checkpointing: bool = True
     adam_8bit: bool = True
     equal_weight: bool = True
     smoke_test: bool = False
+    gpu_max_memory: str = "10GiB"
+    cpu_max_memory: str = "32GiB"
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -117,8 +129,31 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Offline Top-K KL distillation (student only, cached teacher logits)"
     )
-    p.add_argument("--student-name", type=str, default=d.student_name)
-    p.add_argument("--fff-depth", type=int, default=d.fff_depth)
+    p.add_argument(
+        "--student-name",
+        "--student_name",
+        dest="student_name",
+        type=str,
+        default=d.student_name,
+        help="Student HF id (default: Qwen/Qwen3.5-7B)",
+    )
+    p.add_argument(
+        "--fff-depth",
+        "--depth-per-tree",
+        "--depth_per_tree",
+        dest="fff_depth",
+        type=int,
+        default=d.fff_depth,
+        help="Per-tree FFF depth d (default 5 → 32 leaves/tree)",
+    )
+    p.add_argument(
+        "--num-trees",
+        "--num_trees",
+        dest="num_trees",
+        type=int,
+        default=d.num_trees,
+        help="CMM forest size K (default 12)",
+    )
     p.add_argument("--init-tau", type=float, default=d.init_tau)
     p.add_argument("--min-tau", type=float, default=d.min_tau)
     p.add_argument("--kl-temperature", type=float, default=d.kl_temperature)
@@ -153,6 +188,18 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default=d.logits_cache,
         help="Directory of {domain}_logits.pt shards",
+    )
+    p.add_argument(
+        "--gpu-max-memory",
+        type=str,
+        default=d.gpu_max_memory,
+        help="CUDA VRAM cap for 7B student offload (default 10GiB)",
+    )
+    p.add_argument(
+        "--cpu-max-memory",
+        type=str,
+        default=d.cpu_max_memory,
+        help="CPU RAM budget for offloaded frozen layers (default 32GiB)",
     )
     p.add_argument("--fp32", action="store_true")
     p.add_argument(
@@ -219,6 +266,7 @@ def main() -> None:
     cfg = OfflineDistillConfig(
         student_name=args.student_name,
         fff_depth=args.fff_depth,
+        num_trees=args.num_trees,
         init_tau=args.init_tau,
         min_tau=args.min_tau,
         kl_temperature=args.kl_temperature,
@@ -241,9 +289,12 @@ def main() -> None:
         logits_cache=args.logits_cache,
         use_bf16=not args.fp32,
         freeze_backbone=not args.unfreeze_backbone,
+        gradient_checkpointing=True,
         adam_8bit=not args.adam_fp32,
         equal_weight=not args.length_weighted,
         smoke_test=bool(args.smoke_test),
+        gpu_max_memory=str(args.gpu_max_memory),
+        cpu_max_memory=str(args.cpu_max_memory),
     )
     if cfg.smoke_test:
         cfg.max_steps = 50
@@ -273,15 +324,20 @@ def main() -> None:
     h_uniform = math.log(float(n_leaves))
 
     print("=" * 72)
-    print("Offline FFF Distill — student only (cached teacher Top-K)")
+    print("Offline FFF Distill — Qwen3.5-7B CMM student (cached teacher Top-K)")
     print("=" * 72)
     print_device_info(device)
     print(f"config: {asdict(cfg)}")
     print(
         f"student_dtype={compute_dtype} | kl_topk={cfg.kl_topk} | "
-        f"grad_accum={cfg.grad_accum_steps}"
+        f"grad_accum={cfg.grad_accum_steps} | "
+        f"CMM K={cfg.num_trees} d={cfg.fff_depth} leaves/tree={n_leaves}"
     )
-    print(f"target leaf entropy H_uniform=log({n_leaves})={h_uniform:.4f}")
+    print(
+        f"target leaf entropy H_uniform=log({n_leaves})={h_uniform:.4f} "
+        f"(per tree; freeze_backbone={cfg.freeze_backbone} "
+        f"grad_ckpt={cfg.gradient_checkpointing})"
+    )
 
     cache_dir = Path(cfg.logits_cache)
     cache_bytes = logits_cache_dir_size(cache_dir)
@@ -318,17 +374,35 @@ def main() -> None:
         cfg.student_name,
         device,
         fff_depth=cfg.fff_depth,
+        num_trees=cfg.num_trees,
         init_temp=cfg.init_tau,
         compute_dtype=compute_dtype,
         freeze_backbone=cfg.freeze_backbone,
+        gradient_checkpointing=cfg.gradient_checkpointing,
+        gpu_max_memory=cfg.gpu_max_memory,
+        cpu_max_memory=cfg.cpu_max_memory,
     )
     apply_context_length(student, n_ctx=cfg.max_context_length)
     enable_model_sdpa(student)
+    input_device = infer_model_input_device(student, device)
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    text_cfg = get_text_config(student)
+    d_model, used_i, n_leaves_chk, slice_size = adapt_fff_swiglu_dims(
+        int(text_cfg.hidden_size),
+        int(text_cfg.intermediate_size),
+        num_trees=cfg.num_trees,
+        depth_per_tree=cfg.fff_depth,
+    )
     print(
         f"context_length={model_context_length(student):,} | "
-        f"attention=SDPA student={attn_implementation_name(student)}"
+        f"attention=SDPA student={attn_implementation_name(student)} | "
+        f"input_device={input_device}"
+    )
+    print(
+        f"FFF dims: D={d_model} I={int(text_cfg.intermediate_size)}→{used_i} "
+        f"K={cfg.num_trees} d={cfg.fff_depth} "
+        f"leaves/tree={n_leaves_chk} slice={slice_size}"
     )
 
     n_fff = sum(1 for _ in iter_fff_swiglu_blocks(student))
@@ -383,7 +457,7 @@ def main() -> None:
 
         batch = next(data_iter)
         input_ids, attention_mask, topk_idx, topk_val = _move_offline_batch(
-            batch, device, vocab_size=vocab_s
+            batch, input_device, vocab_size=vocab_s
         )
 
         with bf16_autocast(device):
@@ -458,6 +532,8 @@ def main() -> None:
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "fff_depth": cfg.fff_depth,
+                "num_trees": cfg.num_trees,
+                "depth_per_tree": cfg.fff_depth,
                 "model_name": cfg.student_name,
                 "teacher_name": dataset.teacher_name,
                 "architecture": "fff_swiglu_offline_distill",

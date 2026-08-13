@@ -28,6 +28,7 @@ from fff_swiglu import (
     patch_model_with_fff_swiglu,
     set_fff_routing_mode,
     set_fff_temperature,
+    adapt_fff_swiglu_dims,
 )
 from models.fff_hard_triton import is_triton_available
 
@@ -498,36 +499,61 @@ def build_fff_student(
     device: torch.device,
     *,
     fff_depth: int = 4,
+    num_trees: int = 1,
     init_temp: float = 1.0,
     compute_dtype: torch.dtype = torch.bfloat16,
     freeze_backbone: bool = True,
+    gradient_checkpointing: bool = True,
+    gpu_max_memory: str = "10GiB",
+    cpu_max_memory: str = "32GiB",
 ) -> Any:
-    """Load Instruct student, inject FFF SwiGLU (FP32 init), cast dtype.
+    """Load Instruct student, inject FFF / CMM SwiGLU, freeze backbone.
 
-    By default only FFF blocks stay trainable (12GB-safe). Pass
-    ``freeze_backbone=False`` to finetune embeddings / attention / LM head.
+    Hidden and MLP widths come from the student ``text_config`` (e.g. Qwen3.5-7B)
+    and are snapped to ``num_trees * 2^{fff_depth}`` leaf slices.
+
+    Weights load directly in ``compute_dtype`` (not FP32) so a 7B student fits
+    CPU RAM / unified memory. FFF blocks are still smart-inited in FP32 then
+    cast. On CUDA, Accelerate ``device_map='auto'`` with a 10GiB VRAM cap
+    offloads frozen backbone layers to CPU when the 7B trunk exceeds 12GB.
+
+    By default only FFF blocks stay trainable. Pass ``freeze_backbone=False``
+    to finetune embeddings / attention / LM head.
     """
-    print(f"Loading student `{student_name}` (float32 for FFF init) ...")
-    student = load_hf_causal_lm(student_name, dtype=torch.float32)
+    print(f"Loading student `{student_name}` ({compute_dtype}) ...")
+    student = load_hf_causal_lm(student_name, dtype=compute_dtype)
     for p in student.parameters():
         p.requires_grad_(True)
 
-    print("Injecting FFF SwiGLU (smart-init FP32) ...")
+    text_cfg = get_text_config(student)
+    d_model, used_i, n_leaves, slice_size = adapt_fff_swiglu_dims(
+        int(text_cfg.hidden_size),
+        int(text_cfg.intermediate_size),
+        num_trees=num_trees,
+        depth_per_tree=fff_depth,
+    )
+    print(
+        f"  detected D={d_model} I={int(text_cfg.intermediate_size)} → "
+        f"FFF I={used_i} | CMM K={num_trees} d={fff_depth} "
+        f"leaves/tree={n_leaves} slice={slice_size}"
+    )
+
+    print("Injecting FFF SwiGLU CMM (smart-init FP32) ...")
     n = patch_model_with_fff_swiglu(
         student,
         fff_depth=fff_depth,
+        num_trees=num_trees,
         init_temp=init_temp,
     )
     scale0 = math.sqrt(float(1 << fff_depth))
     print(
         f"  patched {n} MLPs | STE soft train | "
-        f"output_scale init=√L={scale0:.4f}"
+        f"output_scale init=√L={scale0:.4f} | num_trees={num_trees}"
     )
 
     if compute_dtype != torch.float32:
         print(f"Casting student → {compute_dtype} ...")
         student = student.to(dtype=compute_dtype)
-    student = student.to(device)
     student.train()
     set_fff_routing_mode(student, "soft")
 
@@ -538,23 +564,124 @@ def build_fff_student(
             f"frozen={n_frozen:,}"
         )
     else:
-        print("  freeze_backbone=OFF (full student trainable — needs lots of VRAM)")
+        print("  freeze_backbone=OFF (full student trainable — needs ≫12GB VRAM)")
 
-    if hasattr(student, "gradient_checkpointing_enable"):
+    if gradient_checkpointing and hasattr(student, "gradient_checkpointing_enable"):
         student.gradient_checkpointing_enable()
         if hasattr(student, "config"):
             student.config.use_cache = False
         print("  gradient_checkpointing=ON (use_cache=False)")
+
+    student = _place_student_on_device(
+        student,
+        device,
+        gpu_max_memory=gpu_max_memory,
+        cpu_max_memory=cpu_max_memory,
+    )
     return student
 
 
+def _place_student_on_device(
+    student: Any,
+    device: torch.device,
+    *,
+    gpu_max_memory: str = "10GiB",
+    cpu_max_memory: str = "32GiB",
+) -> Any:
+    """Move student to ``device``; on CUDA cap VRAM and CPU-offload the rest.
+
+    RTX 3060 12GB cannot hold a 7B bf16 trunk (~14GB) plus activations.
+    ``max_memory={0: 10GiB, cpu: 32GiB}`` keeps ~2GB headroom.
+    MPS / CPU use a plain ``.to(device)`` (unified / host memory).
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return student.to(device)
+    try:
+        from accelerate import dispatch_model, infer_auto_device_map
+    except ImportError:
+        print(
+            "  accelerate not installed — placing the full student on CUDA "
+            "(7B may OOM on 12GB; pip install accelerate)"
+        )
+        return student.to(device)
+
+    gpu_index = int(device.index) if device.index is not None else 0
+    max_memory: dict[Any, str] = {
+        gpu_index: str(gpu_max_memory),
+        "cpu": str(cpu_max_memory),
+    }
+    no_split = [
+        "FFFSwiGLUBlock",
+        "FFFGemmaBlock",
+        "Qwen3_5DecoderLayer",
+        "Qwen3DecoderLayer",
+        "Qwen2DecoderLayer",
+        "LlamaDecoderLayer",
+    ]
+    print(f"  placing student with device_map=auto max_memory={max_memory} ...")
+    device_map = infer_auto_device_map(
+        student,
+        max_memory=max_memory,
+        no_split_module_classes=no_split,
+    )
+    student = dispatch_model(student, device_map=device_map)
+    dmap = getattr(student, "hf_device_map", None)
+    if isinstance(dmap, dict) and dmap:
+        from collections import Counter
+
+        counts = Counter(str(v) for v in dmap.values())
+        hist = " ".join(f"{dev}={n}" for dev, n in sorted(counts.items()))
+        print(f"  student hf_device_map: {hist}")
+    return student
+
+
+def infer_model_input_device(model: Any, fallback: torch.device) -> torch.device:
+    """Device that should receive ``input_ids`` for a possibly sharded HF model."""
+    dmap = getattr(model, "hf_device_map", None)
+    if isinstance(dmap, dict) and dmap:
+        for key in (
+            "model.embed_tokens",
+            "model.language_model.embed_tokens",
+            "model.model.language_model.embed_tokens",
+        ):
+            if key in dmap:
+                spec = dmap[key]
+                break
+        else:
+            spec = next(iter(dmap.values()))
+        if isinstance(spec, torch.device):
+            return spec
+        if isinstance(spec, int):
+            return torch.device(f"cuda:{spec}")
+        text = str(spec)
+        if text.isdigit():
+            return torch.device(f"cuda:{int(text)}")
+        if text.startswith("cuda") or text == "cpu":
+            return torch.device(text)
+    try:
+        param = next(model.parameters())
+        if param.device.type != "meta":
+            return param.device
+    except StopIteration:
+        pass
+    return fallback
+
+
 def gather_student_leaf_probs(student: Any) -> Tensor:
-    """Concatenate cached leaf probs from all FFF blocks → ``(N, L)``."""
+    """Concatenate cached leaf probs from all FFF blocks → ``(N, L)``.
+
+    CMM blocks cache ``(N, K, L)``; those are flattened to ``(N·K, L)`` so
+    load-balancing entropy is per-tree occupancy.
+    """
     chunks: list[Tensor] = []
     for block in iter_fff_swiglu_blocks(student):
         p = block.leaf_probs()
-        if p is not None:
-            chunks.append(p)
+        if p is None:
+            continue
+        if p.ndim == 3:
+            n_tok, n_trees, n_leaves = p.shape
+            p = p.reshape(n_tok * n_trees, n_leaves)
+        chunks.append(p)
     if not chunks:
         raise RuntimeError("no leaf probs cached — run a soft student forward first")
     return torch.cat(chunks, dim=0)
@@ -668,8 +795,13 @@ def load_student_from_checkpoint(
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     name = model_name or str(ckpt.get("model_name", default_model))
-    fff_depth = int(ckpt.get("fff_depth", 4))
     cfg = ckpt.get("config") or {}
+    fff_depth = int(
+        ckpt.get(
+            "depth_per_tree",
+            ckpt.get("fff_depth", cfg.get("fff_depth", 4)),
+        )
+    )
     init_tau = float(cfg.get("init_tau", 1.0))
     n_ctx = int(ckpt.get("max_context_length", max_context_length))
 
@@ -679,7 +811,8 @@ def load_student_from_checkpoint(
     print(f"  context_length={model_context_length(student):,}")
     print(f"Injecting FFF SwiGLU (depth={fff_depth}) ...")
     n = patch_model_with_fff_swiglu(
-        student, fff_depth=fff_depth, init_temp=init_tau, noise_std=noise_std
+        student, fff_depth=fff_depth, init_temp=init_tau, noise_std=noise_std,
+        num_trees=int(ckpt.get("num_trees", cfg.get("num_trees", 1))),
     )
     if smart_init_only:
         print(

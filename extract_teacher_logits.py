@@ -3,7 +3,7 @@
 
 Loads **only** the teacher (default ``Qwen/Qwen3.6-35B-Instruct``, resolved to
 the Hub checkpoint ``Qwen/Qwen3.6-35B-A3B``), tokenizes the multi-domain
-ChatML mixture (CoT / Agent / Code / Thai / English) at ``max_length=64``,
+ChatML mixture (CoT / Agent / Code / Thai / English) at ``max_length=2048``,
 and writes compressed ``.pt`` shards::
 
     data/logits_cache/cot_logits.pt
@@ -17,8 +17,7 @@ Each shard stores, per token:
 * ``topk_indices`` — Top-``K=50`` teacher vocab ids (int32), shape ``(N, T, K)``
 * ``topk_values``  — matching logit values (fp16/bf16), shape ``(N, T, K)``
 
-plus ``input_ids`` / ``attention_mask`` so student training never reloads the
-teacher.
+plus ``input_ids`` / ``attention_mask`` so Phase 2 never reloads the teacher.
 
 35B on RTX 3060 12GB
 --------------------
@@ -26,14 +25,14 @@ Qwen3.6-35B is a multimodal MoE checkpoint (~18GB in 4-bit). bitsandbytes
 NF4 + Accelerate ``device_map="auto"`` with
 ``max_memory={0: "10GiB", "cpu": "48GiB"}`` keeps ~2GB VRAM headroom and
 offloads the remaining ~8–12GB of 4-bit weights to system RAM.
-Teacher micro-batches default to 2 to avoid activation spikes over PCIe.
+Default micro-batch is 1 at ``T=2048`` (raise to 2 if VRAM allows).
 
 Example
 -------
-    python extract_teacher_logits.py --device auto
+    python extract_teacher_logits.py --device cuda
     python extract_teacher_logits.py --teacher_name Qwen/Qwen3.6-35B-Instruct
+    python extract_teacher_logits.py --kl-topk 50 --max-length 2048 --batch-size 1
     python extract_teacher_logits.py --smoke-test --smoke-synthetic-data
-    python extract_teacher_logits.py --kl-topk 50 --max-length 64 --batch-size 2
 """
 
 from __future__ import annotations
@@ -56,6 +55,7 @@ from tqdm import tqdm
 from data.dataset_loader import (
     LOGITS_CACHE_DIR,
     format_byte_count,
+    estimate_logits_cache_bytes,
     logits_cache_dir_size,
     logits_cache_path,
     save_teacher_logits_cache,
@@ -89,9 +89,9 @@ DEFAULT_TEACHER: str = "Qwen/Qwen3.6-35B-Instruct"
 # Official Hub id for the 35B Instruct / thinking checkpoint (MoE 35B / 3B active).
 HUB_TEACHER_35B: str = "Qwen/Qwen3.6-35B-A3B"
 DEFAULT_KL_TOPK: int = 50
-DEFAULT_MAX_LENGTH: int = 64
+DEFAULT_MAX_LENGTH: int = 2048
 DEFAULT_MAX_SAMPLES: int = 8_000
-DEFAULT_BATCH_SIZE: int = 2
+DEFAULT_BATCH_SIZE: int = 1
 DEFAULT_GPU_MAX_MEMORY: str = "10GiB"
 DEFAULT_CPU_MAX_MEMORY: str = "48GiB"
 
@@ -389,7 +389,7 @@ def extract_topk_for_ids(
 ) -> tuple[Tensor, Tensor]:
     """Teacher forward over ``(N, T)`` ids → compact Top-K tensors on CPU.
 
-    Uses a small micro-batch (default 2) so a 4-bit 35B teacher with CPU
+    Uses a small micro-batch (default 1 at T=2048) so a 4-bit 35B teacher with CPU
     offload stays under the 10GiB VRAM cap. On CUDA OOM the batch size is
     halved automatically down to 1.
 
@@ -501,13 +501,20 @@ def build_argparser() -> argparse.ArgumentParser:
         default=DEFAULT_KL_TOPK,
         help="K for teacher Top-K (default 50)",
     )
-    p.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
+    p.add_argument(
+        "--max-length",
+        "--max_length",
+        dest="max_length",
+        type=int,
+        default=DEFAULT_MAX_LENGTH,
+        help="Sequence length T (default 2048)",
+    )
     p.add_argument("--max-samples-per-domain", type=int, default=DEFAULT_MAX_SAMPLES)
     p.add_argument(
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
-        help="Teacher micro-batch (default 2; try 4 if VRAM allows)",
+        help="Teacher micro-batch (default 1 at T=2048; try 2 if VRAM allows)",
     )
     p.add_argument(
         "--gpu-max-memory",
@@ -622,6 +629,18 @@ def main() -> None:
             "(device_map=auto, ~10GiB VRAM + ~8–12GiB 4-bit weights on CPU)"
         )
     print(f"output_dir={cache_dir}")
+    n_dom = max(len(domains), 1)
+    est = estimate_logits_cache_bytes(
+        n_samples=max_samples,
+        max_length=int(args.max_length),
+        kl_topk=int(args.kl_topk),
+        n_domains=n_dom,
+    )
+    print(
+        f"est. uncompressed Top-K cache ≈ {format_byte_count(est)} "
+        f"({n_dom} domains × {max_samples:,} × T={int(args.max_length)} × K={int(args.kl_topk)}; "
+        "zip .pt will be smaller)"
+    )
 
     print("\nLoading teacher tokenizer ...")
     tokenizer = load_teacher_tokenizer(hub_teacher)

@@ -6,8 +6,8 @@ Provides:
   and cache as a memory-mapped ``uint16`` ``.bin`` file under ``data/``
 * ``BPEDataset`` — **non-overlapping** windows of ``block_size`` tokens
   (``stride = block_size`` by default; never ``stride = 1``)
-* ``OfflineDistillDataset`` — precomputed teacher Top-K logits from
-  ``data/logits_cache/{domain}_logits.pt`` (no teacher at train time)
+* ``OfflineDistillDataset`` — streams teacher Top-K logits from
+  ``data/logits_cache/{domain}_logits.pt`` (Phase 2; no teacher in RAM)
 
 Example
 -------
@@ -557,6 +557,25 @@ def format_byte_count(n_bytes: int) -> str:
     return f"{size:.2f} TB"
 
 
+def estimate_logits_cache_bytes(
+    *,
+    n_samples: int,
+    max_length: int,
+    kl_topk: int,
+    n_domains: int = 5,
+    value_bytes: int = 2,
+) -> int:
+    """Uncompressed byte estimate for ``n_domains`` Top-K shards.
+
+    Per sample: ``input_ids`` int32 + ``attention_mask`` uint8 +
+    ``topk_indices`` int32 + ``topk_values`` fp16/bf16, all length ``T`` / ``(T, K)``.
+    """
+    t = max(int(max_length), 1)
+    k = max(int(kl_topk), 1)
+    per_sample = t * 4 + t * 1 + t * k * 4 + t * k * int(value_bytes)
+    return max(int(n_samples), 0) * max(int(n_domains), 1) * per_sample
+
+
 def logits_cache_dir_size(cache_dir: str | Path | None = None) -> int:
     """Sum on-disk size of ``*.pt`` shards under the logits cache directory."""
     root = Path(cache_dir) if cache_dir is not None else LOGITS_CACHE_DIR
@@ -639,7 +658,14 @@ def load_teacher_logits_cache(path: str | Path) -> dict[str, Any]:
     src = Path(path)
     if not src.is_file():
         raise FileNotFoundError(src)
-    payload = torch.load(src, map_location="cpu", weights_only=False)
+    try:
+        payload = torch.load(
+            src, map_location="cpu", mmap=True, weights_only=False
+        )
+    except TypeError:
+        payload = torch.load(src, map_location="cpu", weights_only=False)
+    except Exception:
+        payload = torch.load(src, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise TypeError(f"{src} is not a dict payload")
     required = (
@@ -679,10 +705,12 @@ def discover_logits_cache_files(
 
 
 class OfflineDistillDataset(Dataset):
-    """Map-style dataset over precomputed teacher Top-K logits.
+    """Stream precomputed teacher Top-K logits from ``data/logits_cache/``.
 
-    Loads compressed ``.pt`` shards from ``data/logits_cache/`` produced by
-    ``extract_teacher_logits.py``. **No teacher weights** are required.
+    Reads compressed ``{domain}_logits.pt`` shards written by
+    ``extract_teacher_logits.py`` (Phase 1, typically ``T=2048``, ``K=50``).
+    **No teacher weights** are loaded — Phase 2 trains the student against
+    these tensors only.
 
     Each item is a dict::
 

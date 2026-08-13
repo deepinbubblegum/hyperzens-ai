@@ -72,6 +72,42 @@ def _init_uniform_fp32_(weight: Tensor, a: float, b: float | None = None) -> Non
     weight.data.copy_(w_fp32.to(device=weight.device, dtype=weight.dtype))
 
 
+def adapt_fff_swiglu_dims(
+    hidden_size: int,
+    intermediate_size: int,
+    *,
+    num_trees: int = 1,
+    depth_per_tree: int = 4,
+) -> tuple[int, int, int, int]:
+    """Fit FFF CMM slices to a pretrained SwiGLU width.
+
+    Returns
+    -------
+    d_model, intermediate_used, num_leaves, slice_size
+        ``intermediate_used = num_trees * num_leaves * slice_size`` is the
+        largest multiple of ``K · 2^d`` that does not exceed ``intermediate_size``.
+        Qwen3.5-7B hidden/MLP widths are read from ``text_config`` and passed in.
+    """
+    d_model = int(hidden_size)
+    if d_model < 1:
+        raise ValueError(f"hidden_size must be >= 1, got {hidden_size}")
+    n_trees = max(int(num_trees), 1)
+    depth = int(depth_per_tree)
+    if depth < 1:
+        raise ValueError(f"depth_per_tree must be >= 1, got {depth_per_tree}")
+    n_leaves = 1 << depth
+    denom = n_trees * n_leaves
+    raw_i = int(intermediate_size)
+    used = (raw_i // denom) * denom
+    if used < denom:
+        raise ValueError(
+            f"intermediate_size={raw_i} is smaller than K·L={denom} "
+            f"(num_trees={n_trees}, depth={depth}, leaves/tree={n_leaves})"
+        )
+    slice_size = used // denom
+    return d_model, used, n_leaves, slice_size
+
+
 # ---------------------------------------------------------------------------
 # SwiGLU FFF tree
 # ---------------------------------------------------------------------------
@@ -90,7 +126,9 @@ class FastFeedforwardSwiGLU(nn.Module):
         SwiGLU:  ``y_ℓ = (SiLU(x W_gate) ⊙ (x W_up)) W_down``
         GeGLU:   ``y_ℓ = (GELU_tanh(x W_gate) ⊙ (x W_up)) W_down``
 
-    Soft mixture: ``y = Σ_ℓ P(ℓ|x) · y_ℓ``. Hard / Triton: single winning leaf.
+    Soft mixture (per tree): ``y_k = Σ_ℓ P_k(ℓ|x) · y_{k,ℓ}``.
+    CMM output: ``y = Σ_k y_k`` (residual stays ``D→D``).
+    Hard / Triton: one winning leaf **per tree**, then sum over trees.
 
     Shapes
     ------
@@ -105,6 +143,7 @@ class FastFeedforwardSwiGLU(nn.Module):
         depth: int = 4,
         init_temp: float = 1.0,
         gate_activation: Literal["silu", "gelu_tanh"] = "silu",
+        num_trees: int = 1,
     ) -> None:
         super().__init__()
         if depth < 1:
@@ -117,34 +156,47 @@ class FastFeedforwardSwiGLU(nn.Module):
             raise ValueError(
                 f"gate_activation must be 'silu' or 'gelu_tanh', got {gate_activation!r}"
             )
+        n_trees = max(int(num_trees), 1)
 
         self.d_model: int = int(d_model)
-        self.intermediate_size: int = int(intermediate_size)
         self.depth: int = int(depth)
+        self.num_trees: int = n_trees
+        self.depth_per_tree: int = self.depth
         self.num_leaves: int = 1 << self.depth
         self.num_routers: int = self.num_leaves - 1
         self.gate_activation: str = gate_activation
-        if intermediate_size % self.num_leaves != 0:
-            raise ValueError(
-                f"intermediate_size={intermediate_size} not divisible by "
-                f"num_leaves={self.num_leaves} (depth={depth})"
-            )
-        self.slice_size: int = intermediate_size // self.num_leaves
-
-        self.router_weights = nn.Parameter(
-            torch.empty(self.num_routers, self.d_model)
+        d_model, used_i, n_leaves, slice_size = adapt_fff_swiglu_dims(
+            d_model,
+            intermediate_size,
+            num_trees=n_trees,
+            depth_per_tree=depth,
         )
-        self.router_biases = nn.Parameter(torch.empty(self.num_routers))
+        self.d_model = d_model
+        self.intermediate_size: int = int(used_i)
+        self.native_intermediate_size: int = int(intermediate_size)
+        self.slice_size: int = int(slice_size)
 
-        # Leaf SwiGLU projections (stored as batchable 3-D tensors).
+        # Tree-major CMM layout. K=1 recovers classic single-tree FFF.
+        self.router_weights = nn.Parameter(
+            torch.empty(self.num_trees, self.num_routers, self.d_model)
+        )
+        self.router_biases = nn.Parameter(
+            torch.empty(self.num_trees, self.num_routers)
+        )
         self.w_gate_leaf = nn.Parameter(
-            torch.empty(self.num_leaves, self.d_model, self.slice_size)
+            torch.empty(
+                self.num_trees, self.num_leaves, self.d_model, self.slice_size
+            )
         )
         self.w_up_leaf = nn.Parameter(
-            torch.empty(self.num_leaves, self.d_model, self.slice_size)
+            torch.empty(
+                self.num_trees, self.num_leaves, self.d_model, self.slice_size
+            )
         )
         self.w_down_leaf = nn.Parameter(
-            torch.empty(self.num_leaves, self.slice_size, self.d_model)
+            torch.empty(
+                self.num_trees, self.num_leaves, self.slice_size, self.d_model
+            )
         )
 
         self.register_buffer(
@@ -169,8 +221,9 @@ class FastFeedforwardSwiGLU(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """Small orthogonal routers; Xavier-style leaf slices (always via FP32)."""
-        _init_orthogonal_fp32_(self.router_weights, gain=0.1)
+        """Small orthogonal routers per tree; Xavier-style leaf slices (FP32)."""
+        for k in range(self.num_trees):
+            _init_orthogonal_fp32_(self.router_weights.data[k], gain=0.1)
         nn.init.zeros_(self.router_biases)
         a = math.sqrt(1.0 / self.d_model)
         _init_uniform_fp32_(self.w_gate_leaf, a)
@@ -201,7 +254,7 @@ class FastFeedforwardSwiGLU(nn.Module):
         return F.silu(gate)
 
     def _swiglu_all_leaves(self, flat: Tensor) -> Tensor:
-        """Evaluate every gated-GLU leaf.
+        """Evaluate every gated-GLU leaf on every tree.
 
         Parameters
         ----------
@@ -211,52 +264,61 @@ class FastFeedforwardSwiGLU(nn.Module):
         Returns
         -------
         Tensor
-            ``(N, L, D)`` leaf outputs.
+            ``(N, K, L, D)`` leaf outputs.
         """
-        # gate/up: (N, L, S); down: (N, L, D)
-        gate = torch.einsum("nd,lds->nls", flat, self.w_gate_leaf)
-        up = torch.einsum("nd,lds->nls", flat, self.w_up_leaf)
+        # gate/up: (N, K, L, S); down: (N, K, L, D)
+        gate = torch.einsum("nd,klds->nkls", flat, self.w_gate_leaf)
+        up = torch.einsum("nd,klds->nkls", flat, self.w_up_leaf)
         hidden = self._apply_gate(gate) * up
-        return torch.einsum("nls,lsd->nld", hidden, self.w_down_leaf)
+        return torch.einsum("nkls,klsd->nkld", hidden, self.w_down_leaf)
 
     def _swiglu_selected(self, flat: Tensor, leaf_ids: Tensor) -> Tensor:
-        """Evaluate one gated-GLU leaf per token.
+        """Evaluate one gated-GLU leaf per tree per token.
 
         Parameters
         ----------
         flat:
             ``(N, D)``
         leaf_ids:
-            ``(N,)`` contiguous leaf indices in ``[0, L)``.
+            ``(N,)`` (K=1) or ``(N, K)`` contiguous leaf indices in ``[0, L)``.
 
         Returns
         -------
         Tensor
-            ``(N, D)``
+            ``(N, D)`` — sum over trees.
         """
-        w_g = self.w_gate_leaf[leaf_ids]  # (N, D, S)
-        w_u = self.w_up_leaf[leaf_ids]
-        w_d = self.w_down_leaf[leaf_ids]  # (N, S, D)
-        gate = torch.einsum("nd,nds->ns", flat, w_g)
-        up = torch.einsum("nd,nds->ns", flat, w_u)
+        if leaf_ids.ndim == 1:
+            if self.num_trees != 1:
+                raise ValueError("leaf_ids (N,) requires num_trees=1")
+            leaf_ids = leaf_ids.unsqueeze(1)
+        n_batch = int(flat.size(0))
+        k_idx = torch.arange(self.num_trees, device=flat.device).view(1, -1).expand(
+            n_batch, self.num_trees
+        )
+        w_g = self.w_gate_leaf[k_idx, leaf_ids]  # (N, K, D, S)
+        w_u = self.w_up_leaf[k_idx, leaf_ids]
+        w_d = self.w_down_leaf[k_idx, leaf_ids]  # (N, K, S, D)
+        gate = torch.einsum("nd,nkds->nks", flat, w_g)
+        up = torch.einsum("nd,nkds->nks", flat, w_u)
         hidden = self._apply_gate(gate) * up
-        return torch.einsum("ns,nsd->nd", hidden, w_d)
+        per_tree = torch.einsum("nks,nksd->nkd", hidden, w_d)
+        return per_tree.sum(dim=1)
 
     def _soft_leaf_logits(self, flat: Tensor) -> tuple[Tensor, Tensor]:
-        """Log-path scores ``(N, L)`` and router decisions ``(N, R)``."""
+        """Log-path scores ``(N, K, L)`` and router decisions ``(N, K, R)``."""
         eps = 1e-7
         router_logits = (
-            F.linear(flat, self.router_weights, self.router_biases)
-            / self.temperature
-        )
+            torch.einsum("nd,krd->nkr", flat, self.router_weights)
+            + self.router_biases
+        ) / self.temperature
         node_decisions = torch.sigmoid(router_logits).clamp(min=eps, max=1.0 - eps)
         log_c = F.logsigmoid(router_logits)
         log_not_c = F.logsigmoid(-router_logits)
         idx = self.path_router_idx
         log_edges = torch.where(
-            self.path_go_right.unsqueeze(0),
-            log_c[:, idx],
-            log_not_c[:, idx],
+            self.path_go_right.view(1, 1, *self.path_go_right.shape),
+            log_c[:, :, idx],
+            log_not_c[:, :, idx],
         )
         log_leaf = log_edges.sum(dim=-1)
         return log_leaf, node_decisions
@@ -266,20 +328,23 @@ class FastFeedforwardSwiGLU(nn.Module):
     ) -> None:
         self._last_leaf_probs = leaf_probs
         self._last_node_decisions = node_decisions
-        self._last_reach_probs = leaf_probs @ self.leaf_router_inc
+        # leaf_router_inc: (L, R) → reach (N, K, R)
+        self._last_reach_probs = torch.einsum(
+            "nkl,lr->nkr", leaf_probs, self.leaf_router_inc.to(dtype=leaf_probs.dtype)
+        )
 
     def forward_soft(self, x: Tensor) -> Tensor:
-        """Soft mixture over all SwiGLU leaves (training / soft eval)."""
+        """Soft CMM: per-tree mixture, then sum over trees."""
         flat, leading = self._flatten_input(x)
         log_leaf, node_decisions = self._soft_leaf_logits(flat)
         leaf_probs = F.softmax(log_leaf, dim=-1)
         self._cache_soft_stats(leaf_probs, node_decisions)
-        leaf_out = self._swiglu_all_leaves(flat)  # (N, L, D)
-        y = torch.einsum("nl,nld->nd", leaf_probs, leaf_out)
+        leaf_out = self._swiglu_all_leaves(flat)  # (N, K, L, D)
+        y = torch.einsum("nkl,nkld->nd", leaf_probs, leaf_out)
         return y.view(*leading, self.d_model)
 
     def forward_soft_ste(self, x: Tensor) -> Tensor:
-        """STE hard-aware forward: one leaf in forward, soft grads in backward."""
+        """STE hard-aware CMM: one leaf per tree in forward, soft grads backward."""
         flat, leading = self._flatten_input(x)
         log_leaf, node_decisions = self._soft_leaf_logits(flat)
         prob_soft = F.softmax(log_leaf, dim=-1)
@@ -291,24 +356,28 @@ class FastFeedforwardSwiGLU(nn.Module):
         ).to(dtype=prob_soft.dtype)
         mask = (mask_hard - prob_soft).detach() + prob_soft
 
-        # Mask tokens so forward ≡ winning leaf; grads flow through soft mask.
-        masked_in = flat.unsqueeze(1) * mask.unsqueeze(-1)  # (N, L, D)
-        gate = torch.einsum("nld,lds->nls", masked_in, self.w_gate_leaf)
-        up = torch.einsum("nld,lds->nls", masked_in, self.w_up_leaf)
+        masked_in = flat[:, None, None, :] * mask.unsqueeze(-1)  # (N, K, L, D)
+        gate = torch.einsum("nkld,klds->nkls", masked_in, self.w_gate_leaf)
+        up = torch.einsum("nkld,klds->nkls", masked_in, self.w_up_leaf)
         hidden = self._apply_gate(gate) * up
-        leaf_out = torch.einsum("nls,lsd->nld", hidden, self.w_down_leaf)
+        leaf_out = torch.einsum("nkls,klsd->nkld", hidden, self.w_down_leaf)
         leaf_out = leaf_out * mask.unsqueeze(-1)
-        y = leaf_out.sum(dim=1)
+        y = leaf_out.sum(dim=(1, 2))
         return y.view(*leading, self.d_model)
 
     def _hard_leaf_ids(self, flat: Tensor) -> Tensor:
-        """Discrete tree walk → contiguous leaf ids ``(N,)``."""
+        """Discrete walk on every tree → leaf ids ``(N, K)``."""
         n_batch = flat.shape[0]
-        node_ids = torch.zeros(n_batch, dtype=torch.long, device=flat.device)
+        node_ids = torch.zeros(
+            n_batch, self.num_trees, dtype=torch.long, device=flat.device
+        )
+        k_idx = torch.arange(self.num_trees, device=flat.device).view(1, -1).expand(
+            n_batch, self.num_trees
+        )
         for _ in range(self.depth):
-            w = self.router_weights[node_ids]
-            b = self.router_biases[node_ids]
-            logits = torch.einsum("ni,ni->n", flat, w) + b
+            w = self.router_weights[k_idx, node_ids]
+            b = self.router_biases[k_idx, node_ids]
+            logits = torch.einsum("nd,nkd->nk", flat, w) + b
             go_right = logits > 0
             node_ids = (node_ids << 1) + 1 + go_right.to(torch.long)
         return node_ids - (self.num_leaves - 1)
@@ -363,6 +432,7 @@ class FFFSwiGLUBlock(nn.Module):
         fff_depth: int = 4,
         init_temp: float = 1.0,
         *,
+        num_trees: int = 1,
         leaf_out_scale: float | None = None,
         learnable_scale: bool = True,
         gate_activation: Literal["silu", "gelu_tanh"] = "silu",
@@ -374,6 +444,7 @@ class FFFSwiGLUBlock(nn.Module):
             depth=fff_depth,
             init_temp=init_temp,
             gate_activation=gate_activation,
+            num_trees=num_trees,
         )
         self.routing_mode: str = "soft"
         scale0 = (
@@ -399,7 +470,7 @@ class FFFSwiGLUBlock(nn.Module):
             # Sum every leaf slice → reconstruct the original dense SwiGLU
             # (diagnostic / undertrained checkpoints). No √L output_scale.
             flat, leading = self.fff._flatten_input(hidden_states)
-            y = self.fff._swiglu_all_leaves(flat).sum(dim=1)
+            y = self.fff._swiglu_all_leaves(flat).sum(dim=(1, 2))
             return y.view(*leading, self.fff.d_model)
         if mode == "soft":
             if self.training:
@@ -443,6 +514,7 @@ class FFFGemmaBlock(FFFSwiGLUBlock):
         fff_depth: int = 4,
         init_temp: float = 1.0,
         *,
+        num_trees: int = 1,
         leaf_out_scale: float | None = None,
         learnable_scale: bool = True,
     ) -> None:
@@ -451,6 +523,7 @@ class FFFGemmaBlock(FFFSwiGLUBlock):
             intermediate_size=intermediate_size,
             fff_depth=fff_depth,
             init_temp=init_temp,
+            num_trees=num_trees,
             leaf_out_scale=leaf_out_scale,
             learnable_scale=learnable_scale,
             gate_activation="gelu_tanh",
@@ -508,48 +581,56 @@ def init_fff_from_swiglu(
     """
     gate_proj, up_proj, down_proj = _get_swiglu_projections(swiglu_mlp)
     fff = fff_block.fff
+    n_trees = int(fff.num_trees)
     n_leaves = int(fff.num_leaves)
     d_model = int(fff.d_model)
     slice_size = int(fff.slice_size)
+    used_i = int(fff.intermediate_size)
 
     w_gate = gate_proj.weight.detach()
     w_up = up_proj.weight.detach()
     w_down = down_proj.weight.detach()
     if w_gate.ndim != 2 or w_up.ndim != 2 or w_down.ndim != 2:
         raise ValueError("gate/up/down weights must be 2-D")
-    if w_gate.shape != (fff.intermediate_size, d_model):
+    native_i = int(w_gate.size(0))
+    if w_gate.shape != (native_i, d_model):
         raise ValueError(
             f"gate_proj shape {tuple(w_gate.shape)} != "
-            f"(I={fff.intermediate_size}, D={d_model})"
+            f"(I={native_i}, D={d_model})"
         )
     if w_up.shape != w_gate.shape:
         raise ValueError(
             f"up_proj shape {tuple(w_up.shape)} != gate {tuple(w_gate.shape)}"
         )
-    if w_down.shape != (d_model, fff.intermediate_size):
+    if w_down.shape != (d_model, native_i):
         raise ValueError(
             f"down_proj shape {tuple(w_down.shape)} != "
-            f"(D={d_model}, I={fff.intermediate_size})"
+            f"(D={d_model}, I={native_i})"
+        )
+    if used_i > native_i:
+        raise ValueError(
+            f"FFF intermediate {used_i} exceeds MLP width {native_i}"
         )
 
     # Slice + noise entirely in FP32 on CPU (LAPACK / RNG safe), then cast.
-    w_gate = w_gate.detach().to(device="cpu", dtype=torch.float32)
-    w_up = w_up.detach().to(device="cpu", dtype=torch.float32)
-    w_down = w_down.detach().to(device="cpu", dtype=torch.float32)
+    w_gate = w_gate.detach().to(device="cpu", dtype=torch.float32)[:used_i]
+    w_up = w_up.detach().to(device="cpu", dtype=torch.float32)[:used_i]
+    w_down = w_down.detach().to(device="cpu", dtype=torch.float32)[:, :used_i]
 
     gate_leaves = torch.empty(
-        n_leaves, d_model, slice_size, device="cpu", dtype=torch.float32
+        n_trees, n_leaves, d_model, slice_size, device="cpu", dtype=torch.float32
     )
     up_leaves = torch.empty_like(gate_leaves)
     down_leaves = torch.empty(
-        n_leaves, slice_size, d_model, device="cpu", dtype=torch.float32
+        n_trees, n_leaves, slice_size, d_model, device="cpu", dtype=torch.float32
     )
-    for i in range(n_leaves):
-        start = i * slice_size
-        end = start + slice_size
-        gate_leaves[i] = w_gate[start:end, :].T.contiguous()
-        up_leaves[i] = w_up[start:end, :].T.contiguous()
-        down_leaves[i] = w_down[:, start:end].T.contiguous()
+    for k in range(n_trees):
+        for i in range(n_leaves):
+            start = (k * n_leaves + i) * slice_size
+            end = start + slice_size
+            gate_leaves[k, i] = w_gate[start:end, :].T.contiguous()
+            up_leaves[k, i] = w_up[start:end, :].T.contiguous()
+            down_leaves[k, i] = w_down[:, start:end].T.contiguous()
 
     if noise_std > 0.0:
         gate_leaves = gate_leaves + noise_std * torch.randn_like(gate_leaves)
@@ -563,7 +644,8 @@ def init_fff_from_swiglu(
     fff.w_down_leaf.copy_(down_leaves.to(device=tgt_device, dtype=tgt_dtype))
 
     # orthogonal_ requires FP32 (geqrf); never call it on Half parameters.
-    _init_orthogonal_fp32_(fff.router_weights, gain=float(router_gain))
+    for k in range(n_trees):
+        _init_orthogonal_fp32_(fff.router_weights.data[k], gain=float(router_gain))
     nn.init.zeros_(fff.router_biases)
 
 
@@ -627,12 +709,17 @@ def patch_model_with_fff_swiglu(
     model: Any,
     *,
     fff_depth: int = 4,
+    num_trees: int = 1,
     init_temp: float = 1.0,
     noise_std: float = 1e-3,
     router_gain: float = 0.1,
     block_cls: type[FFFSwiGLUBlock] = FFFSwiGLUBlock,
 ) -> int:
-    """Replace each ``layer.mlp`` with a gated-GLU FFF block (in-place).
+    """Replace each ``layer.mlp`` with a gated-GLU FFF / CMM block (in-place).
+
+    Hidden and MLP widths are taken from ``text_config`` (Qwen3.5-7B etc.)
+    and snapped to a multiple of ``num_trees * 2^{fff_depth}`` so leaf slices
+    divide evenly.
 
     Blocks are constructed and smart-initialized in **float32**. Callers that
     want BF16/FP16 inference should cast the full model **after** this returns.
@@ -641,18 +728,22 @@ def patch_model_with_fff_swiglu(
     ----------
     block_cls:
         ``FFFSwiGLUBlock`` (SiLU) or ``FFFGemmaBlock`` (GELU-tanh GeGLU).
+    num_trees:
+        CMM forest size ``K`` (``K=1`` is classic FFF).
+    fff_depth:
+        Per-tree depth ``d``; leaves per tree = ``2**d``.
 
     Returns the number of patched layers.
     """
     text_cfg = get_text_config(model)
-    d_model = int(text_cfg.hidden_size)
-    intermediate = int(text_cfg.intermediate_size)
-    n_leaves = 1 << int(fff_depth)
-    if intermediate % n_leaves != 0:
-        raise ValueError(
-            f"intermediate_size={intermediate} not divisible by "
-            f"2^{fff_depth}={n_leaves}"
-        )
+    d_model, used_i, n_leaves, slice_size = adapt_fff_swiglu_dims(
+        int(text_cfg.hidden_size),
+        int(text_cfg.intermediate_size),
+        num_trees=num_trees,
+        depth_per_tree=fff_depth,
+    )
+    native_i = int(text_cfg.intermediate_size)
+    n_trees = max(int(num_trees), 1)
 
     # Keep patching on the model's current device, but force FP32 params for init.
     ref = next(model.parameters())
@@ -666,9 +757,10 @@ def patch_model_with_fff_swiglu(
             continue
         block = block_cls(
             d_model=d_model,
-            intermediate_size=intermediate,
+            intermediate_size=native_i,
             fff_depth=fff_depth,
             init_temp=init_temp,
+            num_trees=n_trees,
         )
         block = block.to(device=patch_device, dtype=torch.float32)
         init_fff_from_swiglu(
@@ -681,9 +773,9 @@ def patch_model_with_fff_swiglu(
         n_patched += 1
         if n_patched == 1:
             print(
-                f"  layer {layer_idx}: FFF {act} depth={fff_depth} leaves={n_leaves} "
-                f"slice={intermediate // n_leaves} D={d_model} I={intermediate} "
-                f"(init dtype=float32)"
+                f"  layer {layer_idx}: FFF {act} CMM K={n_trees} "
+                f"d={fff_depth} leaves/tree={n_leaves} slice={slice_size} "
+                f"D={d_model} I={native_i}→{used_i} (init dtype=float32)"
             )
     if n_patched == 0:
         raise RuntimeError("no decoder layers with `.mlp` found to patch")
@@ -694,6 +786,7 @@ def patch_model_with_fff_gemma(
     model: Any,
     *,
     fff_depth: int = 4,
+    num_trees: int = 1,
     init_temp: float = 1.0,
     noise_std: float = 1e-3,
     router_gain: float = 0.1,
@@ -702,6 +795,7 @@ def patch_model_with_fff_gemma(
     return patch_model_with_fff_swiglu(
         model,
         fff_depth=fff_depth,
+        num_trees=num_trees,
         init_temp=init_temp,
         noise_std=noise_std,
         router_gain=router_gain,
@@ -861,9 +955,9 @@ def run_synthetic_smoke(
     flat, _ = block.fff._flatten_input(x)
     leaf_ids = torch.zeros(flat.shape[0], dtype=torch.long, device=device)
     y_leaf = block.fff._swiglu_selected(flat, leaf_ids)
-    w_g = block.fff.w_gate_leaf[0]
-    w_u = block.fff.w_up_leaf[0]
-    w_d = block.fff.w_down_leaf[0]
+    w_g = block.fff.w_gate_leaf[0, 0]
+    w_u = block.fff.w_up_leaf[0, 0]
+    w_d = block.fff.w_down_leaf[0, 0]
     if is_geglu:
         y_ref = (
             F.gelu(flat @ w_g, approximate="tanh") * (flat @ w_u)
