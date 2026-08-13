@@ -126,6 +126,30 @@ def print_cot_header(
     print()
 
 
+def _as_token_id_list(ids: Any) -> list[int] | None:
+    """Normalize ``apply_chat_template`` output to a 1-D list of token ids."""
+    if ids is None:
+        return None
+    if isinstance(ids, dict) or hasattr(ids, "keys"):
+        try:
+            ids = ids["input_ids"]
+        except Exception:  # noqa: BLE001
+            return None
+    if hasattr(ids, "tolist"):
+        ids = ids.tolist()
+    if isinstance(ids, list) and ids and isinstance(ids[0], list):
+        ids = ids[0]
+    if not isinstance(ids, list) or not ids:
+        return None
+    if not isinstance(ids[0], int):
+        try:
+            ids = [int(x) for x in ids]
+        except (TypeError, ValueError):
+            return None
+        return ids
+    return [int(x) for x in ids]
+
+
 def build_chat_input_ids(
     tokenizer: Any,
     history: list[dict[str, str]],
@@ -142,28 +166,24 @@ def build_chat_input_ids(
         "add_generation_prompt": True,
         "add_special_tokens": False,
     }
-    ids: Any = None
+    raw: Any = None
     try:
-        ids = tokenizer.apply_chat_template(
+        raw = tokenizer.apply_chat_template(
             messages, enable_thinking=False, **kwargs
         )
     except TypeError:
         try:
-            ids = tokenizer.apply_chat_template(messages, **kwargs)
+            raw = tokenizer.apply_chat_template(messages, **kwargs)
         except Exception:  # noqa: BLE001
-            ids = None
+            raw = None
     except Exception:  # noqa: BLE001
-        ids = None
+        raw = None
+    ids = _as_token_id_list(raw)
     if ids is None:
         text = build_chat_prompt(tokenizer, history, system=system)
         ids = encode_truncate_left(
             tokenizer, text, max_length=max_length, add_special_tokens=False
         )
-    if hasattr(ids, "tolist"):
-        ids = ids.tolist()
-    if ids and isinstance(ids[0], list):
-        ids = ids[0]
-    ids = [int(x) for x in ids]
     if len(ids) > max_length:
         ids = ids[-max_length:]
     return ids
