@@ -220,6 +220,60 @@ def build_student_param_groups(
     return groups
 
 
+def freeze_non_fff_parameters(student: Any) -> tuple[int, int]:
+    """Freeze embeddings, attention, norms, and LM head; keep FFF trainable.
+
+    Full-model AdamW on a 2B student needs ~15GB of optimizer state plus a
+    ~970MiB ``lm_head`` gradient — both blow a 12GB card. Distilling FFF
+    only updates routers / leaf SwiGLU slices / ``output_scale``.
+
+    Returns
+    -------
+    tuple[int, int]
+        ``(n_trainable, n_frozen)`` element counts.
+    """
+    fff_ids: set[int] = set()
+    for block in iter_fff_swiglu_blocks(student):
+        for p in block.parameters():
+            fff_ids.add(id(p))
+    n_train = 0
+    n_frozen = 0
+    for p in student.parameters():
+        if id(p) in fff_ids:
+            p.requires_grad_(True)
+            n_train += int(p.numel())
+        else:
+            p.requires_grad_(False)
+            n_frozen += int(p.numel())
+    return n_train, n_frozen
+
+
+def build_student_optimizer(
+    param_groups: list[dict[str, Any]],
+    *,
+    weight_decay: float,
+    adam_8bit: bool,
+) -> torch.optim.Optimizer:
+    """AdamW, preferring bitsandbytes 8-bit states on CUDA (≈4× less VRAM)."""
+    kwargs: dict[str, Any] = {
+        "weight_decay": float(weight_decay),
+        "betas": (0.9, 0.95),
+    }
+    if adam_8bit:
+        try:
+            import bitsandbytes as bnb
+        except ImportError as exc:
+            raise SystemExit(
+                "bitsandbytes is required for 8-bit AdamW (default on 12GB).\n"
+                "  pip install bitsandbytes\n"
+                "Or pass --adam-fp32 if you have enough VRAM."
+            ) from exc
+        print("optimizer: AdamW8bit (FFF params only)")
+        return bnb.optim.AdamW8bit(param_groups, **kwargs)
+    print("optimizer: AdamW FP32")
+    return torch.optim.AdamW(param_groups, **kwargs)
+
+
 def load_4bit_teacher(model_name: str, device: torch.device) -> Any:
     """Load CausalLM teacher in bitsandbytes 4-bit (BF16 compute)."""
     try:
@@ -281,8 +335,13 @@ def build_fff_student(
     fff_depth: int = 4,
     init_temp: float = 1.0,
     compute_dtype: torch.dtype = torch.bfloat16,
+    freeze_backbone: bool = True,
 ) -> Any:
-    """Load Instruct student, inject FFF SwiGLU (FP32 init), cast dtype."""
+    """Load Instruct student, inject FFF SwiGLU (FP32 init), cast dtype.
+
+    By default only FFF blocks stay trainable (12GB-safe). Pass
+    ``freeze_backbone=False`` to finetune embeddings / attention / LM head.
+    """
     print(f"Loading student `{student_name}` (float32 for FFF init) ...")
     student = load_hf_causal_lm(student_name, dtype=torch.float32)
     for p in student.parameters():
@@ -306,6 +365,15 @@ def build_fff_student(
     student = student.to(device)
     student.train()
     set_fff_routing_mode(student, "soft")
+
+    if freeze_backbone:
+        n_train, n_frozen = freeze_non_fff_parameters(student)
+        print(
+            f"  freeze_backbone=ON | FFF trainable={n_train:,} | "
+            f"frozen={n_frozen:,}"
+        )
+    else:
+        print("  freeze_backbone=OFF (full student trainable — needs lots of VRAM)")
 
     if hasattr(student, "gradient_checkpointing_enable"):
         student.gradient_checkpointing_enable()

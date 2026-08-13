@@ -37,6 +37,7 @@ ChatML assistant turns for CoT::
 Memory engine
 -------------
 * Top-K KL (``K=200``) + feature matching on last hidden states
+* Freeze non-FFF backbone + AdamW8bit (fits RTX 3060 12GB)
 * Gradient checkpointing on the student
 * Model context ``262144`` (256K); train micro-batch ``max_length=64``
 * ``batch_size=1``, ``grad_accum_steps=16``
@@ -85,6 +86,7 @@ from fff_hf import (
     apply_context_length,
     bf16_autocast,
     build_fff_student,
+    build_student_optimizer,
     build_student_param_groups,
     encode_truncate_left,
     extract_teacher_topk,
@@ -748,6 +750,8 @@ class UltimateConfig:
     checkpoint: str = CHECKPOINT_NAME
     use_bf16: bool = True
     teacher_4bit: bool = True
+    freeze_backbone: bool = True
+    adam_8bit: bool = True
     smoke_synthetic_data: bool = False
 
 
@@ -796,6 +800,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint", type=str, default=d.checkpoint)
     p.add_argument("--fp32", action="store_true")
     p.add_argument("--no-4bit", action="store_true")
+    p.add_argument(
+        "--unfreeze-backbone",
+        action="store_true",
+        help="Train embeddings/attention/LM head too (needs ≫12GB VRAM)",
+    )
+    p.add_argument(
+        "--adam-fp32",
+        action="store_true",
+        help="Use full-precision AdamW instead of 8-bit (more VRAM)",
+    )
     p.add_argument("--smoke-synthetic-data", action="store_true")
     return p
 
@@ -846,6 +860,8 @@ def main() -> None:
         checkpoint=args.checkpoint,
         use_bf16=not args.fp32,
         teacher_4bit=not args.no_4bit,
+        freeze_backbone=not args.unfreeze_backbone,
+        adam_8bit=not args.adam_fp32,
         smoke_synthetic_data=args.smoke_synthetic_data,
     )
 
@@ -927,9 +943,12 @@ def main() -> None:
         fff_depth=cfg.fff_depth,
         init_temp=cfg.init_tau,
         compute_dtype=compute_dtype,
+        freeze_backbone=cfg.freeze_backbone,
     )
     apply_context_length(teacher, n_ctx=cfg.max_context_length)
     apply_context_length(student, tokenizer, n_ctx=cfg.max_context_length)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     print(
         f"context_length={model_context_length(student):,} "
         f"(train microbatch max_length={cfg.max_length})"
@@ -937,14 +956,18 @@ def main() -> None:
 
     n_fff = sum(1 for _ in iter_fff_swiglu_blocks(student))
     n_train = sum(p.numel() for p in student.parameters() if p.requires_grad)
-    print(f"FFF SwiGLU blocks={n_fff} | student trainable={n_train:,}")
+    n_frozen = sum(p.numel() for p in student.parameters() if not p.requires_grad)
+    print(
+        f"FFF SwiGLU blocks={n_fff} | student trainable={n_train:,} | "
+        f"frozen={n_frozen:,}"
+    )
 
-    optimizer = torch.optim.AdamW(
+    optimizer = build_student_optimizer(
         build_student_param_groups(
             student, lr_leaf=cfg.lr_leaf, lr_router=cfg.lr_router
         ),
         weight_decay=cfg.weight_decay,
-        betas=(0.9, 0.95),
+        adam_8bit=cfg.adam_8bit,
     )
     n_opt_steps = max(
         (cfg.max_steps + cfg.grad_accum_steps - 1) // cfg.grad_accum_steps, 1
@@ -970,8 +993,7 @@ def main() -> None:
     log_count = 0
 
     print(
-        f"optimizer: AdamW leaf/other lr={cfg.lr_leaf:.2e} "
-        f"router lr={cfg.lr_router:.2e} | "
+        f"lr_leaf={cfg.lr_leaf:.2e} lr_router={cfg.lr_router:.2e} | "
         f"CosineAnnealingLR T_max={n_opt_steps} eta_min={cfg.min_lr:.2e}"
     )
 
@@ -1047,7 +1069,10 @@ def main() -> None:
             del teacher_hidden
 
         if (step + 1) % cfg.grad_accum_steps == 0:
-            torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                (p for p in student.parameters() if p.requires_grad),
+                1.0,
+            )
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
