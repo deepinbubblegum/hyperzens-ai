@@ -696,6 +696,152 @@ def gather_student_leaf_probs(student: Any) -> Tensor:
     return torch.cat(chunks, dim=0)
 
 
+def _first_param_device(module: Any, fallback: torch.device) -> torch.device:
+    """Device of the first non-meta parameter, else ``fallback``."""
+    try:
+        for p in module.parameters():
+            if p.device.type != "meta":
+                return p.device
+    except StopIteration:
+        pass
+    return fallback
+
+
+def resolve_teacher_backbone(teacher: Any) -> Any:
+    """Inner transformer that emits ``last_hidden_state`` (no LM head).
+
+    HuggingFace CausalLM ``forward`` always runs ``lm_head`` over the full
+    sequence and allocates ``(B, T, V)`` logits. Phase-1 extraction must call
+    this backbone instead.
+    """
+    for name in ("model", "transformer", "language_model"):
+        inner = getattr(teacher, name, None)
+        if inner is not None and inner is not teacher and callable(inner):
+            return inner
+    getter = getattr(teacher, "get_decoder", None)
+    if callable(getter):
+        decoder = getter()
+        if decoder is not None and callable(decoder):
+            return decoder
+    raise RuntimeError(
+        "teacher has no .model / .transformer backbone; cannot skip the LM head"
+    )
+
+
+def resolve_teacher_lm_head(teacher: Any) -> Any:
+    """Output projection ``(H → V)`` (``lm_head`` or ``get_output_embeddings``)."""
+    head = getattr(teacher, "lm_head", None)
+    if head is None:
+        getter = getattr(teacher, "get_output_embeddings", None)
+        if callable(getter):
+            head = getter()
+    if head is None or not callable(head):
+        raise RuntimeError("teacher has no lm_head / output embeddings")
+    return head
+
+
+@torch.no_grad()
+def forward_teacher_hidden(
+    teacher: Any,
+    input_ids: Tensor,
+    attention_mask: Tensor | None = None,
+) -> Tensor:
+    """Backbone-only forward → ``last_hidden_state`` of shape ``(B, T, H)``.
+
+    Does **not** run the LM head, so VRAM stays ``O(B·T·H)`` (~20 MiB at
+    ``B=1, T=2048, H=5120`` bf16) instead of ``O(B·T·V)``.
+    """
+    backbone = resolve_teacher_backbone(teacher)
+    kwargs: dict[str, Any] = {
+        "input_ids": input_ids,
+        "use_cache": False,
+        "return_dict": True,
+    }
+    if attention_mask is not None:
+        kwargs["attention_mask"] = attention_mask
+    try:
+        out = backbone(**kwargs)
+    except TypeError:
+        kwargs.pop("return_dict", None)
+        out = backbone(**kwargs)
+    hidden = getattr(out, "last_hidden_state", None)
+    if hidden is None:
+        hidden = out[0] if isinstance(out, (tuple, list)) else out
+    del out
+    return hidden
+
+
+@torch.no_grad()
+def extract_topk_via_chunked_lm_head(
+    hidden: Tensor,
+    lm_head: Any,
+    *,
+    k: int = 50,
+    vocab_limit: int | None = None,
+    seq_chunk: int = TEACHER_TOPK_SEQ_CHUNK,
+    value_dtype: torch.dtype = torch.float16,
+) -> tuple[Tensor, Tensor]:
+    """Project ``(B, T, H)`` through ``lm_head`` in sequence chunks, then Top-K.
+
+    Each chunk allocates at most ``(B, seq_chunk, V)`` logits (~78 MiB bf16 at
+    ``B=1, chunk=256, V=152064``), runs ``torch.topk`` in native precision,
+    copies ``(B, chunk, K)`` to CPU, and frees the logits before the next
+    slice. Never materializes ``(B, T, V)``.
+
+    Parameters
+    ----------
+    hidden:
+        ``(B, T, H)`` last hidden state on GPU (or CPU).
+    lm_head:
+        Linear (or embedding) mapping ``H → V``.
+    k:
+        Top-K along vocab.
+    vocab_limit:
+        Optional vocab cap ``v <= V``.
+    seq_chunk:
+        Tokens per LM-head slice (default 256).
+    value_dtype:
+        CPU storage dtype for Top-K values.
+
+    Returns
+    -------
+    topk_indices:
+        ``(B, T, K)`` int32 on CPU.
+    topk_values:
+        ``(B, T, K)`` ``value_dtype`` on CPU.
+    """
+    if hidden.ndim != 3:
+        raise ValueError(f"hidden must be (B, T, H), got {tuple(hidden.shape)}")
+    _batch, seq_len, _hidden = hidden.shape
+    chunk = max(int(seq_chunk), 1)
+    k_req = max(int(k), 1)
+    head_device = _first_param_device(lm_head, hidden.device)
+
+    idx_cpu: list[Tensor] = []
+    val_cpu: list[Tensor] = []
+    for start in range(0, seq_len, chunk):
+        end = min(start + chunk, seq_len)
+        hidden_chunk = hidden[:, start:end, :]
+        if hidden_chunk.device != head_device:
+            hidden_chunk = hidden_chunk.to(device=head_device)
+        logits = lm_head(hidden_chunk)
+        del hidden_chunk
+        if vocab_limit is not None:
+            v = min(int(vocab_limit), int(logits.size(-1)))
+            logits = logits[..., :v]
+        k_eff = min(k_req, int(logits.size(-1)))
+        topk_val, topk_idx = torch.topk(logits, k=k_eff, dim=-1)
+        del logits
+        idx_cpu.append(topk_idx.to(dtype=torch.int32, device="cpu"))
+        val_cpu.append(topk_val.to(dtype=value_dtype, device="cpu"))
+        del topk_val, topk_idx
+
+    indices = torch.cat(idx_cpu, dim=1)
+    values = torch.cat(val_cpu, dim=1)
+    del idx_cpu, val_cpu
+    return indices, values
+
+
 def _release_cuda_cache() -> None:
     """Drop orphaned CUDA blocks after a large logits tensor is freed."""
     gc.collect()

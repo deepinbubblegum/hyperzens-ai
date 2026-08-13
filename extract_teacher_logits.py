@@ -26,9 +26,11 @@ bitsandbytes 4-bit is **incompatible** with Accelerate CPU-offload hooks
 (``Cannot copy out of meta tensor``), so 14B never uses ``max_memory`` or
 ``offload_folder``. Sequences are **left-truncated** to ``--max_length``
 (default 2048) with **no global padding**. Each domain is sorted by length
-and micro-batched (default 4, auto up to 8) with padding only to that
-batch's max length (``pad_to_multiple_of=8``). ``attention_mask`` is passed
-to the teacher so SDPA ignores pads.
+and micro-batched (default **2**, cap 2) with padding only to that batch's
+max length (``pad_to_multiple_of=8``). The teacher backbone returns
+``last_hidden_state`` ``(B, T, H)``; the LM head is applied in **256-token
+chunks** so ``(B, T, V)`` logits are never allocated. ``attention_mask`` is
+passed so SDPA ignores pads. ``torch.cuda.empty_cache()`` runs between domains.
 
 32B (optional, CPU offload — fragile)
 -------------------------------------
@@ -40,7 +42,7 @@ Example
     python extract_teacher_logits.py --device cuda
     python extract_teacher_logits.py --teacher_name Qwen/Qwen2.5-14B-Instruct
     python extract_teacher_logits.py --teacher_name Qwen/Qwen2.5-32B-Instruct
-    python extract_teacher_logits.py --kl-topk 50 --max-length 2048 --batch-size 4
+    python extract_teacher_logits.py --kl-topk 50 --max-length 2048 --batch-size 2
     python extract_teacher_logits.py --smoke-test --smoke-synthetic-data
 """
 
@@ -82,9 +84,12 @@ from fff_hf import (
     enable_fast_sdpa,
     enable_model_sdpa,
     encode_truncate_left,
-    extract_teacher_topk,
+    extract_topk_via_chunked_lm_head,
+    forward_teacher_hidden,
     model_vocab_size,
     resolve_compute_dtype,
+    resolve_teacher_lm_head,
+    TEACHER_TOPK_SEQ_CHUNK,
 )
 from train_fff_agent import (
     DEFAULT_SYSTEM,
@@ -100,8 +105,8 @@ HUB_TEACHER_35B: str = "Qwen/Qwen3.6-35B-A3B"
 DEFAULT_KL_TOPK: int = 50
 DEFAULT_MAX_LENGTH: int = 2048
 DEFAULT_MAX_SAMPLES: int = 8_000
-DEFAULT_BATCH_SIZE: int = 4
-DEFAULT_MAX_BATCH_SIZE: int = 8
+DEFAULT_BATCH_SIZE: int = 2
+DEFAULT_MAX_BATCH_SIZE: int = 2
 PAD_TO_MULTIPLE: int = 8
 DEFAULT_GPU_MAX_MEMORY: str = "6GiB"
 DEFAULT_CPU_MAX_MEMORY: str = "48GiB"
@@ -594,22 +599,27 @@ def _forward_topk_batch(
     vocab_limit: int | None,
     value_dtype: torch.dtype,
 ) -> tuple[Tensor, Tensor]:
-    """One teacher micro-batch → CPU Top-K ``(B, T, K)`` indices / values."""
+    """Backbone hidden + chunked LM-head Top-K → CPU ``(B, T, K)``.
+
+    Runs ``teacher.model(...)`` for ``last_hidden_state`` ``(B, T, H)``, then
+    projects 256-token slices through ``lm_head`` so a full ``(B, T, V)``
+    logits tensor is never allocated (~1.25–2.5 GiB at T=2048, V=152064).
+    """
+    lm_head = resolve_teacher_lm_head(teacher)
     with bf16_autocast(autocast_device):
-        out = teacher(
-            input_ids=ids,
-            attention_mask=mask,
-            use_cache=False,
+        hidden = forward_teacher_hidden(teacher, ids, attention_mask=mask)
+        idx_cpu, val_cpu = extract_topk_via_chunked_lm_head(
+            hidden,
+            lm_head,
+            k=k,
+            vocab_limit=vocab_limit,
+            seq_chunk=TEACHER_TOPK_SEQ_CHUNK,
+            value_dtype=value_dtype,
         )
-        logits = out.logits
-        del out
-        topk_val, topk_idx = extract_teacher_topk(
-            logits, k=k, vocab_limit=vocab_limit
-        )
-        del logits
-    idx_cpu = topk_idx.to(dtype=torch.int32, device="cpu")
-    val_cpu = topk_val.to(dtype=value_dtype, device="cpu")
-    del topk_val, topk_idx
+        del hidden
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return idx_cpu, val_cpu
 
 
@@ -628,17 +638,17 @@ def extract_topk_for_ids(
     vocab_limit: int | None = None,
     pad_multiple: int = PAD_TO_MULTIPLE,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Teacher forward over variable-length rows with dynamic micro-batch padding.
+    """Teacher forward over variable-length rows with chunked LM-head Top-K.
 
     Sequences must already be **sorted by length**. Each GPU micro-batch is
-    padded only to that batch's max length (rounded up to ``pad_multiple``),
-    never to a global ``T=2048``. ``attention_mask`` is passed into
-    ``teacher()`` so SDPA ignores pads. Results are right-padded to
-    ``max_length`` on CPU so Phase 2 still sees rectangular ``(N, T, K)``.
+    padded only to that batch's max length (rounded up to ``pad_multiple``).
+    The CausalLM backbone yields ``last_hidden_state``; ``lm_head`` is applied
+    in 256-token slices so ``(B, T, V)`` logits never land in VRAM.
+    ``attention_mask`` is passed into the backbone so SDPA ignores pads.
+    Results are right-padded to ``max_length`` on CPU for Phase 2.
 
-    Micro-batch size starts from ``batch_size`` (default 4) and auto-grows
-    up to ``max_batch_size`` (default 8) while ``T_pad * B`` stays under a
-    token budget of ``batch_size * max_length``. CUDA OOM halves the budget.
+    Micro-batch size defaults to 2 (cap 2) at ``T=2048``. CUDA OOM halves
+    the token budget.
 
     Returns
     -------
@@ -798,7 +808,7 @@ def build_argparser() -> argparse.ArgumentParser:
         dest="batch_size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
-        help="Teacher micro-batch (default 4; auto-grows with short sequences)",
+        help="Teacher micro-batch (default 2 at T=2048; keep 1–2 on RTX 3060 12GB)",
     )
     p.add_argument(
         "--max-batch-size",
@@ -806,7 +816,7 @@ def build_argparser() -> argparse.ArgumentParser:
         dest="max_batch_size",
         type=int,
         default=DEFAULT_MAX_BATCH_SIZE,
-        help="Upper bound for auto-tuned micro-batch (default 8)",
+        help="Upper bound for auto-tuned micro-batch (default 2)",
     )
     p.add_argument(
         "--gpu-max-memory",
@@ -916,6 +926,10 @@ def main() -> None:
         f"K={int(args.kl_topk)} | T_cap={int(args.max_length)} | "
         f"samples/domain={max_samples} | micro-batch={int(args.batch_size)} "
         f"(max {int(args.max_batch_size)}, dynamic pad x{PAD_TO_MULTIPLE})"
+    )
+    print(
+        f"LM-head Top-K: chunk={TEACHER_TOPK_SEQ_CHUNK} tokens "
+        "(backbone hidden only; no full (B, T, V) logits)"
     )
     if teacher_4bit and full_gpu:
         print(
@@ -1029,6 +1043,7 @@ def main() -> None:
                 "offload_folder": None if full_gpu else DEFAULT_OFFLOAD_FOLDER,
                 "n_non_pad": n_tok,
                 "dynamic_padding": True,
+                "lm_head_chunk": TEACHER_TOPK_SEQ_CHUNK,
                 "pad_multiple": PAD_TO_MULTIPLE,
                 "batch_size": int(args.batch_size),
                 "max_batch_size": int(args.max_batch_size),
@@ -1042,6 +1057,7 @@ def main() -> None:
         )
         written.append(dest)
         del input_ids, attention_mask, topk_indices, topk_values
+        gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
