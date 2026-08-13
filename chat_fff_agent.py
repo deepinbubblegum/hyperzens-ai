@@ -126,6 +126,71 @@ def print_cot_header(
     print()
 
 
+def build_chat_input_ids(
+    tokenizer: Any,
+    history: list[dict[str, str]],
+    *,
+    system: str,
+    max_length: int,
+) -> list[int]:
+    """Tokenize ChatML via the tokenizer template (no string round-trip)."""
+    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    messages.extend(history)
+    max_length = max(int(max_length), 8)
+    kwargs: dict[str, Any] = {
+        "tokenize": True,
+        "add_generation_prompt": True,
+        "add_special_tokens": False,
+    }
+    ids: Any = None
+    try:
+        ids = tokenizer.apply_chat_template(
+            messages, enable_thinking=False, **kwargs
+        )
+    except TypeError:
+        try:
+            ids = tokenizer.apply_chat_template(messages, **kwargs)
+        except Exception:  # noqa: BLE001
+            ids = None
+    except Exception:  # noqa: BLE001
+        ids = None
+    if ids is None:
+        text = build_chat_prompt(tokenizer, history, system=system)
+        ids = encode_truncate_left(
+            tokenizer, text, max_length=max_length, add_special_tokens=False
+        )
+    if hasattr(ids, "tolist"):
+        ids = ids.tolist()
+    if ids and isinstance(ids[0], list):
+        ids = ids[0]
+    ids = [int(x) for x in ids]
+    if len(ids) > max_length:
+        ids = ids[-max_length:]
+    return ids
+
+
+def clean_reply_text(text: str) -> str:
+    """Drop leaked ChatML role lines the 2B model sometimes emits."""
+    text = text.strip()
+    for stop in ("<|im_end|>", "<|im_start|>", "<|endoftext|>"):
+        if stop in text:
+            text = text.split(stop)[0].strip()
+    for sep in ("\nassistant\n", "\nassistant:", "\nAssistant\n"):
+        if sep in text.lower() or sep in text:
+            # Keep the body after the last assistant marker.
+            parts = re.split(r"\nassistant\s*:?\s*\n", text, flags=re.I)
+            if len(parts) > 1:
+                text = parts[-1].strip()
+    text = re.sub(
+        r"^(?:user|assistant|system)\s*\n", "", text, count=1, flags=re.I
+    ).strip()
+    # A leading fake user turn: "....\nassistant\nreal reply"
+    text = re.sub(
+        r"^user\s*\n.*?\nassistant\s*\n", "", text, count=1, flags=re.I | re.S
+    ).strip()
+    return text
+
+
 def build_chat_prompt(
     tokenizer: Any,
     history: list[dict[str, str]],
@@ -205,6 +270,7 @@ def generate_reply(
     top_k: int = 20,
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     no_repeat_ngram_size: int = 0,
+    prompt_token_ids: list[int] | None = None,
 ) -> tuple[str, float, float, int]:
     """Sample a reply with KV cache; n-gram ban applies to **new tokens only**."""
     model.eval()
@@ -212,9 +278,11 @@ def generate_reply(
         model.config.use_cache = True
     n_ctx = model_context_length(model)
     max_prompt = max(n_ctx - max_new_tokens, 64)
-    prompt_ids = encode_truncate_left(
-        tokenizer, prompt, max_length=max_prompt, add_special_tokens=False
-    )
+    prompt_ids = prompt_token_ids
+    if prompt_ids is None:
+        prompt_ids = encode_truncate_left(
+            tokenizer, prompt, max_length=max_prompt, add_special_tokens=False
+        )
     if not prompt_ids:
         prompt_ids = [int(tokenizer.eos_token_id or 0)]
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
@@ -229,6 +297,9 @@ def generate_reply(
         eos_ids.append(int(tokenizer.eos_token_id))
     try:
         tid = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if tid is not None and int(tid) >= 0:
+            eos_ids.append(int(tid))
+        tid = tokenizer.convert_tokens_to_ids("<|im_start|>")
         if tid is not None and int(tid) >= 0:
             eos_ids.append(int(tid))
     except Exception:  # noqa: BLE001
@@ -271,9 +342,7 @@ def generate_reply(
         generated[0, prompt_len:].tolist(),
         skip_special_tokens=True,
     ).strip()
-    for stop in ("<|im_end|>", "<|im_start|>"):
-        if stop in text:
-            text = text.split(stop)[0].strip()
+    text = clean_reply_text(text)
     return text, tok_s, ms_tok, n_new
 
 
@@ -404,7 +473,12 @@ def chat_loop(
         if len(history) > max_msgs:
             history = history[-max_msgs:]
 
-        prompt = build_chat_prompt(tokenizer, history, system=system)
+        n_ctx = model_context_length(model)
+        max_prompt = max(n_ctx - max_new_tokens, 64)
+        prompt_ids = build_chat_input_ids(
+            tokenizer, history, system=system, max_length=max_prompt
+        )
+        prompt = ""
         try:
             reply, tok_s, ms_tok, n_new = generate_reply(
                 model,
@@ -416,6 +490,7 @@ def chat_loop(
                 top_p=top_p,
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
+                prompt_token_ids=prompt_ids,
             )
         except KeyboardInterrupt:
             print("\n  (ยกเลิกการสร้างข้อความ)")
