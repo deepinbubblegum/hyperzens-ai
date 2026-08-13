@@ -393,8 +393,14 @@ class FFFSwiGLUBlock(nn.Module):
     def forward(self, hidden_states: Tensor) -> Tensor:
         """FFF gated-GLU forward using ``self.routing_mode``, then ``× output_scale``."""
         mode = self.routing_mode
-        if mode not in ("soft", "hard", "triton"):
+        if mode not in ("soft", "hard", "triton", "sum"):
             mode = "soft"
+        if mode == "sum":
+            # Sum every leaf slice → reconstruct the original dense SwiGLU
+            # (diagnostic / undertrained checkpoints). No √L output_scale.
+            flat, leading = self.fff._flatten_input(hidden_states)
+            y = self.fff._swiglu_all_leaves(flat).sum(dim=1)
+            return y.view(*leading, self.fff.d_model)
         if mode == "soft":
             if self.training:
                 y = self.fff.forward_soft_ste(hidden_states)
@@ -411,6 +417,9 @@ class FFFSwiGLUBlock(nn.Module):
         self.fff.set_temperature(tau)
 
     def set_routing_mode(self, mode: str) -> None:
+        allowed = ("soft", "hard", "triton", "sum")
+        if mode not in allowed:
+            raise ValueError(f"routing_mode must be one of {allowed}, got {mode!r}")
         self.routing_mode = str(mode)
 
     def leaf_probs(self) -> Tensor | None:
@@ -603,7 +612,7 @@ def iter_fff_swiglu_blocks(model: Any) -> Iterator[FFFSwiGLUBlock]:
 
 
 def set_fff_routing_mode(model: Any, mode: str) -> None:
-    """Set soft / hard / triton on every injected FFF SwiGLU block."""
+    """Set soft / hard / triton / sum on every injected FFF SwiGLU block."""
     for block in iter_fff_swiglu_blocks(model):
         block.set_routing_mode(mode)
 
