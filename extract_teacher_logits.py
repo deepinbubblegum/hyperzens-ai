@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Pre-compute teacher Top-K logits for offline FFF distillation (Phase 1).
 
-Loads **only** the teacher (default ``Qwen/Qwen3.6-35B-Instruct``, resolved to
-the Hub checkpoint ``Qwen/Qwen3.6-35B-A3B``), tokenizes the multi-domain
-ChatML mixture (CoT / Agent / Code / Thai / English) at ``max_length=2048``,
-and writes compressed ``.pt`` shards::
+Loads **only** the teacher (default ``Qwen/Qwen2.5-32B-Instruct``), tokenizes
+the multi-domain ChatML mixture (CoT / Agent / Code / Thai / English) at
+``max_length=2048``, and writes compressed ``.pt`` shards::
 
     data/logits_cache/cot_logits.pt
     data/logits_cache/agent_logits.pt
@@ -19,19 +18,21 @@ Each shard stores, per token:
 
 plus ``input_ids`` / ``attention_mask`` so Phase 2 never reloads the teacher.
 
-35B on RTX 3060 12GB
+32B on RTX 3060 12GB
 --------------------
-Qwen3.6-35B is a multimodal MoE checkpoint (~18GB in 4-bit). bitsandbytes
-NF4 + Accelerate ``device_map="auto"`` with
+Qwen2.5-32B-Instruct is a standard CausalLM (~18GB in 4-bit NF4). bitsandbytes
++ Accelerate ``device_map="auto"`` with
 ``max_memory={0: "6GiB", "cpu": "48GiB"}`` keeps ~6GB of 4-bit weights on the
 RTX 3060 and leaves ~5.6GB VRAM free for activations and CUDA allocator
 overhead. Remaining 4-bit layers offload to system RAM.
+Loading uses ``AutoModelForCausalLM.from_pretrained`` only (no ImageText
+auto-classes) with ``low_cpu_mem_usage=True``.
 Default micro-batch is 1 at ``T=2048`` (raise to 2 if VRAM allows).
 
 Example
 -------
     python extract_teacher_logits.py --device cuda
-    python extract_teacher_logits.py --teacher_name Qwen/Qwen3.6-35B-Instruct
+    python extract_teacher_logits.py --teacher_name Qwen/Qwen2.5-32B-Instruct
     python extract_teacher_logits.py --kl-topk 50 --max-length 2048 --batch-size 1
     python extract_teacher_logits.py --smoke-test --smoke-synthetic-data
 """
@@ -75,8 +76,6 @@ from fff_hf import (
     enable_model_sdpa,
     encode_truncate_left,
     extract_teacher_topk,
-    load_dense_teacher,
-    load_hf_causal_lm,
     model_vocab_size,
     resolve_compute_dtype,
 )
@@ -87,8 +86,8 @@ from train_fff_agent import (
     messages_to_chatml,
 )
 
-DEFAULT_TEACHER: str = "Qwen/Qwen3.6-35B-Instruct"
-# Official Hub id for the 35B Instruct / thinking checkpoint (MoE 35B / 3B active).
+DEFAULT_TEACHER: str = "Qwen/Qwen2.5-32B-Instruct"
+# Optional Qwen3.6 Hub id (image-text; not the Phase-1 default).
 HUB_TEACHER_35B: str = "Qwen/Qwen3.6-35B-A3B"
 DEFAULT_KL_TOPK: int = 50
 DEFAULT_MAX_LENGTH: int = 2048
@@ -110,8 +109,8 @@ _TEACHER_HUB_ALIASES: dict[str, str] = {
 def resolve_teacher_hub_id(name: str) -> str:
     """Map ``--teacher_name`` aliases to a loadable HuggingFace repo id.
 
-    ``Qwen/Qwen3.6-35B-Instruct`` is the Phase-1 display name; weights live at
-    ``Qwen/Qwen3.6-35B-A3B`` (image-text Instruct checkpoint).
+    Default teacher is ``Qwen/Qwen2.5-32B-Instruct`` (plain CausalLM).
+    Qwen3.6 ``*-Instruct`` aliases still map to ``Qwen/Qwen3.6-35B-A3B``.
     """
     raw = str(name).strip()
     mapped = _TEACHER_HUB_ALIASES.get(raw.lower())
@@ -133,10 +132,10 @@ def _require_tokenizer() -> Any:
 
 
 def load_teacher_tokenizer(hub_id: str) -> Any:
-    """Load tokenizer for a Qwen3.6 (or CausalLM) teacher checkpoint.
+    """Load tokenizer for a CausalLM teacher (Qwen2.5-32B-Instruct by default).
 
-    Tries ``AutoTokenizer`` first, then ``AutoProcessor.tokenizer`` for
-    image-text Instruct wrappers that do not expose a standalone tokenizer.
+    Uses ``AutoTokenizer`` first. Falls back to ``AutoProcessor.tokenizer``
+    only if the checkpoint has no standalone tokenizer.
     """
     AutoTokenizer = _require_tokenizer()
     try:
@@ -214,6 +213,51 @@ def summarize_device_map(teacher: Any) -> str:
     return " ".join(f"{dev}={n}" for dev, n in sorted(counts.items()))
 
 
+def _require_causal_lm() -> Any:
+    try:
+        from transformers import AutoModelForCausalLM
+    except ImportError as exc:
+        raise SystemExit(
+            "transformers is required: pip install transformers"
+        ) from exc
+    return AutoModelForCausalLM
+
+
+def _from_pretrained_causal_lm(model_name: str, **kwargs: Any) -> Any:
+    """Load via ``AutoModelForCausalLM.from_pretrained`` only.
+
+    Never tries ``AutoModelForImageTextToText`` (that path materializes meta
+    tensors and breaks bitsandbytes 4-bit offload with
+    ``Tensor.item() cannot be called on meta tensors``).
+    """
+    AutoModelForCausalLM = _require_causal_lm()
+    kwargs.setdefault("trust_remote_code", True)
+    kwargs.setdefault("low_cpu_mem_usage", True)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    except (TypeError, ValueError):
+        if kwargs.get("attn_implementation") != "sdpa":
+            raise
+        print("  SDPA attn_implementation rejected; retrying default attention ...")
+        fallback = {k: v for k, v in kwargs.items() if k != "attn_implementation"}
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return AutoModelForCausalLM.from_pretrained(model_name, **fallback)
+
+
+def _freeze_eval(teacher: Any) -> Any:
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    if hasattr(teacher, "config"):
+        teacher.config.use_cache = False
+    return teacher
+
+
 def load_extract_teacher(
     model_name: str,
     device: torch.device,
@@ -234,12 +278,15 @@ def load_extract_teacher(
         max_memory = {0: "6GiB", "cpu": "48GiB"}
 
     so RTX 3060 12GB keeps ~6GB of 4-bit weights on GPU and ~5.6GB VRAM
-    free for activations / CUDA caching allocator. Remaining 35B 4-bit
+    free for activations / CUDA caching allocator. Remaining 32B 4-bit
     layers offload to system RAM (PCIe during the forward).
+
+    Weights are loaded with ``AutoModelForCausalLM.from_pretrained`` and
+    ``low_cpu_mem_usage=True`` — no ImageText auto-class fallback.
 
     MPS / CPU path
     --------------
-    Dense ``bfloat16`` / ``float16`` (4-bit NF4 is CUDA-only). A 35B dense
+    Dense ``bfloat16`` / ``float16`` (4-bit NF4 is CUDA-only). A 32B dense
     teacher will not fit on a laptop — use CUDA for Phase 1 extraction.
     """
     if not use_4bit or device.type != "cuda" or not torch.cuda.is_available():
@@ -249,10 +296,16 @@ def load_extract_teacher(
         )
         if any(tag in model_name.lower() for tag in ("32b", "35b")) and device.type != "cuda":
             print(
-                "warning: Qwen3.6-35B extraction is intended for CUDA "
-                "(RTX 3060 12GB + ~48GiB RAM). Dense 35B will likely OOM here."
+                "warning: Qwen2.5-32B extraction is intended for CUDA "
+                "(RTX 3060 12GB + ~48GiB RAM). Dense 32B will likely OOM here."
             )
-        return load_dense_teacher(model_name, device, dtype=compute_dtype)
+        teacher = _from_pretrained_causal_lm(
+            model_name,
+            dtype=compute_dtype,
+            low_cpu_mem_usage=True,
+            attn_implementation="sdpa",
+        )
+        return _freeze_eval(teacher.to(device=device, dtype=compute_dtype))
 
     try:
         from transformers import BitsAndBytesConfig
@@ -264,7 +317,7 @@ def load_extract_teacher(
         import bitsandbytes  # noqa: F401
     except ImportError as extra:
         raise SystemExit(
-            "bitsandbytes is required for 4-bit 35B extraction:\n"
+            "bitsandbytes is required for 4-bit 32B extraction:\n"
             "  pip install bitsandbytes"
         ) from extra
 
@@ -280,7 +333,10 @@ def load_extract_teacher(
         bnb_4bit_use_double_quant=True,
         llm_int8_enable_fp32_cpu_offload=True,
     )
-    extra: dict[str, Any] = {}
+    extra: dict[str, Any] = {
+        "low_cpu_mem_usage": True,
+        "attn_implementation": "sdpa",
+    }
     if offload_folder is not None:
         offload_folder.mkdir(parents=True, exist_ok=True)
         extra["offload_folder"] = str(offload_folder)
@@ -290,21 +346,14 @@ def load_extract_teacher(
         f"Loading 4-bit teacher `{model_name}` with device_map='auto' "
         f"max_memory={max_memory} (bnb_4bit_compute_dtype=bfloat16) ..."
     )
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    teacher = load_hf_causal_lm(
+    teacher = _from_pretrained_causal_lm(
         model_name,
         quantization_config=bnb_cfg,
         device_map="auto",
         max_memory=max_memory,
-        extra_from_pretrained=extra or None,
+        **extra,
     )
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-    if hasattr(teacher, "config"):
-        teacher.config.use_cache = False
+    teacher = _freeze_eval(teacher)
     print(f"  hf_device_map: {summarize_device_map(teacher)}")
     return teacher
 
@@ -395,7 +444,7 @@ def extract_topk_for_ids(
 ) -> tuple[Tensor, Tensor]:
     """Teacher forward over ``(N, T)`` ids → compact Top-K tensors on CPU.
 
-    Uses a small micro-batch (default 1 at T=2048) so a 4-bit 35B teacher with CPU
+    Uses a small micro-batch (default 1 at T=2048) so a 4-bit 32B teacher with CPU
     offload stays under the 6GiB weight cap. On CUDA OOM the batch size is
     halved automatically down to 1.
 
@@ -487,7 +536,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Pre-compute teacher Top-K logits for offline distillation "
-            "(35B 4-bit + CPU offload)"
+            "(32B 4-bit + CPU offload)"
         )
     )
     p.add_argument(
@@ -497,8 +546,7 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default=DEFAULT_TEACHER,
         help=(
-            "Teacher HF id or alias (default: Qwen/Qwen3.6-35B-Instruct → "
-            "Qwen/Qwen3.6-35B-A3B)"
+            "Teacher HF id (default: Qwen/Qwen2.5-32B-Instruct)"
         ),
     )
     p.add_argument(
@@ -615,7 +663,7 @@ def main() -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 72)
-    print("Extract teacher Top-K logits — Phase 1 (35B 4-bit + CPU offload)")
+    print("Extract teacher Top-K logits — Phase 1 (32B 4-bit + CPU offload)")
     print("=" * 72)
     print_device_info(device)
 
