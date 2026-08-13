@@ -36,6 +36,8 @@ from models.fff_hard_triton import is_triton_available
 # Qwen3.5 native context (256K tokens). Train micro-batches stay short;
 # this only configures model / tokenizer capacity for long-context inference.
 CONTEXT_LENGTH_256K: int = 262_144
+# Sequence-axis chunk for teacher Top-K so ``(B, T, V)`` never becomes FP32.
+TEACHER_TOPK_SEQ_CHUNK: int = 256
 
 
 def annealed_tau(
@@ -694,20 +696,107 @@ def gather_student_leaf_probs(student: Any) -> Tensor:
     return torch.cat(chunks, dim=0)
 
 
+def _release_cuda_cache() -> None:
+    """Drop orphaned CUDA blocks after a large logits tensor is freed."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _topk_vocab_native(logits_chunk: Tensor, k_eff: int) -> tuple[Tensor, Tensor]:
+    """``torch.topk`` in the chunk's native dtype; cast only ``(..., K)`` values.
+
+    Parameters
+    ----------
+    logits_chunk:
+        ``(..., V)`` scores (bf16 / fp16 / fp32). Not cast to FP32.
+    k_eff:
+        ``K`` along the last (vocab) axis.
+
+    Returns
+    -------
+    topk_val:
+        ``(..., K)`` float32 values.
+    topk_idx:
+        ``(..., K)`` int64 indices.
+    """
+    values, indices = torch.topk(logits_chunk, k=k_eff, dim=-1)
+    out_val = values.float()
+    del values
+    return out_val, indices
+
+
 @torch.no_grad()
 def extract_teacher_topk(
     teacher_logits: Tensor,
     *,
     k: int = 200,
     vocab_limit: int | None = None,
+    seq_chunk: int = TEACHER_TOPK_SEQ_CHUNK,
 ) -> tuple[Tensor, Tensor]:
-    """Select teacher Top-K logits / indices; drop the full ``V`` tensor ASAP."""
+    """Select teacher Top-K logits / indices without an FP32 ``(B, T, V)`` copy.
+
+    ``torch.topk`` runs on ``teacher_logits[..., :v]`` in native bf16/fp16.
+    Only the compact ``(..., K)`` values are cast to float32. When the
+    sequence axis ``T`` (dim ``-2`` for rank ≥ 3, dim ``0`` for rank 2)
+    exceeds ``seq_chunk`` (default 256), extraction loops over sequence
+    chunks so peak extra VRAM is ``O(B · chunk · V)`` instead of
+    ``O(B · T · V)`` in FP32 (~1.24 GiB at ``T=2048``, ``V=152064``).
+
+    Parameters
+    ----------
+    teacher_logits:
+        ``(B, T, V)`` or ``(N, V)`` teacher scores.
+    k:
+        Top-K along the vocab axis.
+    vocab_limit:
+        Optional vocab cap ``v <= V`` (e.g. student vocab).
+    seq_chunk:
+        Sequence-chunk length. ``T > seq_chunk`` enables chunking;
+        ``seq_chunk <= 0`` disables it.
+
+    Returns
+    -------
+    topk_val:
+        ``(B, T, K)`` or ``(N, K)`` float32 values.
+    topk_idx:
+        Matching int64 indices.
+    """
     v = int(teacher_logits.size(-1) if vocab_limit is None else vocab_limit)
     v = min(v, int(teacher_logits.size(-1)))
     k_eff = min(int(k), v)
-    topk_val, topk_idx = torch.topk(
-        teacher_logits[..., :v].float(), k=k_eff, dim=-1
-    )
+    logits = teacher_logits[..., :v]
+    chunk = int(seq_chunk)
+
+    seq_dim: int | None = None
+    seq_len = 0
+    if logits.ndim >= 3:
+        seq_dim = -2
+        seq_len = int(logits.size(-2))
+    elif logits.ndim == 2:
+        seq_dim = 0
+        seq_len = int(logits.size(0))
+
+    if seq_dim is None or chunk <= 0 or seq_len <= chunk:
+        topk_val, topk_idx = _topk_vocab_native(logits, k_eff)
+        del logits
+        return topk_val, topk_idx
+
+    val_chunks: list[Tensor] = []
+    idx_chunks: list[Tensor] = []
+    for start in range(0, seq_len, chunk):
+        length = min(chunk, seq_len - start)
+        piece = logits.narrow(seq_dim, start, length)
+        val_p, idx_p = _topk_vocab_native(piece, k_eff)
+        val_chunks.append(val_p)
+        idx_chunks.append(idx_p)
+        del piece, val_p, idx_p
+
+    del logits
+    topk_val = torch.cat(val_chunks, dim=seq_dim)
+    topk_idx = torch.cat(idx_chunks, dim=seq_dim)
+    del val_chunks, idx_chunks
+    _release_cuda_cache()
     return topk_val, topk_idx
 
 
