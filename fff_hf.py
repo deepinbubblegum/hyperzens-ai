@@ -12,7 +12,8 @@ temperature annealing, and checkpoint restore.
 from __future__ import annotations
 
 import math
-from contextlib import contextmanager, nullcontext
+import sys
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -160,25 +161,41 @@ def load_hf_causal_lm(
 
 @contextmanager
 def bf16_autocast(device: torch.device) -> Iterator[None]:
-    """Mixed-precision autocast: CUDA BF16, MPS BF16/FP16, otherwise no-op."""
+    """Mixed-precision autocast: CUDA BF16, MPS BF16/FP16, otherwise no-op.
+
+    Uses a single ``yield`` plus ``try/finally`` so an exception inside the
+    training step cannot trigger ``generator didn't stop after throw()``.
+    """
+    cm: AbstractContextManager[Any]
     if device.type == "cuda":
         dtype = (
             torch.bfloat16
             if torch.cuda.is_bf16_supported()
             else torch.float16
         )
-        with torch.amp.autocast(device_type="cuda", dtype=dtype):
-            yield
-        return
-    if device.type == "mps":
+        cm = torch.amp.autocast(device_type="cuda", dtype=dtype)
+    elif device.type == "mps":
         try:
-            with torch.amp.autocast(device_type="mps", dtype=_mps_half_dtype()):
-                yield
-            return
+            cm = torch.amp.autocast(
+                device_type="mps", dtype=_mps_half_dtype()
+            )
         except Exception:
-            pass
-    with nullcontext():
+            cm = nullcontext()
+    else:
+        cm = nullcontext()
+
+    entered = False
+    exc: tuple[Any, Any, Any] = (None, None, None)
+    try:
+        cm.__enter__()
+        entered = True
         yield
+    except Exception:
+        exc = sys.exc_info()
+        raise
+    finally:
+        if entered:
+            cm.__exit__(*exc)
 
 
 def _mps_half_dtype() -> torch.dtype:

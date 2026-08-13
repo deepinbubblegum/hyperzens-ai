@@ -54,7 +54,6 @@ from device_utils import (
     amp_autocast,
     apply_hardware_optimizations,
     make_grad_scaler,
-    pin_memory_for,
     print_device_info,
     resolve_device,
 )
@@ -864,7 +863,7 @@ def main() -> None:
         shuffle=True,
         drop_last=True,
         num_workers=0,
-        pin_memory=pin_memory_for(device),
+        pin_memory=(device.type == "cuda"),
     )
     print(f"train chunks={len(dataset)} block_size={cfg.block_size}")
 

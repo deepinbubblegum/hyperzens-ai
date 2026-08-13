@@ -77,7 +77,6 @@ from tqdm import tqdm
 
 from device_utils import (
     apply_hardware_optimizations,
-    pin_memory_for,
     print_device_info,
     resolve_device,
 )
@@ -659,17 +658,36 @@ def feature_matching_loss(
 ) -> Tensor:
     """MSE between L2-normalized mean-pooled last hidden states.
 
-    Handles different widths (1.5B vs 7B) by adaptive-pooling both sides to
-    ``min(D_s, D_t)`` before the MSE — cheap and VRAM-friendly vs full-seq
-    feature maps.
+    Handles different widths (e.g. 2B vs 4B) by linearly interpolating both
+    sides to ``min(D_s, D_t)`` before the MSE. ``F.interpolate`` is used
+    instead of ``adaptive_avg_pool1d`` because MPS requires the input length
+    to divide the output length.
     """
     # (B, T, D) → (B, D)
     s = student_hidden.float().mean(dim=1)
     t = teacher_hidden.float().mean(dim=1).detach()
     target = min(int(s.size(-1)), int(t.size(-1)))
-    s = F.adaptive_avg_pool1d(s.unsqueeze(1), target).squeeze(1)
-    t = F.adaptive_avg_pool1d(t.unsqueeze(1), target).squeeze(1)
+    s = _align_feature_width(s, target)
+    t = _align_feature_width(t, target)
     return F.mse_loss(F.normalize(s, dim=-1), F.normalize(t, dim=-1))
+
+
+def _align_feature_width(hidden: Tensor, target: int) -> Tensor:
+    """Resize ``(B, D)`` to ``(B, target)`` with linear interpolation.
+
+    Works on CUDA, MPS, and CPU when ``D`` does not divide ``target``.
+    """
+    width = int(hidden.size(-1))
+    if width == target:
+        return hidden
+    # (B, D) → (B, 1, D) so interpolate acts on the feature axis.
+    aligned = F.interpolate(
+        hidden.unsqueeze(1),
+        size=target,
+        mode="linear",
+        align_corners=False,
+    )
+    return aligned.squeeze(1)
 
 
 def ultimate_distill_loss(
@@ -944,7 +962,7 @@ def main() -> None:
         mixture,
         batch_size=cfg.batch_size,
         num_workers=0,
-        pin_memory=pin_memory_for(device),
+        pin_memory=(device.type == "cuda"),
     )
     print(
         f"mixture ready | domains={list(mixture.domains)} | "

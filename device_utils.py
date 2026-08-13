@@ -117,8 +117,11 @@ def apply_hardware_optimizations(device: torch.device) -> None:
 
 
 def pin_memory_for(device: torch.device) -> bool:
-    """Whether DataLoader should pin host memory for this device."""
-    return device.type in {"cuda", "mps"}
+    """Whether DataLoader should pin host memory.
+
+    Pinned pages help CUDA H2D copies. MPS and CPU warn if ``pin_memory=True``.
+    """
+    return device.type == "cuda"
 
 
 def amp_enabled(device: torch.device) -> bool:

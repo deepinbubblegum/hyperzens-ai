@@ -532,7 +532,7 @@ def main() -> None:
     assert int(meta["vocab_size"]) == cfg.vocab_size == GPT2_VOCAB_SIZE
     _ = get_gpt2_encoding()  # ensure tiktoken is importable early
 
-    pin_memory = bool(pin_memory_for(device) or device.type == "cuda")
+    pin_memory = pin_memory_for(device)
     train_loader = make_dataloader(
         train_ds,
         batch_size=cfg.batch_size,
