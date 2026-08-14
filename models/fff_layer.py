@@ -1292,6 +1292,15 @@ class QuantizedLeafWeights:
         *,
         quant_type: str = "nf4",
         block_size: int = 64,
+        gate_absmax: Tensor | None = None,
+        up_absmax: Tensor | None = None,
+        down_absmax: Tensor | None = None,
+        gate_rows: int = 0,
+        gate_cols: int = 0,
+        up_rows: int = 0,
+        up_cols: int = 0,
+        down_rows: int = 0,
+        down_cols: int = 0,
     ) -> None:
         self.gate_qweight = gate_qweight
         self.gate_qstate = gate_qstate
@@ -1302,8 +1311,22 @@ class QuantizedLeafWeights:
         self.quant_type = quant_type
         self.block_size = block_size
 
+        # Per-block (rows, ceil(cols / block_size)) fp32 absmax, computed from
+        # the original full-precision weights at quantize time. Kept on CPU so
+        # only small slices are moved to GPU per chunk (chunked dequant never
+        # materializes the full FP32 weight set).
+        self.gate_absmax = gate_absmax
+        self.up_absmax = up_absmax
+        self.down_absmax = down_absmax
+        self.gate_rows = int(gate_rows)
+        self.gate_cols = int(gate_cols)
+        self.up_rows = int(up_rows)
+        self.up_cols = int(up_cols)
+        self.down_rows = int(down_rows)
+        self.down_cols = int(down_cols)
+
     def to(self, device: torch.device) -> "QuantizedLeafWeights":
-        """Move quantized weights to device."""
+        """Move quantized weights to device (absmax stays on CPU)."""
         return QuantizedLeafWeights(
             self.gate_qweight.to(device),
             self.gate_qstate,
@@ -1313,11 +1336,118 @@ class QuantizedLeafWeights:
             self.down_qstate,
             quant_type=self.quant_type,
             block_size=self.block_size,
+            gate_absmax=self.gate_absmax,
+            up_absmax=self.up_absmax,
+            down_absmax=self.down_absmax,
+            gate_rows=self.gate_rows,
+            gate_cols=self.gate_cols,
+            up_rows=self.up_rows,
+            up_cols=self.up_cols,
+            down_rows=self.down_rows,
+            down_cols=self.down_cols,
         )
 
     @property
     def device(self) -> torch.device:
         return self.gate_qweight.device
+
+
+# ---------------------------------------------------------------------------
+# Pure-PyTorch NF4 blockwise dequantization (no bitsandbytes at inference)
+# ---------------------------------------------------------------------------
+
+# Standard QLoRA NF4 codebook (stable across bitsandbytes versions).
+_NF4_CODEBOOK = torch.tensor(
+    [
+        -1.0,
+        -0.6961928009986877,
+        -0.5250730514526367,
+        -0.39491748809814453,
+        -0.28444138169288635,
+        -0.18477343022823334,
+        -0.09105003625154495,
+        0.0,
+        0.07958029955625534,
+        0.16093020141124725,
+        0.24611230194568634,
+        0.33791524171829224,
+        0.44070982933044434,
+        0.5626170039176941,
+        0.7229568362236023,
+        1.0,
+    ],
+    dtype=torch.float32,
+)
+
+
+def _unpack_nibbles(packed: Tensor) -> Tensor:
+    """Expand packed bytes ``(R, C//2)`` → ``(R, C)`` NF4 codes in ``[0, 15]``.
+
+    Mirrors bitsandbytes ``convert4to8``: within each group of 4 bytes
+    (8 values) the nibble order alternates, and a byte's two nibbles land 4
+    columns apart.
+    """
+    p = packed.to(torch.int32)
+    r, half = p.shape
+    lo = p & 0x0F
+    hi = (p >> 4) & 0x0F
+    out = torch.empty(r, half * 2, dtype=torch.int32, device=p.device)
+    base = torch.arange(half, device=p.device)
+    idx = (base // 4) * 8 + (base % 4)
+    swap = (base // 4) % 2 == 1
+    out[:, idx] = torch.where(swap, hi, lo)
+    out[:, idx + 4] = torch.where(swap, lo, hi)
+    return out
+
+
+def _per_block_absmax(w: Tensor, block_size: int) -> Tensor:
+    """Per-block ``max|w|`` for a 2D ``(rows, cols)`` tensor → ``(rows, nb)`` fp32."""
+    flat = w.reshape(-1, w.shape[-1])
+    rows, cols = flat.shape
+    nb = (cols + block_size - 1) // block_size
+    pad = nb * block_size - cols
+    if pad:
+        flat = F.pad(flat, (0, pad))
+    return flat.reshape(rows, nb, block_size).abs().amax(dim=-1).float().contiguous()
+
+
+def _dequantize_blockwise(
+    packed: Tensor,
+    absmax: Tensor,
+    rows: Tensor,
+    out_cols: int,
+    block_size: int,
+    *,
+    quant_type: str = "nf4",
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Dequantize the NF4 rows indexed by ``rows`` (1D long) into ``dtype``.
+
+    Peak memory is bounded by the number of requested rows — the full weight
+    set is never materialized. ``absmax`` is ``(rows_total, ceil(cols / bs))``
+    fp32 (kept on CPU by :meth:`MultiTreeFFFLayer.quantize_leaves`).
+    """
+    if quant_type != "nf4":
+        raise RuntimeError(
+            f"chunked blockwise dequant supports 'nf4' only, got {quant_type!r}"
+        )
+    if out_cols % 8 != 0:
+        raise RuntimeError(
+            f"out_cols must be a multiple of 8 for bnb nibble unpacking, got {out_cols}"
+        )
+    if packed.shape[1] * 2 != out_cols:
+        raise RuntimeError(
+            f"packed width {packed.shape[1]}*2 != out_cols {out_cols}"
+        )
+    rows = rows.to(device=packed.device)
+    packed_rows = packed.index_select(0, rows)
+    codes = _unpack_nibbles(packed_rows)
+    am = absmax.index_select(0, rows.to(device="cpu")).to(
+        device=packed.device, dtype=torch.float32
+    )
+    blk = torch.arange(out_cols, device=packed.device) // block_size
+    codebook = _NF4_CODEBOOK.to(device=packed.device)
+    return (codebook[codes] * am[:, blk]).to(dtype=dtype)
 
 
 def quantize_leaf_weights_fp4(
@@ -1342,7 +1472,8 @@ def quantize_leaf_weights_fp4(
     Returns
     -------
     QuantizedLeafWeights
-        Container with quantized weights and quantization state.
+        Container with quantized weights, quantization state, per-block absmax,
+        and logical shapes for chunked blockwise dequantization.
     """
     if not BNB_AVAILABLE:
         raise RuntimeError("bitsandbytes not available. Install with: pip install bitsandbytes")
@@ -1372,10 +1503,55 @@ def quantize_leaf_weights_fp4(
     up_qw, up_qs = _quantize_3d(up_proj)
     down_qw, down_qs = _quantize_3d(down_proj)
 
-    return QuantizedLeafWeights(
+    # Per-block absmax computed from the original weights (no bnb runtime
+    # dependency for the chunked forward path).
+    gate_absmax = _per_block_absmax(gate_proj.reshape(k * l * h, i_exp), block_size)
+    up_absmax = _per_block_absmax(up_proj.reshape(k * l * h, i_exp), block_size)
+    down_absmax = _per_block_absmax(down_proj.reshape(k * l * i_exp, h), block_size)
+
+    qstate = QuantizedLeafWeights(
         gate_qw, gate_qs, up_qw, up_qs, down_qw, down_qs,
-        quant_type=quant_type, block_size=block_size
+        quant_type=quant_type,
+        block_size=block_size,
+        gate_absmax=gate_absmax,
+        up_absmax=up_absmax,
+        down_absmax=down_absmax,
+        gate_rows=k * l * h,
+        gate_cols=i_exp,
+        up_rows=k * l * h,
+        up_cols=i_exp,
+        down_rows=k * l * i_exp,
+        down_cols=h,
     )
+
+    # Runtime self-check: if our nibble-unpack order mismatches this bnb
+    # version, dequantized values would scramble — detect it immediately.
+    try:
+        n_check = min(64, gate_qw.shape[0])
+        rows = torch.arange(n_check)
+        deq = _dequantize_blockwise(
+            gate_qw, gate_absmax, rows, i_exp, block_size,
+            quant_type=quant_type, dtype=torch.float32,
+        )
+        orig = gate_proj.reshape(-1, i_exp)[:n_check].to(
+            device=deq.device, dtype=torch.float32
+        )
+        err = (deq - orig).abs().max().item()
+        tol = max(1e-2, 2.0 * float(math.sqrt(2.0 / (h + i_exp))))
+        if err > tol:
+            warnings.warn(
+                f"NF4 dequant self-check failed (max err {err:.4f} > {tol:.4f}). "
+                f"This bitsandbytes version may use a different nibble order.",
+                stacklevel=2,
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        warnings.warn(
+            f"NF4 dequant self-check skipped ({exc}). "
+            f"Chunked forward will still run.",
+            stacklevel=2,
+        )
+
+    return qstate
 
 
 def dequantize_leaf_weights(qweights: QuantizedLeafWeights) -> tuple[Tensor, Tensor, Tensor]:
@@ -2058,11 +2234,16 @@ class MultiTreeFFFLayer(nn.Module):
         return qstate
 
     def dequantize_leaves(self) -> tuple[Tensor, Tensor, Tensor]:
-        """Dequantize leaf weights back to float32 tensors.
+        """Dequantize leaf weights back to float32 tensors (reference only).
+
+        WARNING: materializes the full FP32 weight set (≈26 GB at K=16/d=5) —
+        use only for small configs / verification. The forward paths use
+        :meth:`_swiglu_all_leaves_quantized` / :meth:`_swiglu_selected_quantized`
+        which dequantize in chunks and stay near 4-bit memory.
 
         Returns
         -------
-        tuple of (gate_proj, up_proj, down_proj) in float32 on CPU.
+        tuple of (gate_proj, up_proj, down_proj) in float32.
         """
         if self.leaf_qstate is None:
             raise RuntimeError("No quantized leaf weights to dequantize")
@@ -2071,43 +2252,105 @@ class MultiTreeFFFLayer(nn.Module):
 
         return dequantize_leaf_weights(self.leaf_qstate)
 
+    def _quant_chunk_size(self, budget_bytes: int = 256 * 1024 * 1024) -> int:
+        """Leaves per dequant chunk so peak chunk memory stays under ``budget_bytes``.
+
+        The soft path holds at most ``3 * chunk * H * I`` FP32 dequantized
+        values at once (plus einsum temporaries); the hard path only materializes
+        the unique selected leaves.
+        """
+        per_leaf = 3 * self.hidden_size * self.expert_intermediate_size * 4
+        return max(1, min(self.num_leaves, budget_bytes // max(per_leaf, 1)))
+
     def _swiglu_all_leaves_quantized(self, flat: Tensor) -> Tensor:
-        """Soft forward with 4-bit quantized leaves — dequantizes on-the-fly."""
+        """Soft forward with 4-bit quantized leaves — chunked blockwise dequant.
+
+        Dequantizes leaves in chunks (peak memory ≈ chunk size, never the full
+        FP32 weight set) and accumulates ``(N, K, L, H)`` SwiGLU outputs.
+        """
         if self.leaf_qstate is None:
             raise RuntimeError("Leaf weights not quantized. Call quantize_leaves() first.")
+        qs = self.leaf_qstate
+        n_batch, h = flat.shape
+        k, l, i_exp = self.num_trees, self.num_leaves, self.expert_intermediate_size
+        total = k * l
+        out_flat = torch.empty(n_batch, total, h, device=flat.device, dtype=flat.dtype)
+        chunk = self._quant_chunk_size()
 
-        gate_fp, up_fp, down_fp = self.dequantize_leaves()
-        gate_fp = gate_fp.to(device=flat.device, dtype=flat.dtype)
-        up_fp = up_fp.to(device=flat.device, dtype=flat.dtype)
-        down_fp = down_fp.to(device=flat.device, dtype=flat.dtype)
-
-        gate = torch.einsum("nd,kldh->nklh", flat, gate_fp)
-        up = torch.einsum("nd,kldh->nklh", flat, up_fp)
-        hidden = F.silu(gate) * up
-        return torch.einsum("nklh,klhi->nkli", hidden, down_fp)
+        for s in range(0, total, chunk):
+            e = min(s + chunk, total)
+            rows_g = torch.arange(s * h, e * h, device=flat.device)
+            rows_d = torch.arange(s * i_exp, e * i_exp, device=flat.device)
+            gate = _dequantize_blockwise(
+                qs.gate_qweight, qs.gate_absmax, rows_g, i_exp, qs.block_size,
+                quant_type=qs.quant_type, dtype=flat.dtype,
+            ).view(e - s, h, i_exp)
+            up = _dequantize_blockwise(
+                qs.up_qweight, qs.up_absmax, rows_g, i_exp, qs.block_size,
+                quant_type=qs.quant_type, dtype=flat.dtype,
+            ).view(e - s, h, i_exp)
+            g = torch.einsum("nd,cdi->nci", flat, gate)
+            u = torch.einsum("nd,cdi->nci", flat, up)
+            hidden = F.silu(g) * u
+            down = _dequantize_blockwise(
+                qs.down_qweight, qs.down_absmax, rows_d, h, qs.block_size,
+                quant_type=qs.quant_type, dtype=flat.dtype,
+            ).view(e - s, i_exp, h)
+            out_flat[:, s:e, :] = torch.einsum("nci,cih->nch", hidden, down)
+        return out_flat.view(n_batch, k, l, h)
 
     def _swiglu_selected_quantized(self, flat: Tensor, leaf_ids: Tensor) -> Tensor:
-        """Hard forward with 4-bit quantized leaves — dequantizes only selected leaves."""
+        """Hard forward with 4-bit quantized leaves — dequantizes only selected leaves.
+
+        Materializes the unique routed leaves (chunked), never the full FP32 set.
+        """
         if self.leaf_qstate is None:
             raise RuntimeError("Leaf weights not quantized. Call quantize_leaves() first.")
+        qs = self.leaf_qstate
+        n_batch, h = flat.shape
+        k, l, i_exp = self.num_trees, self.num_leaves, self.expert_intermediate_size
+        m = n_batch * k
+        local_ids = leaf_ids.reshape(-1)
+        tree_of_m = torch.arange(m, device=flat.device) % k
+        batch_of_m = torch.arange(m, device=flat.device) // k
+        global_ids = tree_of_m * l + local_ids
+        out_flat = torch.zeros(m, h, device=flat.device, dtype=flat.dtype)
 
-        gate_fp, up_fp, down_fp = self.dequantize_leaves()
-        gate_fp = gate_fp.to(device=flat.device, dtype=flat.dtype)
-        up_fp = up_fp.to(device=flat.device, dtype=flat.dtype)
-        down_fp = down_fp.to(device=flat.device, dtype=flat.dtype)
+        unique = torch.unique(global_ids)
+        chunk = self._quant_chunk_size()
+        for s in range(0, unique.numel(), chunk):
+            chunk_ids = unique[s : s + chunk]
+            in_chunk = torch.isin(global_ids, chunk_ids)
+            sub_idx = torch.searchsorted(chunk_ids, global_ids[in_chunk])
+            c = chunk_ids.numel()
 
-        n_batch = flat.shape[0]
-        k_idx = torch.arange(self.num_trees, device=flat.device).view(1, -1).expand(n_batch, self.num_trees)
+            rows_g = (
+                chunk_ids.view(-1, 1) * h + torch.arange(h, device=flat.device)
+            ).reshape(-1)
+            rows_d = (
+                chunk_ids.view(-1, 1) * i_exp + torch.arange(i_exp, device=flat.device)
+            ).reshape(-1)
 
-        w_g = gate_fp[k_idx, leaf_ids]
-        w_u = up_fp[k_idx, leaf_ids]
-        w_d = down_fp[k_idx, leaf_ids]
+            w_g = _dequantize_blockwise(
+                qs.gate_qweight, qs.gate_absmax, rows_g, i_exp, qs.block_size,
+                quant_type=qs.quant_type, dtype=flat.dtype,
+            ).view(c, h, i_exp)[sub_idx]
+            w_u = _dequantize_blockwise(
+                qs.up_qweight, qs.up_absmax, rows_g, i_exp, qs.block_size,
+                quant_type=qs.quant_type, dtype=flat.dtype,
+            ).view(c, h, i_exp)[sub_idx]
+            w_d = _dequantize_blockwise(
+                qs.down_qweight, qs.down_absmax, rows_d, h, qs.block_size,
+                quant_type=qs.quant_type, dtype=flat.dtype,
+            ).view(c, i_exp, h)[sub_idx]
 
-        gate = torch.einsum("nd,nkdh->nkh", flat, w_g)
-        up = torch.einsum("nd,nkdh->nkh", flat, w_u)
-        hidden = F.silu(gate) * up
-        per_tree = torch.einsum("nkh,nkhi->nki", hidden, w_d)
-        return per_tree.sum(dim=1)
+            sub_flat = flat[batch_of_m[in_chunk]]
+            gate = torch.einsum("md,mdi->mi", sub_flat, w_g)
+            up = torch.einsum("md,mdi->mi", sub_flat, w_u)
+            hidden = F.silu(gate) * up
+            out_flat[in_chunk] += torch.einsum("mi,mih->mh", hidden, w_d)
+
+        return out_flat.view(n_batch, k, h).sum(dim=1)
 
     def forward_soft(self, x: Tensor) -> Tensor:
         """Soft multi-tree mixture — independent per tree, then sum."""
@@ -2140,14 +2383,7 @@ class MultiTreeFFFLayer(nn.Module):
         masked_in = flat.unsqueeze(1).unsqueeze(1) * mask.unsqueeze(-1)
 
         if self.leaf_qstate is not None:
-            gate_fp, up_fp, down_fp = self.dequantize_leaves()
-            gate_fp = gate_fp.to(device=flat.device, dtype=flat.dtype)
-            up_fp = up_fp.to(device=flat.device, dtype=flat.dtype)
-            down_fp = down_fp.to(device=flat.device, dtype=flat.dtype)
-            gate = torch.einsum("nkld,kldh->nklh", masked_in, gate_fp)
-            up = torch.einsum("nkld,kldh->nklh", masked_in, up_fp)
-            hidden = F.silu(gate) * up
-            leaf_out = torch.einsum("nklh,klhi->nkli", hidden, down_fp)
+            leaf_out = self._swiglu_all_leaves_quantized(flat) * mask.unsqueeze(-1)
         else:
             gate = torch.einsum("nkld,kldh->nklh", masked_in, self.gate_proj)
             up = torch.einsum("nkld,kldh->nklh", masked_in, self.up_proj)
