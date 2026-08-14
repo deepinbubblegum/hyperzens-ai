@@ -1478,6 +1478,17 @@ def quantize_leaf_weights_fp4(
     if not BNB_AVAILABLE:
         raise RuntimeError("bitsandbytes not available. Install with: pip install bitsandbytes")
 
+    # bitsandbytes ``Linear4bit`` packs in a fixed 64-element block size and does
+    # not accept a ``block_size`` constructor kwarg — force 64 downstream so the
+    # absmax layout / dequant block indexing always match the packed bytes.
+    if block_size != 64:
+        warnings.warn(
+            f"bitsandbytes Linear4bit uses a fixed block_size of 64; "
+            f"requested {block_size} is ignored.",
+            stacklevel=2,
+        )
+        block_size = 64
+
     k, l, h, i_exp = gate_proj.shape
 
     def _quantize_3d(weight: Tensor) -> tuple[Tensor, Any]:
@@ -1491,7 +1502,6 @@ def quantize_leaf_weights_fp4(
             compute_dtype=torch.float32,
             compress_statistics=True,
             quant_type=quant_type,
-            block_size=block_size,
         )
         linear4bit.weight = torch.nn.Parameter(weight_2d.t().contiguous(), requires_grad=False)
         linear4bit.to(weight.device)
@@ -1572,7 +1582,6 @@ def dequantize_leaf_weights(qweights: QuantizedLeafWeights) -> tuple[Tensor, Ten
             compute_dtype=torch.float32,
             compress_statistics=True,
             quant_type=qweights.quant_type,
-            block_size=qweights.block_size,
         )
         linear4bit.weight = torch.nn.Parameter(qweight, requires_grad=False)
         linear4bit.weight.quant_state = qstate
@@ -2234,7 +2243,8 @@ class MultiTreeFFFLayer(nn.Module):
 
         self.leaf_qstate = qstate
         self.quant_type = quant_type
-        self.block_size = block_size
+        # Sync the effective block size (Linear4bit fixes it to 64).
+        self.block_size = qstate.block_size
 
         del gate_fp, up_fp, down_fp
         if device.type == "cuda":
