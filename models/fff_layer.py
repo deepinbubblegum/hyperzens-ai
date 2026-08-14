@@ -1,28 +1,14 @@
-"""Fast Feedforward / Multi-Tree CMM linear layer — Belcak & Wattenhofer.
+"""Fast Feedforward / Multi-Tree CMM — Belcak & Wattenhofer.
 
-Replaces a dense linear map with ``K`` independent binary trees of depth
-``d`` (UltraFastBERT / Conditional Matrix Multiplication):
+Core modules:
 
-    y = Σ_{k=1}^{K} (x W_{k, ℓ_k} + b_{k, ℓ_k})
+* :class:`FastFeedforwardLinear` — affine leaf maps (GPT-2 / legacy CMM).
+* :class:`SwiGLULeafExpert` — one SwiGLU FFN expert (gate / up / down).
+* :class:`FFFTree` — single depth-``d`` binary tree (``2^d`` SwiGLU leaves).
+* :class:`MultiTreeFFFLayer` — ``K`` parallel trees for HyperZens 35B Student
+  (default ``H=3584``, ``K=16``, ``d=5``, dense SwiGLU width ``18944``).
 
-``K = 1`` is the original single-tree FFF (checkpoint-compatible).
-
-Tree indexing (heap / breadth-first, 0-based, **per tree**):
-    - Root: 0
-    - Left child of ``i``: ``2*i + 1``
-    - Right child of ``i``: ``2*i + 2``
-    - Leaf heap indices: ``[2^d - 1, 2^{d+1} - 2]``
-    - Contiguous leaf id: ``heap_index - (2^d - 1)``
-
-Parameter layout (tree-major, matches ``csrc/fff_hard.cpp``)::
-
-    router_weights : (K, R, D_in)      R = 2^d - 1
-    router_biases  : (K, R)
-    leaf_weights   : (K, L, D_in, D_out)   L = 2^d
-    leaf_biases    : (K, L, D_out)
-
-Hard routing on CPU uses ``cmm_hard_forward_cpu`` (falls back to the
-legacy ``fff_hard_forward_cpu`` when ``K = 1`` and the symbol is missing).
+``K = 1`` on :class:`FastFeedforwardLinear` is the original single-tree FFF.
 """
 
 from __future__ import annotations
@@ -39,6 +25,51 @@ from torch import Tensor
 
 
 RoutingMode = Literal["soft", "hard", "hard_cpp", "triton", "triton_int8", "triton_int4"]
+
+# ---------------------------------------------------------------------------
+# HyperZens 35B Student — default Multi-Tree FFF SwiGLU geometry
+# ---------------------------------------------------------------------------
+
+HYPERZENS_35B_HIDDEN_SIZE: int = 3584
+HYPERZENS_35B_NUM_TREES: int = 16
+HYPERZENS_35B_TREE_DEPTH: int = 5  # L = 32 leaves / tree, 512 leaves / layer
+HYPERZENS_35B_INTERMEDIATE_SIZE: int = 18944  # dense SwiGLU width (Qwen-class)
+HYPERZENS_35B_LEAVES_PER_TREE: int = 1 << HYPERZENS_35B_TREE_DEPTH
+HYPERZENS_35B_TOTAL_LEAVES: int = HYPERZENS_35B_NUM_TREES * HYPERZENS_35B_LEAVES_PER_TREE
+HYPERZENS_35B_ACTIVE_LEAVES_PER_TOKEN: int = HYPERZENS_35B_NUM_TREES
+
+
+def expert_intermediate_per_leaf(
+    intermediate_size: int,
+    *,
+    num_trees: int,
+) -> int:
+    """SwiGLU hidden width per leaf so ``K`` active experts match dense ``I``.
+
+    With exactly one active leaf per tree, ``K`` SwiGLU experts run per token.
+    Setting ``expert_I = intermediate_size // K`` makes the active intermediate
+    capacity ``K · expert_I ≈ intermediate_size`` (dense MLP budget).
+
+    Parameters
+    ----------
+    intermediate_size:
+        Dense FFN intermediate (e.g. ``18944`` for HyperZens 35B Student).
+    num_trees:
+        Parallel trees ``K``.
+
+    Returns
+    -------
+    int
+        Per-leaf SwiGLU intermediate ``I_leaf`` (must divide evenly).
+    """
+    k = max(int(num_trees), 1)
+    raw = int(intermediate_size)
+    if raw % k != 0:
+        raise ValueError(
+            f"intermediate_size={raw} must be divisible by num_trees={k} "
+            "so K active experts partition the dense SwiGLU width"
+        )
+    return raw // k
 
 # ---------------------------------------------------------------------------
 # Optional C++ hard-routing extension (JIT via torch.utils.cpp_extension)
@@ -1228,6 +1259,560 @@ class FastFeedforwardLinear(nn.Module):
         }
 
 
+# ---------------------------------------------------------------------------
+# SwiGLU Multi-Tree FFF (HyperZens 35B Student)
+# ---------------------------------------------------------------------------
+
+
+class SwiGLULeafExpert(nn.Module):
+    """One SwiGLU feed-forward expert: ``SiLU(gate) ⊙ up → down``.
+
+    Parameter layout (stacked by :class:`FFFTree` / :class:`MultiTreeFFFLayer`)::
+
+        gate_proj : (hidden_size, expert_intermediate)
+        up_proj   : (hidden_size, expert_intermediate)
+        down_proj : (expert_intermediate, hidden_size)
+
+    Forward
+    -------
+    ``x``: ``(..., hidden_size)`` → ``(..., hidden_size)``
+
+        ``y = down( SiLU(x @ gate) ⊙ (x @ up) )``
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        expert_intermediate: int,
+    ) -> None:
+        super().__init__()
+        if hidden_size < 1 or expert_intermediate < 1:
+            raise ValueError(
+                "hidden_size and expert_intermediate must be >= 1, "
+                f"got {hidden_size}, {expert_intermediate}"
+            )
+        self.hidden_size = int(hidden_size)
+        self.expert_intermediate = int(expert_intermediate)
+        self.gate_proj = nn.Parameter(
+            torch.empty(hidden_size, expert_intermediate)
+        )
+        self.up_proj = nn.Parameter(torch.empty(hidden_size, expert_intermediate))
+        self.down_proj = nn.Parameter(
+            torch.empty(expert_intermediate, hidden_size)
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Xavier-style init for gate/up; scaled down-proj (matches HF SwiGLU)."""
+        a = math.sqrt(2.0 / float(self.hidden_size + self.expert_intermediate))
+        nn.init.uniform_(self.gate_proj, -a, a)
+        nn.init.uniform_(self.up_proj, -a, a)
+        nn.init.uniform_(
+            self.down_proj,
+            -a / math.sqrt(max(self.expert_intermediate, 1)),
+            a / math.sqrt(max(self.expert_intermediate, 1)),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Apply SwiGLU on ``x`` with shape ``(..., hidden_size)``."""
+        gate = F.silu(x @ self.gate_proj)
+        up = x @ self.up_proj
+        return (gate * up) @ self.down_proj
+
+
+class FFFTree(nn.Module):
+    """Single binary FFF tree of depth ``d`` with ``2^d`` SwiGLU leaf experts.
+
+    Routing walks ``d`` levels in ``O(d)`` per token, selecting **one** leaf.
+    Routers are scalar gates ``hidden_size → 1`` (dot product + bias).
+
+    Parameters (stacked for GPU efficiency)
+    -------------------------------------
+    router_weights : ``(R, hidden_size)``   ``R = 2^d - 1``
+    router_biases  : ``(R,)``
+    gate_proj      : ``(L, hidden_size, I)``  ``L = 2^d``
+    up_proj        : ``(L, hidden_size, I)``
+    down_proj      : ``(L, I, hidden_size)``
+
+    ``I`` is ``expert_intermediate_size`` (SwiGLU inner dim for each leaf).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        expert_intermediate_size: int,
+        depth: int = 5,
+        *,
+        init_temp: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if depth < 1:
+            raise ValueError(f"depth must be >= 1, got {depth}")
+        if hidden_size < 1 or expert_intermediate_size < 1:
+            raise ValueError("hidden_size and expert_intermediate_size must be >= 1")
+        if init_temp <= 0.0:
+            raise ValueError(f"init_temp must be > 0, got {init_temp}")
+
+        self.hidden_size = int(hidden_size)
+        self.expert_intermediate_size = int(expert_intermediate_size)
+        self.depth = int(depth)
+        self.num_leaves = 1 << self.depth
+        self.num_routers = self.num_leaves - 1
+
+        self.router_weights = nn.Parameter(
+            torch.empty(self.num_routers, self.hidden_size)
+        )
+        self.router_biases = nn.Parameter(torch.empty(self.num_routers))
+
+        i_exp = self.expert_intermediate_size
+        h = self.hidden_size
+        l = self.num_leaves
+        self.gate_proj = nn.Parameter(torch.empty(l, h, i_exp))
+        self.up_proj = nn.Parameter(torch.empty(l, h, i_exp))
+        self.down_proj = nn.Parameter(torch.empty(l, i_exp, h))
+
+        self.register_buffer(
+            "temperature",
+            torch.tensor(float(init_temp)),
+            persistent=True,
+        )
+        path_router_idx, path_go_right, leaf_router_inc = (
+            FastFeedforwardLinear._build_path_tables(
+                self.depth, self.num_leaves, self.num_routers
+            )
+        )
+        self.register_buffer("path_router_idx", path_router_idx, persistent=False)
+        self.register_buffer("path_go_right", path_go_right, persistent=False)
+        self.register_buffer("leaf_router_inc", leaf_router_inc, persistent=False)
+
+        self._last_leaf_probs: Tensor | None = None
+        self._last_node_decisions: Tensor | None = None
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Tiny Gaussian routers; Xavier SwiGLU slices per leaf."""
+        nn.init.normal_(self.router_weights, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.router_biases)
+        a = math.sqrt(2.0 / float(self.hidden_size + self.expert_intermediate_size))
+        nn.init.uniform_(self.gate_proj, -a, a)
+        nn.init.uniform_(self.up_proj, -a, a)
+        nn.init.uniform_(self.down_proj, -a, a)
+
+    def set_temperature(self, temp: float) -> None:
+        """Set soft-routing temperature ``τ`` (anneal toward 0 in training)."""
+        if temp <= 0.0:
+            raise ValueError(f"temperature must be > 0, got {temp}")
+        self.temperature.fill_(float(temp))
+
+    def _flatten(self, x: Tensor) -> tuple[Tensor, tuple[int, ...]]:
+        if x.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"expected last dim hidden_size={self.hidden_size}, "
+                f"got {x.shape[-1]}"
+            )
+        leading = tuple(x.shape[:-1])
+        return x.reshape(-1, self.hidden_size), leading
+
+    def _swiglu_all_leaves(self, flat: Tensor) -> Tensor:
+        """All ``L`` SwiGLU leaves — ``(N, L, H)``."""
+        gate = torch.einsum("nd,ldh->nlh", flat, self.gate_proj)
+        up = torch.einsum("nd,ldh->nlh", flat, self.up_proj)
+        hidden = F.silu(gate) * up
+        return torch.einsum("nlh,lhi->nli", hidden, self.down_proj)
+
+    def _swiglu_leaves(self, flat: Tensor, leaf_ids: Tensor) -> Tensor:
+        """Selected leaves ``leaf_ids`` — ``(N,)`` → ``(N, H)``."""
+        w_g = self.gate_proj[leaf_ids]  # (N, H, I)
+        w_u = self.up_proj[leaf_ids]
+        w_d = self.down_proj[leaf_ids]  # (N, I, H)
+        gate = torch.einsum("nd,ndh->nh", flat, w_g)
+        up = torch.einsum("nd,ndh->nh", flat, w_u)
+        hidden = F.silu(gate) * up
+        return torch.einsum("nh,nhi->ni", hidden, w_d)
+
+    def _soft_leaf_logits(self, flat: Tensor) -> tuple[Tensor, Tensor]:
+        """Log-path scores ``(N, L)`` and router decisions ``(N, R)``."""
+        eps = 1e-7
+        router_logits = (
+            flat @ self.router_weights.T + self.router_biases
+        ) / self.temperature
+        node_decisions = torch.sigmoid(router_logits).clamp(min=eps, max=1.0 - eps)
+        log_c = F.logsigmoid(router_logits)
+        log_not_c = F.logsigmoid(-router_logits)
+        idx = self.path_router_idx
+        log_edges = torch.where(
+            self.path_go_right.view(1, self.num_leaves, self.depth),
+            log_c[:, idx],
+            log_not_c[:, idx],
+        )
+        return log_edges.sum(dim=-1), node_decisions
+
+    def _hard_leaf_ids(self, flat: Tensor) -> Tensor:
+        """``O(d)`` tree walk → contiguous leaf ids ``(N,)`` in ``[0, L)``."""
+        node_ids = torch.zeros(flat.shape[0], dtype=torch.long, device=flat.device)
+        for _ in range(self.depth):
+            w = self.router_weights[node_ids]
+            b = self.router_biases[node_ids]
+            go_right = (torch.einsum("nd,nd->n", flat, w) + b) > 0
+            node_ids = (node_ids << 1) + 1 + go_right.to(torch.long)
+        return node_ids - (self.num_leaves - 1)
+
+    def forward_soft(self, x: Tensor) -> Tensor:
+        """Differentiable mixture over all ``L`` SwiGLU leaves."""
+        flat, leading = self._flatten(x)
+        log_leaf, node_decisions = self._soft_leaf_logits(flat)
+        leaf_probs = F.softmax(log_leaf, dim=-1)
+        self._last_leaf_probs = leaf_probs
+        self._last_node_decisions = node_decisions
+        leaf_out = self._swiglu_all_leaves(flat)
+        y = torch.einsum("nl,nli->ni", leaf_probs, leaf_out)
+        return y.view(*leading, self.hidden_size)
+
+    def forward_hard(self, x: Tensor) -> Tensor:
+        """Hard routing — evaluate only the selected SwiGLU leaf."""
+        flat, leading = self._flatten(x)
+        leaf_ids = self._hard_leaf_ids(flat)
+        y = self._swiglu_leaves(flat, leaf_ids)
+        return y.view(*leading, self.hidden_size)
+
+    def forward(self, x: Tensor, *, hard: bool = False) -> Tensor:
+        """Route ``hard=False`` (soft) or ``hard=True`` (discrete leaf)."""
+        return self.forward_hard(x) if hard else self.forward_soft(x)
+
+
+class MultiTreeFFFLayer(nn.Module):
+    """``K`` parallel :class:`FFFTree` instances with SwiGLU leaf experts.
+
+    HyperZens 35B Student defaults: ``H=3584``, ``K=16``, ``d=5``, dense
+    SwiGLU width ``18944`` → ``I_leaf = 18944 / 16 = 1184`` per expert.
+
+    Each token activates **one leaf per tree** (``K`` experts total, ``K·L``
+    stored). Hard inference skips the inactive ``K·L - K`` leaves (~96.8%
+    leaf compute savings at ``K=16, L=32``).
+
+    Output is the **sum** of the ``K`` active SwiGLU outputs:
+
+        ``y = Σ_{k=1}^{K} SwiGLU_{k, ℓ_k}(x)``   shape ``(B, T, H)``
+
+    Soft training uses an independent differentiable mixture per tree, then
+    sums tree outputs (temperature annealing + load-balancing via
+    :meth:`compute_balance_loss`).
+
+    Parameters
+    ----------
+    hidden_size:
+        Model hidden dim ``H`` (3584).
+    num_trees:
+        Parallel trees ``K`` (16).
+    depth:
+        Per-tree depth ``d`` (5 → 32 leaves / tree).
+    intermediate_size:
+        Dense SwiGLU FFN width (18944). Per-leaf intermediate is
+        ``intermediate_size // num_trees``.
+    init_temp:
+        Initial soft-routing temperature ``τ``.
+    expert_intermediate_size:
+        Override per-leaf SwiGLU width ``I`` (default: auto from
+        ``intermediate_size // num_trees``).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = HYPERZENS_35B_HIDDEN_SIZE,
+        num_trees: int = HYPERZENS_35B_NUM_TREES,
+        depth: int = HYPERZENS_35B_TREE_DEPTH,
+        intermediate_size: int = HYPERZENS_35B_INTERMEDIATE_SIZE,
+        init_temp: float = 1.0,
+        *,
+        expert_intermediate_size: int | None = None,
+    ) -> None:
+        super().__init__()
+        if depth < 1 or num_trees < 1 or hidden_size < 1:
+            raise ValueError("hidden_size, num_trees, depth must be >= 1")
+        if init_temp <= 0.0:
+            raise ValueError(f"init_temp must be > 0, got {init_temp}")
+
+        self.hidden_size = int(hidden_size)
+        self.num_trees = int(num_trees)
+        self.depth = int(depth)
+        self.depth_per_tree = self.depth
+        self.num_leaves = 1 << self.depth
+        self.num_routers = self.num_leaves - 1
+        self.intermediate_size = int(intermediate_size)
+        if expert_intermediate_size is None:
+            expert_intermediate_size = expert_intermediate_per_leaf(
+                self.intermediate_size, num_trees=self.num_trees
+            )
+        self.expert_intermediate_size = int(expert_intermediate_size)
+
+        k, r, l, h, i_exp = (
+            self.num_trees,
+            self.num_routers,
+            self.num_leaves,
+            self.hidden_size,
+            self.expert_intermediate_size,
+        )
+        self.router_weights = nn.Parameter(torch.empty(k, r, h))
+        self.router_biases = nn.Parameter(torch.empty(k, r))
+        self.gate_proj = nn.Parameter(torch.empty(k, l, h, i_exp))
+        self.up_proj = nn.Parameter(torch.empty(k, l, h, i_exp))
+        self.down_proj = nn.Parameter(torch.empty(k, l, i_exp, h))
+
+        self.register_buffer(
+            "temperature",
+            torch.tensor(float(init_temp)),
+            persistent=True,
+        )
+        path_router_idx, path_go_right, leaf_router_inc = (
+            FastFeedforwardLinear._build_path_tables(
+                self.depth, self.num_leaves, self.num_routers
+            )
+        )
+        self.register_buffer("path_router_idx", path_router_idx, persistent=False)
+        self.register_buffer("path_go_right", path_go_right, persistent=False)
+        self.register_buffer("leaf_router_inc", leaf_router_inc, persistent=False)
+
+        self._last_leaf_probs: Tensor | None = None
+        self._last_node_decisions: Tensor | None = None
+        self._last_reach_probs: Tensor | None = None
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize all ``K`` trees (tiny routers, Xavier SwiGLU leaves)."""
+        nn.init.normal_(self.router_weights, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.router_biases)
+        a = math.sqrt(2.0 / float(self.hidden_size + self.expert_intermediate_size))
+        nn.init.uniform_(self.gate_proj, -a, a)
+        nn.init.uniform_(self.up_proj, -a, a)
+        nn.init.uniform_(self.down_proj, -a, a)
+
+    def set_temperature(self, temp: float) -> None:
+        """Set soft-routing temperature ``τ``."""
+        if temp <= 0.0:
+            raise ValueError(f"temperature must be > 0, got {temp}")
+        self.temperature.fill_(float(temp))
+
+    def extra_repr(self) -> str:
+        return (
+            f"hidden_size={self.hidden_size}, num_trees={self.num_trees}, "
+            f"depth={self.depth}, num_leaves={self.num_leaves}, "
+            f"expert_intermediate={self.expert_intermediate_size}, "
+            f"dense_intermediate={self.intermediate_size}, "
+            f"active_leaves/token={self.num_trees}, "
+            f"temperature={float(self.temperature):.4g}"
+        )
+
+    def _flatten(self, x: Tensor) -> tuple[Tensor, tuple[int, ...]]:
+        if x.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"expected last dim hidden_size={self.hidden_size}, "
+                f"got {x.shape[-1]}"
+            )
+        leading = tuple(x.shape[:-1])
+        return x.reshape(-1, self.hidden_size), leading
+
+    def _swiglu_all_leaves(self, flat: Tensor) -> Tensor:
+        """Every SwiGLU leaf on every tree — ``(N, K, L, H)``."""
+        gate = torch.einsum("nd,kldh->nklh", flat, self.gate_proj)
+        up = torch.einsum("nd,kldh->nklh", flat, self.up_proj)
+        hidden = F.silu(gate) * up
+        return torch.einsum("nklh,klhi->nkli", hidden, self.down_proj)
+
+    def _swiglu_selected(
+        self, flat: Tensor, leaf_ids: Tensor
+    ) -> Tensor:
+        """One SwiGLU leaf per tree — ``leaf_ids (N, K)`` → ``(N, H)`` sum."""
+        n_batch = int(flat.size(0))
+        k_idx = torch.arange(self.num_trees, device=flat.device).view(1, -1)
+        k_idx = k_idx.expand(n_batch, self.num_trees)
+        w_g = self.gate_proj[k_idx, leaf_ids]
+        w_u = self.up_proj[k_idx, leaf_ids]
+        w_d = self.down_proj[k_idx, leaf_ids]
+        gate = torch.einsum("nd,nkdh->nkh", flat, w_g)
+        up = torch.einsum("nd,nkdh->nkh", flat, w_u)
+        hidden = F.silu(gate) * up
+        per_tree = torch.einsum("nkh,nkhi->nki", hidden, w_d)
+        return per_tree.sum(dim=1)
+
+    def _soft_leaf_logits(self, flat: Tensor) -> tuple[Tensor, Tensor]:
+        """Log-path scores ``(N, K, L)`` and decisions ``(N, K, R)``."""
+        eps = 1e-7
+        router_logits = (
+            torch.einsum("nd,krd->nkr", flat, self.router_weights)
+            + self.router_biases.unsqueeze(0)
+        ) / self.temperature
+        node_decisions = torch.sigmoid(router_logits).clamp(min=eps, max=1.0 - eps)
+        log_c = F.logsigmoid(router_logits)
+        log_not_c = F.logsigmoid(-router_logits)
+        idx = self.path_router_idx
+        log_edges = torch.where(
+            self.path_go_right.view(1, 1, self.num_leaves, self.depth),
+            log_c[:, :, idx],
+            log_not_c[:, :, idx],
+        )
+        return log_edges.sum(dim=-1), node_decisions
+
+    def _cache_soft_stats(
+        self,
+        leaf_probs: Tensor,
+        node_decisions: Tensor,
+    ) -> None:
+        self._last_leaf_probs = leaf_probs
+        self._last_node_decisions = node_decisions
+        self._last_reach_probs = torch.einsum(
+            "nkl,lr->nkr",
+            leaf_probs,
+            self.leaf_router_inc.to(dtype=leaf_probs.dtype),
+        )
+
+    def _hard_leaf_ids(self, flat: Tensor) -> Tensor:
+        """Parallel ``O(K·d)`` hard walk → ``(N, K)`` leaf indices."""
+        n_batch = flat.shape[0]
+        k_idx = torch.arange(self.num_trees, device=flat.device).view(1, -1)
+        k_idx = k_idx.expand(n_batch, self.num_trees)
+        node_ids = torch.zeros(
+            n_batch, self.num_trees, dtype=torch.long, device=flat.device
+        )
+        for _ in range(self.depth):
+            w = self.router_weights[k_idx, node_ids]
+            b = self.router_biases[k_idx, node_ids]
+            logits = torch.einsum("nd,nkd->nk", flat, w) + b
+            go_right = logits > 0
+            node_ids = (node_ids << 1) + 1 + go_right.to(torch.long)
+        return node_ids - (self.num_leaves - 1)
+
+    def forward_soft(self, x: Tensor) -> Tensor:
+        """Soft multi-tree mixture — independent per tree, then sum.
+
+        Parameters
+        ----------
+        x:
+            ``(batch_size, seq_len, hidden_size)`` or ``(..., hidden_size)``.
+
+        Returns
+        -------
+        Tensor
+            Same leading shape as ``x``, last dim ``hidden_size``.
+        """
+        flat, leading = self._flatten(x)
+        log_leaf, node_decisions = self._soft_leaf_logits(flat)
+        leaf_probs = F.softmax(log_leaf, dim=-1)
+        self._cache_soft_stats(leaf_probs, node_decisions)
+        leaf_out = self._swiglu_all_leaves(flat)
+        y = torch.einsum("nkl,nkli->ni", leaf_probs, leaf_out)
+        return y.view(*leading, self.hidden_size)
+
+    def forward_soft_ste(self, x: Tensor) -> Tensor:
+        """STE: hard one-hot leaf per tree in forward, soft grads in backward."""
+        flat, leading = self._flatten(x)
+        log_leaf, node_decisions = self._soft_leaf_logits(flat)
+        prob_soft = F.softmax(log_leaf, dim=-1)
+        self._cache_soft_stats(prob_soft, node_decisions)
+
+        mask_hard = F.one_hot(
+            torch.argmax(log_leaf, dim=-1),
+            num_classes=self.num_leaves,
+        ).to(dtype=prob_soft.dtype)
+        mask = (mask_hard - prob_soft).detach() + prob_soft
+
+        masked_in = flat.unsqueeze(1).unsqueeze(1) * mask.unsqueeze(-1)
+        gate = torch.einsum("nkld,kldh->nklh", masked_in, self.gate_proj)
+        up = torch.einsum("nkld,kldh->nklh", masked_in, self.up_proj)
+        hidden = F.silu(gate) * up
+        leaf_out = torch.einsum("nklh,klhi->nkli", hidden, self.down_proj)
+        leaf_out = leaf_out * mask.unsqueeze(-1)
+        y = leaf_out.sum(dim=(1, 2))
+        return y.view(*leading, self.hidden_size)
+
+    def forward_hard(self, x: Tensor) -> Tensor:
+        """Hard routing — only ``K`` active SwiGLU leaves per token.
+
+        Parameters
+        ----------
+        x:
+            ``(batch_size, seq_len, hidden_size)``.
+
+        Returns
+        -------
+        Tensor
+            ``(batch_size, seq_len, hidden_size)`` — sum of ``K`` tree outputs.
+        """
+        flat, leading = self._flatten(x)
+        leaf_ids = self._hard_leaf_ids(flat)
+        y = self._swiglu_selected(flat, leaf_ids)
+        return y.view(*leading, self.hidden_size)
+
+    def forward(self, x: Tensor, *, hard: bool = False) -> Tensor:
+        """Entry point: ``hard=False`` → :meth:`forward_soft`; else hard."""
+        return self.forward_hard(x) if hard else self.forward_soft(x)
+
+    def leaf_probs(self) -> Tensor | None:
+        """Cached ``(N, K, L)`` leaf mixture from the last soft forward."""
+        return self._last_leaf_probs
+
+    def compute_balance_loss(self, eps: float = 1e-7) -> Tensor:
+        """Load-balancing loss from the latest soft forward (anti-collapse)."""
+        if self._last_node_decisions is None or self._last_leaf_probs is None:
+            raise RuntimeError(
+                "compute_balance_loss() requires a prior forward_soft() call"
+            )
+        decisions = self._last_node_decisions.reshape(-1, self.num_routers)
+        leaf_probs = self._last_leaf_probs.reshape(-1, self.num_leaves)
+
+        p_avg = decisions.mean(dim=0).clamp(min=eps, max=1.0 - eps)
+        node_mse = (p_avg - 0.5).square().sum()
+        entropy = -(
+            p_avg * p_avg.log() + (1.0 - p_avg) * (1.0 - p_avg).log()
+        )
+        node_entropy_loss = -entropy.mean()
+
+        mean_leaf = leaf_probs.mean(dim=0)
+        uniform = 1.0 / float(self.num_leaves)
+        leaf_loss = (mean_leaf - uniform).square().sum()
+        return node_mse + node_entropy_loss + leaf_loss
+
+    @staticmethod
+    def hyperzens_35b_student(**kwargs: Any) -> MultiTreeFFFLayer:
+        """Factory with HyperZens 35B Student defaults (``K=16, d=5, H=3584``)."""
+        return MultiTreeFFFLayer(
+            hidden_size=HYPERZENS_35B_HIDDEN_SIZE,
+            num_trees=HYPERZENS_35B_NUM_TREES,
+            depth=HYPERZENS_35B_TREE_DEPTH,
+            intermediate_size=HYPERZENS_35B_INTERMEDIATE_SIZE,
+            **kwargs,
+        )
+
+    def active_leaf_fraction(self) -> float:
+        """Fraction of stored leaves evaluated per token in hard mode."""
+        total = self.num_trees * self.num_leaves
+        return float(self.num_trees) / float(max(total, 1))
+
+    def count_active_params(self) -> dict[str, int]:
+        """Stored vs hard-active parameter counts."""
+        h, i_exp, k, l, d = (
+            self.hidden_size,
+            self.expert_intermediate_size,
+            self.num_trees,
+            self.num_leaves,
+            self.depth,
+        )
+        r = self.num_routers
+        router_params = k * r * (h + 1)
+        leaf_params = k * l * (3 * h * i_exp + i_exp * h)
+        hard_routers = k * d * (h + 1)
+        hard_leaf = k * (3 * h * i_exp + i_exp * h)
+        dense = 3 * h * self.intermediate_size
+        return {
+            "stored_total": router_params + leaf_params,
+            "hard_active_per_token": hard_routers + hard_leaf,
+            "dense_swiglu_proxy": dense,
+            "active_leaves_per_token": k,
+            "total_leaves": k * l,
+            "inactive_leaf_fraction": 1.0 - self.active_leaf_fraction(),
+        }
+
+
 def _demo_shapes() -> None:
     """Sanity check used for local smoke tests (not run on import)."""
     layer = FastFeedforwardLinear(32, 64, depth=3, init_temp=1.0)
@@ -1281,6 +1866,33 @@ def _demo_shapes() -> None:
     y_f_ste = forest.forward_soft_ste(x0.unsqueeze(0)).squeeze(0)
     assert torch.allclose(y_f_ste, y_f_b, atol=1e-3), (y_f_ste - y_f_b).abs().max()
     print("OK — CMM K=4 d=3 soft/STE/hard/cpp agree")
+
+    # HyperZens 35B Student Multi-Tree SwiGLU FFF
+    hz = MultiTreeFFFLayer.hyperzens_35b_student(init_temp=1.0)
+    assert hz.expert_intermediate_size == 18944 // 16
+    x_hz = torch.randn(2, 8, HYPERZENS_35B_HIDDEN_SIZE)
+    y_soft_hz = hz.forward_soft(x_hz)
+    y_hard_hz = hz.forward_hard(x_hz)
+    y_ste_hz = hz.forward_soft_ste(x_hz)
+    assert y_soft_hz.shape == (2, 8, HYPERZENS_35B_HIDDEN_SIZE)
+    assert y_hard_hz.shape == y_ste_hz.shape == y_soft_hz.shape
+    stats = hz.count_active_params()
+    assert abs(hz.active_leaf_fraction() - 16 / 512) < 1e-6
+    assert abs(stats["inactive_leaf_fraction"] - (1.0 - 16 / 512)) < 1e-6
+    loss_hz = hz.compute_balance_loss()
+    assert loss_hz.ndim == 0
+    tree0 = FFFTree(
+        hidden_size=64,
+        expert_intermediate_size=128,
+        depth=3,
+    )
+    x_t = torch.randn(4, 64)
+    assert tree0.forward_soft(x_t).shape == (4, 64)
+    assert tree0.forward_hard(x_t).shape == (4, 64)
+    print(
+        f"OK — HyperZens MultiTreeFFF K={hz.num_trees} d={hz.depth} "
+        f"I_leaf={hz.expert_intermediate_size} active_frac={hz.active_leaf_fraction():.4f}"
+    )
 
 
 if __name__ == "__main__":
