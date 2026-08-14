@@ -158,6 +158,26 @@ def run_tests() -> bool:
         elif device.type == "mps":
             torch.mps.empty_cache()
 
+    def prepare_4bit_layer(layer):
+        """Verify safe 4-bit initialization, then quantize on CPU → device.
+
+        With ``load_in_4bit=True`` the dense leaf projections are ``None``
+        (weights live in ``leaf_qstate`` after :meth:`quantize_leaves`), so
+        parameter initialization must never touch them. This guards against
+        ``'NoneType' object has no attribute 'uniform_'`` regressions.
+        """
+        assert layer.gate_proj is None, "4-bit layer must not hold dense gate_proj"
+        assert layer.up_proj is None, "4-bit layer must not hold dense up_proj"
+        assert layer.down_proj is None, "4-bit layer must not hold dense down_proj"
+        assert layer.leaf_qstate is None, "leaf_qstate must be unset before quantize_leaves()"
+        assert layer.router_weights is not None and torch.isfinite(layer.router_weights).all()
+        assert layer.router_biases is not None and (layer.router_biases == 0).all()
+        print("  📦 Quantizing leaves on CPU...")
+        layer.quantize_leaves()
+        layer = layer.to(device)
+        clear_memory()
+        return layer
+
     # -------------------------------------------------------------------------
     # Test 1: Shape Verification
     # -------------------------------------------------------------------------
@@ -169,10 +189,7 @@ def run_tests() -> bool:
         if USE_4BIT:
             # Construct weights on CPU first, quantize there, then move to CUDA
             # so a full-size FP16/BF16 copy never lands on the GPU.
-            print("  📦 Quantizing leaves on CPU...")
-            layer.quantize_leaves()
-            layer = layer.to(device)
-            clear_memory()
+            layer = prepare_4bit_layer(layer)
 
         layer.train()
 
@@ -210,9 +227,7 @@ def run_tests() -> bool:
         layer = create_layer(cpu_init=True)
 
         if USE_4BIT:
-            layer.quantize_leaves()
-            layer = layer.to(device)
-            clear_memory()
+            layer = prepare_4bit_layer(layer)
 
         layer.train()
 
@@ -269,9 +284,7 @@ def run_tests() -> bool:
             layer = create_layer(cpu_init=True)
 
             if USE_4BIT:
-                layer.quantize_leaves()
-                layer = layer.to(device)
-                clear_memory()
+                layer = prepare_4bit_layer(layer)
 
             layer = layer.to(dtype=dtype)
             layer.train()
@@ -314,9 +327,7 @@ def run_tests() -> bool:
         layer = create_layer(cpu_init=True)
 
         if USE_4BIT:
-            layer.quantize_leaves()
-            layer = layer.to(device)
-            clear_memory()
+            layer = prepare_4bit_layer(layer)
 
         layer.train()
 
@@ -357,9 +368,7 @@ def run_tests() -> bool:
         layer = create_layer(cpu_init=True)
 
         if USE_4BIT:
-            layer.quantize_leaves()
-            layer = layer.to(device)
-            clear_memory()
+            layer = prepare_4bit_layer(layer)
 
         layer.train()
 

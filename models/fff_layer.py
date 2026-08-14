@@ -1937,13 +1937,22 @@ class MultiTreeFFFLayer(nn.Module):
             self.to(device)
 
     def reset_parameters(self) -> None:
-        """Initialize all ``K`` trees (tiny routers, Xavier SwiGLU leaves)."""
+        """Initialize all ``K`` trees (tiny routers, Xavier SwiGLU leaves).
+
+        With ``load_in_4bit=True`` the leaf projections live only in
+        ``self.leaf_qstate`` (``gate_proj``/``up_proj``/``down_proj`` are
+        ``None``) so their initialization is skipped — it happens inside
+        :meth:`quantize_leaves` from freshly generated full-precision tensors.
+        """
         nn.init.normal_(self.router_weights, mean=0.0, std=1e-3)
         nn.init.zeros_(self.router_biases)
         a = math.sqrt(2.0 / float(self.hidden_size + self.expert_intermediate_size))
-        nn.init.uniform_(self.gate_proj, -a, a)
-        nn.init.uniform_(self.up_proj, -a, a)
-        nn.init.uniform_(self.down_proj, -a, a)
+        if self.gate_proj is not None:
+            nn.init.uniform_(self.gate_proj, -a, a)
+        if self.up_proj is not None:
+            nn.init.uniform_(self.up_proj, -a, a)
+        if self.down_proj is not None:
+            nn.init.uniform_(self.down_proj, -a, a)
 
     def set_temperature(self, temp: float) -> None:
         """Set soft-routing temperature ``τ``."""
