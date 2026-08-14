@@ -67,8 +67,27 @@ def run_tests() -> bool:
     device = get_device()
     compute_dtype = get_compute_dtype(device)
 
-    # Use smaller config for CPU/MPS to avoid timeout
-    if device.type != "cuda":
+    # Memory-aware configuration for RTX 3060 12GB
+    # Full config: 512 leaves * 3 * 3584 * 1184 * 2 bytes ≈ 13 GB (exceeds 12GB)
+    # Use 4-bit quantization or reduced depth
+    if device.type == "cuda":
+        # Check available memory
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        free_gb = free_mem / (1024 ** 3)
+        print(f"🔍 CUDA Memory: {free_gb:.1f} GB free / {total_mem / (1024**3):.1f} GB total")
+
+        if free_gb < 10:
+            # Use 4-bit quantization for full config
+            USE_4BIT = True
+            USE_REDUCED_DEPTH = False
+            print("⚠️  Low VRAM — enabling 4-bit quantization (load_in_4bit=True)")
+        else:
+            USE_4BIT = False
+            USE_REDUCED_DEPTH = False
+    else:
+        # CPU/MPS: use reduced config
+        USE_4BIT = False
+        USE_REDUCED_DEPTH = True
         HIDDEN_SIZE = 256
         NUM_TREES = 2
         DEPTH = 3
@@ -88,15 +107,20 @@ def run_tests() -> bool:
     print(f"Expert I per leaf: {INTERMEDIATE_SIZE // NUM_TREES}")
     print(f"Device: {device} | Compute dtype: {compute_dtype}")
     print(f"Total Leaves: {NUM_TREES * (1 << DEPTH)} (active/token: {NUM_TREES})")
+    print(f"4-bit quantization: {USE_4BIT}")
     print(f"{'='*60}\n")
 
-    def create_layer():
+    def create_layer(cpu_init: bool = False):
         return MultiTreeFFFLayer(
             hidden_size=HIDDEN_SIZE,
             num_trees=NUM_TREES,
             depth=DEPTH,
             intermediate_size=INTERMEDIATE_SIZE,
             init_temp=1.0,
+            load_in_4bit=USE_4BIT,
+            quant_type="nf4",
+            block_size=64,
+            cpu_init=cpu_init or (device.type == "cuda" and USE_4BIT),
         ).to(device)
 
     def autocast_ctx():
@@ -121,7 +145,15 @@ def run_tests() -> bool:
     test_idx = 1
     try:
         clear_memory()
-        layer = create_layer()
+        layer = create_layer(cpu_init=True)
+        
+        if USE_4BIT:
+            # Quantize leaves on CPU first to avoid peak memory spike
+            print("  📦 Quantizing leaves on CPU...")
+            layer.quantize_leaves()
+            layer = layer.to(device)
+            clear_memory()
+
         layer.train()
 
         x = torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE, device=device)
@@ -155,7 +187,13 @@ def run_tests() -> bool:
     test_idx = 2
     try:
         clear_memory()
-        layer = create_layer()
+        layer = create_layer(cpu_init=True)
+        
+        if USE_4BIT:
+            layer.quantize_leaves()
+            layer = layer.to(device)
+            clear_memory()
+
         layer.train()
 
         x = torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE, device=device, requires_grad=True)
@@ -169,17 +207,24 @@ def run_tests() -> bool:
         # Check router gradients
         ok_router_w, msg_r = check_grad_finite("router_weights", layer.router_weights)
         ok_router_b, msg_b = check_grad_finite("router_biases", layer.router_biases)
-        # Check leaf gradients
-        ok_gate, msg_g = check_grad_finite("gate_proj", layer.gate_proj)
-        ok_up, msg_u = check_grad_finite("up_proj", layer.up_proj)
-        ok_down, msg_d = check_grad_finite("down_proj", layer.down_proj)
+        
+        # Check leaf gradients (only if not quantized, as quantized weights are frozen)
+        if not USE_4BIT:
+            ok_gate, msg_g = check_grad_finite("gate_proj", layer.gate_proj)
+            ok_up, msg_u = check_grad_finite("up_proj", layer.up_proj)
+            ok_down, msg_d = check_grad_finite("down_proj", layer.down_proj)
+            all_ok = all([ok_input_grad, ok_router_w, ok_router_b, ok_gate, ok_up, ok_down])
+        else:
+            # With 4-bit, only router gradients should flow
+            all_ok = all([ok_input_grad, ok_router_w, ok_router_b])
 
-        all_ok = all([ok_input_grad, ok_router_w, ok_router_b, ok_gate, ok_up, ok_down])
         if all_ok:
             passed_count += 1
             print_result(test_idx, TOTAL_TESTS, "Gradient Flow & Backward", True)
         else:
-            msgs = [m for m in [msg, msg_r, msg_b, msg_g, msg_u, msg_d] if m]
+            msgs = [m for m in [msg, msg_r, msg_b] if m]
+            if not USE_4BIT:
+                msgs += [m for m in [msg_g, msg_u, msg_d] if m]
             print_result(test_idx, TOTAL_TESTS, "Gradient Flow & Backward", False, "; ".join(msgs))
     except Exception as e:
         print_result(test_idx, TOTAL_TESTS, "Gradient Flow & Backward", False, str(e))
@@ -201,7 +246,13 @@ def run_tests() -> bool:
                 continue
 
             clear_memory()
-            layer = create_layer()
+            layer = create_layer(cpu_init=True)
+            
+            if USE_4BIT:
+                layer.quantize_leaves()
+                layer = layer.to(device)
+                clear_memory()
+            
             layer = layer.to(dtype=dtype)
             layer.train()
 
@@ -225,7 +276,6 @@ def run_tests() -> bool:
         finally:
             clear_memory()
 
-    # Pass if at least one precision mode works
     working_precisions = [r[0] for r in precision_results if r[1]]
     if working_precisions:
         passed_count += 1
@@ -241,7 +291,13 @@ def run_tests() -> bool:
     test_idx = 4
     try:
         clear_memory()
-        layer = create_layer()
+        layer = create_layer(cpu_init=True)
+        
+        if USE_4BIT:
+            layer.quantize_leaves()
+            layer = layer.to(device)
+            clear_memory()
+
         layer.train()
 
         all_finite = True
@@ -278,7 +334,13 @@ def run_tests() -> bool:
     test_idx = 5
     try:
         clear_memory()
-        layer = create_layer()
+        layer = create_layer(cpu_init=True)
+        
+        if USE_4BIT:
+            layer.quantize_leaves()
+            layer = layer.to(device)
+            clear_memory()
+
         layer.train()
 
         x = torch.randn(BATCH_SIZE, SEQ_LEN_MEM, HIDDEN_SIZE, device=device)
@@ -304,8 +366,9 @@ def run_tests() -> bool:
 
         passed_count += 1
         dev_name = "GPU" if device.type == "cuda" else "MPS"
+        mode_str = "4-bit" if USE_4BIT else "FP16/BF16"
         print_result(test_idx, TOTAL_TESTS, "VRAM Benchmark", True,
-                     f"Peak {dev_name} Memory: {peak_gb:.2f} GB (B={BATCH_SIZE}, T={SEQ_LEN_MEM})")
+                     f"Peak {dev_name} Memory: {peak_gb:.2f} GB (B={BATCH_SIZE}, T={SEQ_LEN_MEM}, {mode_str})")
     except Exception as e:
         print_result(test_idx, TOTAL_TESTS, "VRAM Benchmark", False, str(e))
     finally:
