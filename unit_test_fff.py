@@ -17,7 +17,7 @@ from models.fff_layer import MultiTreeFFFLayer, HYPERZENS_35B_HIDDEN_SIZE, HYPER
 
 
 def print_result(test_idx: int, total: int, name: str, passed: bool, msg: str = "") -> None:
-    status = "���" if passed else "���"
+    status = "✅" if passed else "❌"
     print(f"{status} [{test_idx}/{total}] {name}: {'Passed' if passed else 'Failed'}{' — ' + msg if msg else ''}")
 
 
@@ -45,6 +45,15 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def get_compute_dtype(device: torch.device) -> torch.dtype:
+    """Preferred compute dtype for the device."""
+    if device.type == "cuda":
+        return torch.bfloat16
+    if device.type == "mps":
+        return torch.float16
+    return torch.float32
+
+
 def run_tests() -> bool:
     # HyperZens 35B Student Configuration
     HIDDEN_SIZE = HYPERZENS_35B_HIDDEN_SIZE        # 3584
@@ -55,8 +64,10 @@ def run_tests() -> bool:
     SEQ_LEN = 128
     SEQ_LEN_MEM = 2048
 
-    # Use smaller config for CPU/MPS to avoid timeout
     device = get_device()
+    compute_dtype = get_compute_dtype(device)
+
+    # Use smaller config for CPU/MPS to avoid timeout
     if device.type != "cuda":
         HIDDEN_SIZE = 256
         NUM_TREES = 2
@@ -65,7 +76,7 @@ def run_tests() -> bool:
         BATCH_SIZE = 1
         SEQ_LEN = 16
         SEQ_LEN_MEM = 64
-        print("������  Running on CPU/MPS — using reduced test configuration")
+        print(f"⚠️  Running on {device.type.upper()} — using reduced test configuration")
 
     TOTAL_TESTS = 5
     passed_count = 0
@@ -74,7 +85,8 @@ def run_tests() -> bool:
     print(f"MultiTreeFFFLayer Unit Tests — HyperZens 35B Scale")
     print(f"{'='*60}")
     print(f"Config: H={HIDDEN_SIZE}, K={NUM_TREES}, d={DEPTH}, I_dense={INTERMEDIATE_SIZE}")
-    print(f"Device: {device}")
+    print(f"Expert I per leaf: {INTERMEDIATE_SIZE // NUM_TREES}")
+    print(f"Device: {device} | Compute dtype: {compute_dtype}")
     print(f"Total Leaves: {NUM_TREES * (1 << DEPTH)} (active/token: {NUM_TREES})")
     print(f"{'='*60}\n")
 
@@ -87,16 +99,33 @@ def run_tests() -> bool:
             init_temp=1.0,
         ).to(device)
 
+    def autocast_ctx():
+        """Return autocast context for the current device."""
+        if device.type == "cuda":
+            return torch.autocast(device_type="cuda", dtype=compute_dtype)
+        if device.type == "mps":
+            return torch.autocast(device_type="mps", dtype=compute_dtype)
+        return torch.autocast(device_type="cpu", enabled=False)
+
+    def clear_memory():
+        """Clear device memory cache."""
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+        elif device.type == "mps":
+            torch.mps.empty_cache()
+
     # -------------------------------------------------------------------------
     # Test 1: Shape Verification
     # -------------------------------------------------------------------------
     test_idx = 1
     try:
+        clear_memory()
         layer = create_layer()
         layer.train()
 
         x = torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE, device=device)
-        with torch.autocast(device_type=device.type, enabled=False):
+        with autocast_ctx():
             y_soft = layer.forward_soft(x)
             y_hard = layer.forward_hard(x)
             y_ste = layer.forward_soft_ste(x)
@@ -117,26 +146,30 @@ def run_tests() -> bool:
             print_result(test_idx, TOTAL_TESTS, "Shape & Forward Pass", False, msg or "shape mismatch")
     except Exception as e:
         print_result(test_idx, TOTAL_TESTS, "Shape & Forward Pass", False, str(e))
+    finally:
+        clear_memory()
 
     # -------------------------------------------------------------------------
     # Test 2: Gradient Flow & Backward Pass
     # -------------------------------------------------------------------------
     test_idx = 2
     try:
+        clear_memory()
         layer = create_layer()
         layer.train()
 
         x = torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE, device=device, requires_grad=True)
-        y = layer.forward_soft(x)
-        loss = y.pow(2).mean()
+        with autocast_ctx():
+            y = layer.forward_soft(x)
+            loss = y.pow(2).mean()
         loss.backward()
 
         # Check input gradient
         ok_input_grad, msg = check_grad_finite("input x", x)
-        # Check router gradients (sample a few)
+        # Check router gradients
         ok_router_w, msg_r = check_grad_finite("router_weights", layer.router_weights)
         ok_router_b, msg_b = check_grad_finite("router_biases", layer.router_biases)
-        # Check leaf gradients (sample a few active leaves via grad flow)
+        # Check leaf gradients
         ok_gate, msg_g = check_grad_finite("gate_proj", layer.gate_proj)
         ok_up, msg_u = check_grad_finite("up_proj", layer.up_proj)
         ok_down, msg_d = check_grad_finite("down_proj", layer.down_proj)
@@ -150,6 +183,8 @@ def run_tests() -> bool:
             print_result(test_idx, TOTAL_TESTS, "Gradient Flow & Backward", False, "; ".join(msgs))
     except Exception as e:
         print_result(test_idx, TOTAL_TESTS, "Gradient Flow & Backward", False, str(e))
+    finally:
+        clear_memory()
 
     # -------------------------------------------------------------------------
     # Test 3: Precision Compatibility (bfloat16, float16)
@@ -159,14 +194,13 @@ def run_tests() -> bool:
     for dtype_name, dtype in [("bfloat16", torch.bfloat16), ("float16", torch.float16)]:
         try:
             if device.type == "cpu" and dtype == torch.bfloat16:
-                # CPU bfloat16 requires Ampere+ or fallback
                 precision_results.append((dtype_name, False, "CPU bfloat16 not supported"))
                 continue
             if device.type == "mps" and dtype == torch.bfloat16:
-                # MPS bfloat16 not supported yet
                 precision_results.append((dtype_name, False, "MPS bfloat16 not supported"))
                 continue
 
+            clear_memory()
             layer = create_layer()
             layer = layer.to(dtype=dtype)
             layer.train()
@@ -188,8 +222,10 @@ def run_tests() -> bool:
                 precision_results.append((dtype_name, False, msg or msg_g))
         except Exception as e:
             precision_results.append((dtype_name, False, str(e)))
+        finally:
+            clear_memory()
 
-    # Pass if at least one precision mode works (e.g., float16 on MPS)
+    # Pass if at least one precision mode works
     working_precisions = [r[0] for r in precision_results if r[1]]
     if working_precisions:
         passed_count += 1
@@ -204,15 +240,17 @@ def run_tests() -> bool:
     # -------------------------------------------------------------------------
     test_idx = 4
     try:
+        clear_memory()
         layer = create_layer()
         layer.train()
 
         all_finite = True
-        for _ in range(5):  # Reduced iterations for speed
-            x = torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE, device=device) * 10.0  # large inputs
-            y_soft = layer.forward_soft(x)
-            y_hard = layer.forward_hard(x)
-            y_ste = layer.forward_soft_ste(x)
+        for _ in range(5):
+            x = torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE, device=device) * 10.0
+            with autocast_ctx():
+                y_soft = layer.forward_soft(x)
+                y_hard = layer.forward_hard(x)
+                y_ste = layer.forward_soft_ste(x)
             ok, _ = check_tensor_finite("soft", y_soft)
             ok &= check_tensor_finite("hard", y_hard)[0]
             ok &= check_tensor_finite("ste", y_ste)[0]
@@ -220,7 +258,8 @@ def run_tests() -> bool:
 
             # Also test with temperature annealing
             layer.set_temperature(0.1)
-            y_cold = layer.forward_soft(x)
+            with autocast_ctx():
+                y_cold = layer.forward_soft(x)
             all_finite &= check_tensor_finite("cold", y_cold)[0]
 
         if all_finite:
@@ -230,65 +269,47 @@ def run_tests() -> bool:
             print_result(test_idx, TOTAL_TESTS, "Numerical Stability", False, "NaN/Inf detected")
     except Exception as e:
         print_result(test_idx, TOTAL_TESTS, "Numerical Stability", False, str(e))
+    finally:
+        clear_memory()
 
     # -------------------------------------------------------------------------
     # Test 5: VRAM / Memory Benchmark (T=2048)
     # -------------------------------------------------------------------------
     test_idx = 5
     try:
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats(device)
+        clear_memory()
+        layer = create_layer()
+        layer.train()
 
-            layer = create_layer()
-            layer.train()
+        x = torch.randn(BATCH_SIZE, SEQ_LEN_MEM, HIDDEN_SIZE, device=device)
 
-            x = torch.randn(BATCH_SIZE, SEQ_LEN_MEM, HIDDEN_SIZE, device=device)
+        # Warmup
+        with torch.no_grad(), autocast_ctx():
+            _ = layer.forward_hard(x)
 
-            # Warmup
-            with torch.no_grad():
-                _ = layer.forward_hard(x)
+        clear_memory()
 
-            torch.cuda.reset_peak_memory_stats(device)
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                y = layer.forward_soft(x)
-                loss = y.pow(2).mean()
-                loss.backward()
-
-            peak_bytes = torch.cuda.max_memory_allocated(device)
-            peak_gb = peak_bytes / (1024 ** 3)
-
-            passed_count += 1
-            print_result(test_idx, TOTAL_TESTS, "VRAM Benchmark", True,
-                         f"Peak GPU Memory: {peak_gb:.2f} GB (B={BATCH_SIZE}, T={SEQ_LEN_MEM})")
-        elif device.type == "mps":
-            # MPS memory tracking
-            torch.mps.empty_cache()
-
-            layer = create_layer()
-            layer.train()
-
-            x = torch.randn(BATCH_SIZE, SEQ_LEN_MEM, HIDDEN_SIZE, device=device)
-
-            # Warmup
-            with torch.no_grad():
-                _ = layer.forward_hard(x)
-
+        with autocast_ctx():
             y = layer.forward_soft(x)
             loss = y.pow(2).mean()
             loss.backward()
 
+        if device.type == "cuda":
+            peak_bytes = torch.cuda.max_memory_allocated(device)
+        elif device.type == "mps":
             peak_bytes = torch.mps.driver_allocated_memory()
-            peak_gb = peak_bytes / (1024 ** 3)
-
-            passed_count += 1
-            print_result(test_idx, TOTAL_TESTS, "VRAM Benchmark", True,
-                         f"Peak MPS Memory: {peak_gb:.2f} GB (B={BATCH_SIZE}, T={SEQ_LEN_MEM})")
         else:
-            print_result(test_idx, TOTAL_TESTS, "VRAM Benchmark", False, "CUDA/MPS not available, skipping")
+            peak_bytes = 0
+        peak_gb = peak_bytes / (1024 ** 3)
+
+        passed_count += 1
+        dev_name = "GPU" if device.type == "cuda" else "MPS"
+        print_result(test_idx, TOTAL_TESTS, "VRAM Benchmark", True,
+                     f"Peak {dev_name} Memory: {peak_gb:.2f} GB (B={BATCH_SIZE}, T={SEQ_LEN_MEM})")
     except Exception as e:
         print_result(test_idx, TOTAL_TESTS, "VRAM Benchmark", False, str(e))
+    finally:
+        clear_memory()
 
     # -------------------------------------------------------------------------
     # Summary
