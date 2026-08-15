@@ -52,6 +52,11 @@ except Exception:  # pragma: no cover - exercised only on non-CUDA machines
     tl = None
     has_triton = False
 
+
+def _jit(fn):
+    """Apply triton.jit when triton is installed, else leave the function as-is."""
+    return triton.jit(fn) if has_triton else fn
+
 __all__ = [
     "has_triton",
     "fff_forward_ref",
@@ -169,7 +174,7 @@ def fff_forward_native(
 # --------------------------------------------------------------------------
 
 
-@triton.jit
+@_jit
 def _fff_forward_kernel(
     X, WR, BR, WL, BL, Y,
     N,

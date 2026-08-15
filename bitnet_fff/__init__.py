@@ -12,6 +12,8 @@ from . import profiler
 from . import tokenizer
 from . import tuning
 from . import dataset
+from . import triton_fff
+from . import triton_ternary_mm
 
 __all__ = [
     "BitLinear",
@@ -27,6 +29,8 @@ __all__ = [
     "tokenizer",
     "tuning",
     "dataset",
+    "triton_fff",
+    "triton_ternary_mm",
 ]
 
 __version__ = "0.1.0"
