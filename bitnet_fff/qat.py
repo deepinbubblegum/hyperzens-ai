@@ -271,6 +271,18 @@ class BitNetQAT(nn.Module):
     def is_fp16_master(self) -> bool:
         return self._fp16_enabled
 
+    def gradient_checkpointing_enable(self, **kwargs) -> None:
+        if hasattr(self.module, "gradient_checkpointing_enable"):
+            self.module.gradient_checkpointing_enable(**kwargs)
+        else:
+            self.module.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self) -> None:
+        if hasattr(self.module, "gradient_checkpointing_disable"):
+            self.module.gradient_checkpointing_disable()
+        else:
+            self.module.gradient_checkpointing = False
+
     def optimizer(self, lr: float = 1e-3, **kwargs) -> FP16MasterAdamW:
         return FP16MasterAdamW(
             self.module.parameters(), lr=lr, master_dtype=self.master_dtype, **kwargs

@@ -19,6 +19,7 @@ from typing import Callable, Iterator
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from .bitlinear import absmax_quantize
 from .fast_fff import FastFeedForwardBitNet
@@ -496,6 +497,8 @@ class BitNetFFTTransformer(nn.Module):
     ) -> None:
         super().__init__()
         self.cfg = cfg
+        self.gradient_checkpointing = False
+        self._gradient_checkpointing_kwargs: dict = {}
         self.embed = None
         self.pos = None
         if cfg.vocab_size > 0:
@@ -508,6 +511,15 @@ class BitNetFFTTransformer(nn.Module):
             self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
             if cfg.tie_weights and self.embed is not None:
                 self.head.weight = self.embed.weight
+
+    def gradient_checkpointing_enable(self, **kwargs) -> None:
+        """Enable gradient checkpointing for transformer layers during forward pass."""
+        self.gradient_checkpointing = True
+        self._gradient_checkpointing_kwargs = kwargs
+
+    def gradient_checkpointing_disable(self) -> None:
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing = False
 
     def _apply_embeddings(
         self, token_ids: torch.Tensor, pos_start: int = 0
@@ -542,8 +554,22 @@ class BitNetFFTTransformer(nn.Module):
         if mask is None and x.shape[-2] > 1:
             mask = _causal_mask(x.shape[-2], x.device)
         layer_caches = _per_layer_caches(kv_cache, len(self.layers))
-        for layer, layer_cache in zip(self.layers, layer_caches):
-            x = layer(x, mask=mask, kv_cache=layer_cache, past_length=past_length)
+        if self.gradient_checkpointing and self.training:
+            ckpt_kwargs = dict(self._gradient_checkpointing_kwargs)
+            if "use_reentrant" not in ckpt_kwargs:
+                ckpt_kwargs["use_reentrant"] = False
+            for layer, layer_cache in zip(self.layers, layer_caches):
+                x = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    x,
+                    mask,
+                    layer_cache,
+                    past_length,
+                    **ckpt_kwargs,
+                )
+        else:
+            for layer, layer_cache in zip(self.layers, layer_caches):
+                x = layer(x, mask=mask, kv_cache=layer_cache, past_length=past_length)
         x = self.norm(x)
         if self.head is not None:
             x = self.head(x)

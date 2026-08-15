@@ -145,6 +145,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     r.add_argument("--seed", type=int, default=0)
     r.add_argument("--compile", action="store_true",
                    help="wrap the student with torch.compile before training")
+    r.add_argument("--gradient-checkpointing", action="store_true",
+                   help="enable gradient checkpointing on student layers to save VRAM")
     r.add_argument("--log-every", type=int, default=10)
     r.add_argument("--save-every", type=int, default=500)
     r.add_argument("--empty-cache-every", type=int, default=100,
@@ -341,31 +343,37 @@ def _select_tasks(args: argparse.Namespace) -> list:
 
 
 class LinearWarmupScheduler:
-    """Linear LR warmup for the custom FP16-master AdamW optimizer.
+    """Linear LR warmup for AdamW and FP16-master optimizers.
 
-    ``torch.optim.lr_scheduler.LambdaLR`` cannot drive the optimizer returned
-    by :func:`train_qat.make_qat_model` (``FP16MasterAdamW`` is not a
-    ``torch.optim.Optimizer`` subclass: it has no ``param_groups``/``defaults``),
-    so this mirrors LambdaLR's linear warmup by scaling the optimizer's ``lr``
-    attribute directly: the learning rate ramps linearly from 0 to the base
-    ``--lr`` over ``warmup_steps`` optimizer steps and then stays constant.
-    Call :meth:`step` once per optimizer step; the state is checkpointed so a
-    resumed run continues the warmup instead of restarting it.
+    Supports standard optimizers with ``param_groups`` (such as ``bitsandbytes.optim.AdamW8bit``
+    and ``torch.optim.AdamW``) as well as custom ``FP16MasterAdamW`` with direct ``lr`` attribute.
     """
 
     def __init__(self, optimizer, warmup_steps: int, last_step: int = 0) -> None:
         self.optimizer = optimizer
-        self.base_lr = float(optimizer.lr)
+        if hasattr(optimizer, "param_groups") and optimizer.param_groups:
+            self.base_lr = float(optimizer.param_groups[0].get("lr", getattr(optimizer, "lr", 1e-3)))
+        else:
+            self.base_lr = float(getattr(optimizer, "lr", 1e-3))
         self.warmup_steps = max(int(warmup_steps), 0)
         self.last_step = int(last_step)
-        optimizer.lr = self._lr_for(self.last_step)
+        self._set_lr(self._lr_for(self.last_step))
+
+    def _set_lr(self, lr: float) -> None:
+        if hasattr(self.optimizer, "param_groups") and self.optimizer.param_groups:
+            for g in self.optimizer.param_groups:
+                g["lr"] = lr
+        if hasattr(self.optimizer, "lr"):
+            self.optimizer.lr = lr
 
     def step(self) -> None:
         self.last_step += 1
-        self.optimizer.lr = self._lr_for(self.last_step)
+        self._set_lr(self._lr_for(self.last_step))
 
     def get_last_lr(self) -> list[float]:
-        return [self.optimizer.lr]
+        if hasattr(self.optimizer, "param_groups") and self.optimizer.param_groups:
+            return [g["lr"] for g in self.optimizer.param_groups]
+        return [getattr(self.optimizer, "lr", self.base_lr)]
 
     def _lr_for(self, step: int) -> float:
         if self.warmup_steps <= 0:
@@ -383,7 +391,7 @@ class LinearWarmupScheduler:
         self.base_lr = float(state.get("base_lr", self.base_lr))
         self.warmup_steps = int(state.get("warmup_steps", self.warmup_steps))
         self.last_step = int(state.get("last_step", self.last_step))
-        self.optimizer.lr = self._lr_for(self.last_step)
+        self._set_lr(self._lr_for(self.last_step))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -442,6 +450,25 @@ def main(argv: list[str] | None = None) -> int:
         weight_decay=args.weight_decay,
         clip_grad_norm=args.clip_grad_norm,
     )
+
+    if device.type == "cuda":
+        try:
+            import bitsandbytes as bnb
+
+            opt = bnb.optim.AdamW8bit(
+                student.parameters(),
+                lr=args.lr,
+                betas=(args.beta1, args.beta2),
+                weight_decay=args.weight_decay,
+            )
+            print("[optimizer] using bitsandbytes AdamW8bit (8-bit quantized states for CUDA)")
+        except Exception as e:
+            print(f"[optimizer] bitsandbytes AdamW8bit unavailable ({e}), using default optimizer")
+
+    if args.gradient_checkpointing:
+        student.gradient_checkpointing_enable()
+        print("[student] gradient checkpointing enabled")
+
     scheduler = LinearWarmupScheduler(opt, args.warmup_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=False)
     if args.compile:

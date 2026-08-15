@@ -382,6 +382,9 @@ def test_generate_guards():
 def test_generate_mps_fast_inference():
     if not torch.backends.mps.is_available():
         pytest.skip("MPS required")
+    from bitnet_fff.fast_inference import extension_available
+    if not extension_available():
+        pytest.skip("Metal/NEON extension required for _packed_eval")
     torch.manual_seed(0)
     cfg = _cfg(use_fast_inference=True)
     m = BitNetFFTTransformer(cfg).to("mps")
@@ -391,3 +394,27 @@ def test_generate_mps_fast_inference():
     assert out.shape == (1, 14)
     assert torch.isfinite(out).all()
     assert m.layers[0].fff._packed_eval is not None
+
+
+def test_gradient_checkpointing():
+    torch.manual_seed(42)
+    cfg = _cfg()
+    m = BitNetFFTTransformer(cfg)
+    m.train()
+    assert not m.gradient_checkpointing
+
+    m.gradient_checkpointing_enable()
+    assert m.gradient_checkpointing
+
+    tokens = torch.randint(0, cfg.vocab_size, (2, 8))
+    out = m(tokens)
+    assert out.shape == (2, 8, cfg.vocab_size)
+    assert torch.isfinite(out).all()
+
+    loss = out.sum()
+    loss.backward()
+    grads = [p.grad for p in m.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads)
+
+    m.gradient_checkpointing_disable()
+    assert not m.gradient_checkpointing
