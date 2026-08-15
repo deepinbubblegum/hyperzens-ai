@@ -354,16 +354,29 @@ def _sample_from_logits(
 ) -> torch.Tensor:
     """Sample one token per row from raw ``(..., vocab)`` logits, fully on-device.
 
-    ``temperature <= 0`` selects greedily via ``argmax``. Otherwise the logits
-    are temperature-scaled, softmaxed, optionally restricted to the ``top_k``
-    largest probabilities and to the nucleus of cumulative probability mass
-    ``top_p``, renormalized and drawn with ``torch.multinomial``. Every
+    ``temperature <= 0`` (or NaN) selects greedily via ``argmax``. Otherwise the
+    logits are temperature-scaled, softmaxed, optionally restricted to the
+    ``top_k`` largest probabilities and to the nucleus of cumulative probability
+    mass ``top_p``, renormalized and drawn with ``torch.multinomial``. Every
     operation stays on the input tensor's device, so sampling never round-trips
     through the host.
+
+    Dynamic logit scaling and validation keep degenerate inputs from escaping:
+
+    * Non-finite logits (a fused kernel overflowing to ``inf``, NaNs, ...) are
+      zeroed and the scaled logits are max-centered, so ``softmax`` can never
+      see an ``inf/inf`` or NaN and hand ``multinomial`` an invalid distribution.
+    * ``temperature`` is clamped to a small positive floor so a near-zero value
+      cannot overflow ``logits / temperature``.
+    * The sampled ids are clamped into ``[0, vocab)`` so downstream lookups
+      (embeddings, repetition-penalty indexing, decoding) never go out of bounds.
     """
-    if temperature <= 0:
+    if not (temperature > 0):
         return logits.argmax(dim=-1, keepdim=True)
-    probs = torch.softmax(logits / temperature, dim=-1)
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+    logits = logits - logits.max(dim=-1, keepdim=True).values
+    scale = max(float(temperature), 1e-6)
+    probs = torch.softmax(logits / scale, dim=-1)
     if top_k is not None and top_k > 0:
         k = min(int(top_k), probs.shape[-1])
         kth = torch.topk(probs, k, dim=-1).values[..., -1:]
@@ -378,7 +391,8 @@ def _sample_from_logits(
     probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(
         torch.finfo(probs.dtype).tiny
     )
-    return torch.multinomial(probs, num_samples=1)
+    ids = torch.multinomial(probs, num_samples=1)
+    return ids.clamp(0, logits.shape[-1] - 1)
 
 
 def _apply_repetition_penalty(
@@ -399,6 +413,9 @@ def _apply_repetition_penalty(
         return logits
     for b in range(logits.shape[0]):
         ids = torch.unique(prev_ids[b])
+        ids = ids[(ids >= 0) & (ids < logits.shape[-1])]
+        if ids.numel() == 0:
+            continue
         lg = logits[b]
         lg[ids] = torch.where(lg[ids] > 0, lg[ids] / penalty, lg[ids] * penalty)
     return logits
@@ -597,6 +614,12 @@ class BitNetFFTTransformer(nn.Module):
                 batch, prompt_len = tokens.shape
                 if prompt_len < 1:
                     raise ValueError("prompt_ids must contain at least one token")
+                vocab_size = self.embed.weight.shape[0]
+                if tokens.min().item() < 0 or tokens.max().item() >= vocab_size:
+                    raise ValueError(
+                        f"prompt_ids must be in [0, {vocab_size}), got ids in "
+                        f"[{tokens.min().item()}, {tokens.max().item()}]"
+                    )
                 if prompt_len + max_new_tokens > self.cfg.max_seq_len:
                     raise ValueError(
                         f"prompt_len + max_new_tokens ({prompt_len} + "
@@ -706,6 +729,11 @@ class BitNetFFTTransformer(nn.Module):
         sync, as in :meth:`generate`). Sampling parameters match :meth:`generate`
         plus ``repetition_penalty``: when ``> 1.0``, logits of tokens already
         sampled in the continuation are discounted (:func:`_apply_repetition_penalty`).
+        Token ids out of ``[0, vocab_size)`` in the sampled history (e.g. an
+        ``eos_token_id`` larger than the vocabulary) are filtered out before
+        the penalty indexes logits, and prompt ids are validated against the
+        vocabulary up front, so neither the penalty nor the embedding lookup
+        can index out of bounds.
         """
         if max_new_tokens < 1:
             raise ValueError(f"max_new_tokens must be >= 1, got {max_new_tokens}")
@@ -727,6 +755,12 @@ class BitNetFFTTransformer(nn.Module):
                 batch, prompt_len = tokens.shape
                 if prompt_len < 1:
                     raise ValueError("prompt_ids must contain at least one token")
+                vocab_size = self.embed.weight.shape[0]
+                if tokens.min().item() < 0 or tokens.max().item() >= vocab_size:
+                    raise ValueError(
+                        f"prompt_ids must be in [0, {vocab_size}), got ids in "
+                        f"[{tokens.min().item()}, {tokens.max().item()}]"
+                    )
                 if prompt_len + max_new_tokens > self.cfg.max_seq_len:
                     raise ValueError(
                         f"prompt_len + max_new_tokens ({prompt_len} + "

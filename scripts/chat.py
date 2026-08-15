@@ -56,10 +56,40 @@ def build_model(
         if state is None:
             state = torch.load(checkpoint, map_location=device)
         state = state.get("model", state)
+        new_len = _resize_position_embedding(state, model)
+        if new_len is not None:
+            print(f"[model] resized pos embedding {new_len} rows "
+                  f"(max_seq_len={model.cfg.max_seq_len})")
         model.load_state_dict(state)
         print(f"[model] loaded checkpoint {checkpoint}")
     model.eval()
     return model
+
+
+def _resize_position_embedding(
+    state: dict,
+    model: BitNetFFTTransformer,
+) -> int | None:
+    """Resize a checkpoint's ``pos.weight`` to the model's ``max_seq_len``.
+
+    Position embeddings are learned tables sized by ``max_seq_len``, so
+    overriding ``--max-seq-len`` (e.g. ``512`` for a checkpoint saved at a
+    shorter window) would otherwise fail ``load_state_dict`` with a shape
+    mismatch. The overlapping prefix is preserved and any new rows keep the
+    freshly initialized values. Returns the resized length, else ``None``.
+    """
+    saved = state.get("pos.weight")
+    if saved is None or model.pos is None:
+        return None
+    target = model.pos.weight.shape[0]
+    if saved.shape[0] == target:
+        return None
+    resized = model.pos.weight.detach().clone()
+    if saved.shape[1] == resized.shape[1]:
+        n = min(saved.shape[0], target)
+        resized[:n] = saved[:n]
+    state["pos.weight"] = resized
+    return target
 
 
 def _checkpoint_config(state: dict) -> BitNetFFTConfig | None:
@@ -167,21 +197,23 @@ def run_turn(
     n = 0
     t0 = time.perf_counter()
     decode_token = getattr(tokenizer, "decode_step", None)
-    for piece in model.stream_generate(
-        prompt,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        eos_token_id=eos_token_id,
-        repetition_penalty=repetition_penalty,
-        decode_token=decode_token,
-    ):
-        sys.stdout.write(piece)
-        if flush_every <= 1 or n % flush_every == flush_every - 1:
-            sys.stdout.flush()
-        pieces.append(piece)
-        n += 1
+    model.eval()
+    with torch.no_grad():
+        for piece in model.stream_generate(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            repetition_penalty=repetition_penalty,
+            decode_token=decode_token,
+        ):
+            sys.stdout.write(piece)
+            if flush_every <= 1 or n % flush_every == flush_every - 1:
+                sys.stdout.flush()
+            pieces.append(piece)
+            n += 1
     mps_synchronize()
     seconds = time.perf_counter() - t0
 

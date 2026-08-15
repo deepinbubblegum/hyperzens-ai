@@ -147,6 +147,26 @@ def test_run_turn_forwards_repetition_penalty(capsys):
     assert stats["tokens"] == 2
 
 
+def test_run_turn_enters_eval_and_no_grad(capsys, monkeypatch):
+    mod = _load_chat_module()
+    model = _tiny_model()
+    model.train()
+
+    def fake_stream(prompt, **kwargs):
+        assert not model.training
+        assert not torch.is_grad_enabled()
+        return iter(["x", "y"])
+
+    model.stream_generate = fake_stream
+    tok = _byte_tok()
+    mod.run_turn(
+        model, tok, [97], torch.device("cpu"),
+        max_new_tokens=2, temperature=0.0, top_k=50, top_p=0.9,
+        eos_token_id=None,
+    )
+    assert not model.training
+
+
 # --- checkpoint architecture config ------------------------------------------
 
 
@@ -294,6 +314,56 @@ def test_main_rejects_max_new_tokens_vs_checkpoint_seq_len(tmp_path):
             "--device", "cpu", "--tokenizer", "bytes", "--vocab-size", "256",
             "--max-new-tokens", "32", "--checkpoint", path,
         ])
+
+
+def test_build_model_resizes_pos_embedding_for_seq_len_override(tmp_path, capsys):
+    mod = _load_chat_module()
+    tok = _byte_tok()
+    old_cfg = BitNetFFTConfig(
+        vocab_size=256, d_model=32, n_heads=2, n_layers=1, fff_depth=2,
+        max_seq_len=32,
+    ).bind_tokenizer(tok)
+    old = BitNetFFTTransformer(old_cfg)
+    path = tmp_path / "ctx32.pt"
+    torch.save({"model": old.state_dict()}, path)
+
+    new_cfg = BitNetFFTConfig(
+        vocab_size=256, d_model=32, n_heads=2, n_layers=1, fff_depth=2,
+        max_seq_len=512,
+    ).bind_tokenizer(tok)
+    model = mod.build_model(new_cfg, torch.device("cpu"), checkpoint=str(path))
+    assert model.pos.weight.shape[0] == 512
+    assert torch.equal(model.pos.weight[:32], old.pos.weight)  # prefix kept
+    assert "resized pos embedding 512 rows" in capsys.readouterr().out
+    assert not model.training  # eval() mode
+
+
+def test_main_max_seq_len_override_extends_checkpoint_context(
+    monkeypatch, tmp_path, capsys,
+):
+    mod = _load_chat_module()
+    tok = _byte_tok()
+    old_cfg = BitNetFFTConfig(
+        vocab_size=256, d_model=32, n_heads=2, n_layers=1, fff_depth=2,
+        max_seq_len=32,
+    ).bind_tokenizer(tok)
+    path = tmp_path / "ctx32.pt"
+    torch.save(
+        {"config": dataclasses.asdict(old_cfg),
+         "model": BitNetFFTTransformer(old_cfg).state_dict()},
+        path,
+    )
+    monkeypatch.setattr("builtins.input", lambda _: "/quit")
+    rc = mod.main([
+        "--device", "cpu", "--tokenizer", "bytes", "--vocab-size", "256",
+        "--max-new-tokens", "8", "--checkpoint", str(path),
+        "--max-seq-len", "512",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "resized pos embedding 512 rows" in out
+    assert "CLI overrides applied" in out and "max-seq-len" in out
+    assert "max_seq_len=512" in out
 
 
 def test_cli_arch_overrides_detects_user_flags():

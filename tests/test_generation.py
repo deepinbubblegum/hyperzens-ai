@@ -352,6 +352,69 @@ def test_stream_generate_skips_penalty_when_disabled(monkeypatch):
     assert calls == []
 
 
+# --- sampling robustness -----------------------------------------------------
+
+
+def test_sample_from_logits_survives_nonfinite_logits():
+    from bitnet_fff.models import _sample_from_logits
+
+    logits = torch.tensor([[float("nan"), 1.0, float("inf"), -float("inf"), 2.0]])
+    ids = _sample_from_logits(logits, temperature=1.0)
+    assert ids.ndim == 2 and ids.shape[1] == 1
+    assert 0 <= ids.min().item() <= ids.max().item() < logits.shape[-1]
+
+
+def test_sample_from_logits_tiny_temperature_no_overflow():
+    from bitnet_fff.models import _sample_from_logits
+
+    logits = torch.tensor([[1.0, 2.0, 3.0]])
+    ids = _sample_from_logits(logits, temperature=1e-300)
+    assert 0 <= ids.min().item() <= ids.max().item() < logits.shape[-1]
+
+
+def test_sample_from_logits_nan_temperature_is_greedy():
+    from bitnet_fff.models import _sample_from_logits
+
+    logits = torch.tensor([[1.0, 5.0, 2.0]])
+    ids = _sample_from_logits(logits, temperature=float("nan"))
+    assert ids[0, 0].item() == 1  # argmax of [1, 5, 2]
+
+
+def test_sample_from_logits_clamps_ids_to_vocab(monkeypatch):
+    from bitnet_fff.models import _sample_from_logits
+
+    logits = torch.tensor([[1.0, 2.0, 3.0]])
+
+    def fake_multinomial(probs, num_samples):
+        return torch.tensor([[logits.shape[-1] + 5]])  # deliberately OOB
+
+    monkeypatch.setattr("torch.multinomial", fake_multinomial)
+    ids = _sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None)
+    assert ids.max().item() == logits.shape[-1] - 1
+
+
+def test_apply_repetition_penalty_ignores_oob_ids():
+    from bitnet_fff.models import _apply_repetition_penalty
+
+    logits = torch.tensor([[5.0, 3.0, 1.0]])
+    penalized = _apply_repetition_penalty(
+        logits.clone(), torch.tensor([[1, 99, -3]]), 2.0
+    )
+    assert torch.equal(penalized, torch.tensor([[5.0, 1.5, 1.0]]))
+
+
+def test_stream_generate_rejects_oob_prompt_ids():
+    m = _model(vocab_size=64)
+    with pytest.raises(ValueError, match="must be in"):
+        list(m.stream_generate(torch.tensor([5, 999]), max_new_tokens=2))
+
+
+def test_generate_rejects_oob_prompt_ids():
+    m = _model(vocab_size=64)
+    with pytest.raises(ValueError, match="must be in"):
+        m.generate(torch.tensor([5, -1]), max_new_tokens=2)
+
+
 # --- CLI smoke tests ---------------------------------------------------------
 
 
