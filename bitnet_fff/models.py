@@ -381,6 +381,29 @@ def _sample_from_logits(
     return torch.multinomial(probs, num_samples=1)
 
 
+def _apply_repetition_penalty(
+    logits: torch.Tensor,
+    prev_ids: torch.Tensor,
+    penalty: float,
+) -> torch.Tensor:
+    """Discourage already-sampled tokens via the CTRL repetition penalty.
+
+    For every token id that appears in ``prev_ids`` (the generated part of the
+    sequence so far), its logit is divided by ``penalty`` when positive and
+    multiplied by ``penalty`` when negative, nudging the model away from
+    repeating itself. A ``penalty <= 1.0`` (or no history) is a no-op. All
+    operations stay on ``logits``' device; ``prev_ids`` is ``(batch, seq)`` and
+    ``logits`` is ``(batch, vocab)``.
+    """
+    if penalty <= 1.0 or prev_ids is None or prev_ids.numel() == 0:
+        return logits
+    for b in range(logits.shape[0]):
+        ids = torch.unique(prev_ids[b])
+        lg = logits[b]
+        lg[ids] = torch.where(lg[ids] > 0, lg[ids] / penalty, lg[ids] * penalty)
+    return logits
+
+
 class BitNetFFTBlock(nn.Module):
     """Pre-norm transformer block: attention + FFF with residual connections."""
 
@@ -655,6 +678,7 @@ class BitNetFFTTransformer(nn.Module):
         top_k: int = 50,
         top_p: float = 0.9,
         eos_token_id: int | None = None,
+        repetition_penalty: float = 1.0,
         decode_token: Callable[[int], str] | None = None,
     ) -> Iterator[str | int | tuple[str, ...] | torch.Tensor]:
         """Autoregressively stream a continuation, one token (or token text) at a time.
@@ -679,7 +703,9 @@ class BitNetFFTTransformer(nn.Module):
         entered when iteration starts and restored when the generator is
         exhausted or closed early (so it is safe to ``break`` out of the stream).
         Early ``eos_token_id`` termination is honoured (a per-step host-device
-        sync, as in :meth:`generate`). Sampling parameters match :meth:`generate`.
+        sync, as in :meth:`generate`). Sampling parameters match :meth:`generate`
+        plus ``repetition_penalty``: when ``> 1.0``, logits of tokens already
+        sampled in the continuation are discounted (:func:`_apply_repetition_penalty`).
         """
         if max_new_tokens < 1:
             raise ValueError(f"max_new_tokens must be >= 1, got {max_new_tokens}")
@@ -738,6 +764,7 @@ class BitNetFFTTransformer(nn.Module):
                 next_ids = _sample_from_logits(
                     prefill[:, -1], temperature, top_k, top_p
                 )
+                gen_history = next_ids  # (batch, 1) generated so far
                 done = torch.zeros(batch, dtype=torch.bool, device=device)
                 if eos_token_id is not None:
                     done = (next_ids == eos_token_id).squeeze(-1)
@@ -749,10 +776,15 @@ class BitNetFFTTransformer(nn.Module):
                         break
                     logits = self(
                         next_ids, kv_cache=caches, past_length=prompt_len + step - 1
-                    )
+                    )[:, -1]
+                    if repetition_penalty > 1.0:
+                        logits = _apply_repetition_penalty(
+                            logits, gen_history, repetition_penalty
+                        )
                     next_ids = _sample_from_logits(
-                        logits[:, -1], temperature, top_k, top_p
+                        logits, temperature, top_k, top_p
                     )
+                    gen_history = torch.cat([gen_history, next_ids], dim=1)
                     if eos_token_id is not None:
                         done = done | (next_ids == eos_token_id).squeeze(-1)
                         next_ids = next_ids.masked_fill(

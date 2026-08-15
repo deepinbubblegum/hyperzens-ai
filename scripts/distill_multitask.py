@@ -10,8 +10,11 @@ Distills logits from a frozen Teacher into a small QAT-trained
 * Code/Logic (20%): ``m-a-p/CodeFeedback``
 
 The loss blends temperature-scaled KL divergence (teacher) with hard
-next-token cross-entropy, exactly as ``distill.py``. Three extra levers are
-built in for memory-frugal all-rounder training:
+next-token cross-entropy, as in ``distill.py``, but the KD term is re-scaled by
+``alpha * T^2 / vocab_size`` (see :func:`accum_step`) so the total loss stays
+in a normal ~1-20 range, and gradients are clipped to norm 1.0 before each
+optimizer step. Three extra levers are built in for memory-frugal all-rounder
+training:
 
 * ``--tie-weights`` is **on by default** (the output head shares the input
   embedding), cutting the student's trainable parameter count.
@@ -162,6 +165,12 @@ def accum_step(
     accumulated (only one micro-batch's activations live at a time), giving an
     effective batch of ``len(batches) * batch_size`` without the corresponding
     MPS VRAM spike. Returns ``(loss, kd, ce)`` averaged over the micro-batches.
+
+    **Loss scaling** — ``distill.distillation_loss`` returns a temperature-
+    squared batchmean KL (``kd = KL * T^2``); that is re-scaled by
+    ``alpha * T^2 / vocab_size`` before blending with the hard-label CE, so the
+    KD term lands on the same order of magnitude as the CE and the total loss
+    stays in a normal ~1-20 range instead of being dominated by the KL.
     """
     optimizer.zero_grad()
     loss_acc = kd_acc = ce_acc = 0.0
@@ -169,14 +178,19 @@ def accum_step(
     for batch in batches:
         t_logits = distill_mod.teacher_logits(teacher, batch)
         s_logits = student(batch)
-        loss, kd, ce = distill_mod.distillation_loss(
+        _, kd, ce = distill_mod.distillation_loss(
             s_logits, t_logits, batch, alpha, temperature, vocab
         )
+        # distillation_loss returns kd = KL_batchmean * T^2, so the scaled KD
+        # term (alpha * T^2 / vocab) * KL_batchmean == (alpha / vocab) * kd.
+        kd = (alpha / vocab) * kd
+        loss = kd + (1.0 - alpha) * ce
         (loss / grad_accum).backward()
         loss_acc += float(loss.item())
         kd_acc += float(kd.item())
         ce_acc += float(ce.item())
         n += 1
+    torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
     optimizer.step()
     if n == 0:
         raise RuntimeError("accum_step requires at least one micro-batch")

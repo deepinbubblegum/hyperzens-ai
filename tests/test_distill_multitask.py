@@ -187,6 +187,48 @@ def test_accum_step_requires_batches():
         raise AssertionError("expected RuntimeError")
 
 
+def test_accum_step_loss_scaling_and_range():
+    # The KD term is re-scaled by (alpha * T^2 / vocab), so the blended loss
+    # stays ~1-20 instead of being dominated by the temperature-squared KL.
+    torch.manual_seed(0)
+    student = _student()
+    teacher = _teacher()
+    opt = torch.optim.AdamW(student.parameters(), lr=1e-3)
+    torch.manual_seed(0)
+    batch = _batch(n=2)
+    alpha, temperature, vocab = 0.7, 2.0, 64
+    loss, kd, ce = mod.accum_step(
+        student, opt, teacher, [batch], alpha, temperature, vocab, grad_accum=1
+    )
+    # kd returned by accum_step is the scaled term == (alpha*T^2/vocab)*KL_batchmean,
+    # which equals (alpha/vocab) * distill.py's kd (already T^2-scaled).
+    kd_t2 = kd * vocab / alpha
+    assert torch.allclose(
+        torch.tensor(loss),
+        torch.tensor((alpha / vocab) * kd_t2 + (1.0 - alpha) * ce),
+    )
+    assert 1.0 <= loss <= 20.0
+    assert torch.isfinite(torch.tensor(loss))
+
+
+def test_accum_step_clips_gradients_before_step(monkeypatch):
+    student = _student()
+    teacher = _teacher()
+    opt = torch.optim.AdamW(student.parameters(), lr=1e-3)
+    calls = []
+
+    def fake_clip(params, max_norm):
+        calls.append((list(params), max_norm))
+        return torch.tensor(0.0)
+
+    monkeypatch.setattr("torch.nn.utils.clip_grad_norm_", fake_clip)
+    mod.accum_step(student, opt, teacher, [_batch(n=2)], 0.7, 2.0, 64, grad_accum=1)
+    assert len(calls) == 1
+    params, max_norm = calls[0]
+    assert max_norm == 1.0
+    assert len(params) > 0
+
+
 # --- per-task validation -----------------------------------------------------
 
 

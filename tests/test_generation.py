@@ -282,6 +282,76 @@ def test_stream_generate_requires_token_model():
         next(m.stream_generate(prompt, max_new_tokens=2))
 
 
+# --- repetition penalty ------------------------------------------------------
+
+
+def test_apply_repetition_penalty_biases_away_from_sampled():
+    from bitnet_fff.models import _apply_repetition_penalty
+
+    logits = torch.tensor([[5.0, 3.0, 1.0, -2.0]])
+    penalized = _apply_repetition_penalty(
+        logits.clone(), torch.tensor([[1, 3]]), 2.0
+    )
+    # id 1 (logit > 0) is halved; id 3 (logit < 0) is doubled in magnitude.
+    assert torch.equal(penalized, torch.tensor([[5.0, 1.5, 1.0, -4.0]]))
+    assert torch.equal(logits, torch.tensor([[5.0, 3.0, 1.0, -2.0]]))  # no in-place
+
+
+def test_apply_repetition_penalty_noop_when_disabled():
+    from bitnet_fff.models import _apply_repetition_penalty
+
+    logits = torch.tensor([[5.0, 3.0]])
+    assert torch.equal(
+        _apply_repetition_penalty(logits.clone(), torch.tensor([[0, 1]]), 1.0),
+        logits,
+    )
+    assert torch.equal(
+        _apply_repetition_penalty(logits.clone(), torch.empty(0, 0, dtype=torch.long), 2.0),
+        logits,
+    )
+
+
+def test_stream_generate_applies_repetition_penalty(monkeypatch):
+    import bitnet_fff.models as models_mod
+
+    m = _model()
+    calls = []
+
+    def fake_penalty(logits, prev_ids, penalty):
+        calls.append((prev_ids.shape[1], penalty))
+        return logits
+
+    monkeypatch.setattr(models_mod, "_apply_repetition_penalty", fake_penalty)
+    prompt = torch.tensor([1, 2, 3])
+    with torch.no_grad():
+        steps = list(m.stream_generate(
+            prompt, max_new_tokens=3, temperature=1.0, repetition_penalty=1.5
+        ))
+    assert len(steps) == 3
+    # one penalty application per decode step, history grows each time
+    assert calls == [(1, 1.5), (2, 1.5)]
+
+
+def test_stream_generate_skips_penalty_when_disabled(monkeypatch):
+    import bitnet_fff.models as models_mod
+
+    m = _model()
+    calls = []
+
+    def fake_penalty(logits, prev_ids, penalty):
+        calls.append(penalty)
+        return logits
+
+    monkeypatch.setattr(models_mod, "_apply_repetition_penalty", fake_penalty)
+    prompt = torch.tensor([1, 2, 3])
+    with torch.no_grad():
+        steps = list(m.stream_generate(
+            prompt, max_new_tokens=3, temperature=1.0, repetition_penalty=1.0
+        ))
+    assert len(steps) == 3
+    assert calls == []
+
+
 # --- CLI smoke tests ---------------------------------------------------------
 
 

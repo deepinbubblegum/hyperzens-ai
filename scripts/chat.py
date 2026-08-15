@@ -113,6 +113,7 @@ def run_turn(
     top_k: int,
     top_p: float,
     eos_token_id: int | None,
+    repetition_penalty: float = 1.0,
     flush_every: int = 1,
 ) -> tuple[str, dict]:
     """Stream one assistant reply; returns ``(text, stats)``.
@@ -136,6 +137,7 @@ def run_turn(
         top_k=top_k,
         top_p=top_p,
         eos_token_id=eos_token_id,
+        repetition_penalty=repetition_penalty,
         decode_token=decode_token,
     ):
         sys.stdout.write(piece)
@@ -219,6 +221,7 @@ def chat_loop(
             top_k=args.top_k,
             top_p=args.top_p,
             eos_token_id=args.eos_token_id,
+            repetition_penalty=args.repetition_penalty,
         )
         sys.stdout.write("\n")
         print(format_stats(stats))
@@ -264,6 +267,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     s.add_argument("--top-k", type=int, default=50)
     s.add_argument("--top-p", type=float, default=0.9)
     s.add_argument("--eos-token-id", type=int, default=None)
+    s.add_argument("--repetition-penalty", type=float, default=1.2,
+                   help="discount logits of already-sampled tokens "
+                        "(1.0 disables)")
     s.add_argument("--system", default=None,
                    help="optional system prompt prepended to the history")
     s.add_argument("--flush-every", type=int, default=1,

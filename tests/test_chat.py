@@ -120,6 +120,33 @@ def test_format_stats():
     assert "tok/s" in s and "ms/token" in s and "0.50 s" in s
 
 
+def test_parse_args_repetition_penalty_default_and_override():
+    mod = _load_chat_module()
+    assert mod.parse_args([]).repetition_penalty == 1.2
+    assert mod.parse_args(["--repetition-penalty", "1.0"]).repetition_penalty == 1.0
+
+
+def test_run_turn_forwards_repetition_penalty(capsys):
+    mod = _load_chat_module()
+    model = _tiny_model()
+    seen = {}
+
+    def fake_stream(prompt, **kwargs):
+        seen.update(kwargs)
+        return iter(["a", "b"])
+
+    model.stream_generate = fake_stream
+    tok = _byte_tok()
+    text, stats = mod.run_turn(
+        model, tok, [97, 98], torch.device("cpu"),
+        max_new_tokens=2, temperature=0.0, top_k=50, top_p=0.9,
+        eos_token_id=None, repetition_penalty=1.7,
+    )
+    assert seen["repetition_penalty"] == 1.7
+    assert text == "ab"
+    assert stats["tokens"] == 2
+
+
 # --- checkpoint architecture config ------------------------------------------
 
 
