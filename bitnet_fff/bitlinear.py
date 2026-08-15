@@ -28,23 +28,37 @@ __all__ = [
 ]
 
 
-def absmean_ternarize(w: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def absmean_ternarize(
+    w: torch.Tensor,
+    eps: float = 1e-8,
+    threshold_scale: float = 1.0,
+    threshold: float | None = None,
+) -> torch.Tensor:
     """AbsMean ternary quantization returning values in {-1, 0, +1}.
 
-    Weights with magnitude above the AbsMean threshold map to ``sign(w)``,
-    everything else to zero.
+    Weights with magnitude above the threshold map to ``sign(w)``, everything
+    else to zero. The default threshold is the AbsMean magnitude scaled by
+    ``threshold_scale`` (1.0 -> the classic BitNet b1.58 threshold); a fixed
+    absolute ``threshold`` overrides both. ``threshold_scale`` is the knob the
+    auto-tuner sweeps against tree depth.
     """
-    scale = w.abs().mean().clamp_min(eps)
-    return torch.where(w.abs() > scale, torch.sign(w), torch.zeros_like(w))
+    if threshold is None:
+        threshold = float(w.detach().abs().mean().clamp_min(eps)) * threshold_scale
+    return torch.where(w.abs() > threshold, torch.sign(w), torch.zeros_like(w))
 
 
-def ste_ternarize(w: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def ste_ternarize(
+    w: torch.Tensor,
+    eps: float = 1e-8,
+    threshold_scale: float = 1.0,
+    threshold: float | None = None,
+) -> torch.Tensor:
     """Ternary weights with a straight-through estimator.
 
     Forward pass uses the ternary weight; backward pass treats the
     quantization as the identity so the gradient reaches ``w`` unchanged.
     """
-    wq = absmean_ternarize(w, eps=eps)
+    wq = absmean_ternarize(w, eps=eps, threshold_scale=threshold_scale, threshold=threshold)
     return wq + (w - w.detach())
 
 

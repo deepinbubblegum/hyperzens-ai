@@ -6,6 +6,10 @@ from .bitlinear import BitLinear, absmax_quantize, absmean_ternarize, ste_ternar
 from .fast_fff import FastFeedForwardBitNet
 from . import mps_utils
 from . import fast_inference
+from . import models
+from . import qat
+from . import profiler
+from . import tuning
 
 __all__ = [
     "BitLinear",
@@ -15,6 +19,10 @@ __all__ = [
     "absmax_quantize",
     "mps_utils",
     "fast_inference",
+    "models",
+    "qat",
+    "profiler",
+    "tuning",
 ]
 
 __version__ = "0.1.0"

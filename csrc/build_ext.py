@@ -10,12 +10,27 @@ rebuild whenever the shader changes.
 from __future__ import annotations
 
 import hashlib
+import os
 import pathlib
+import sys
 
 _ROOT = pathlib.Path(__file__).resolve().parent
 
 
+def _ensure_ninja_on_path() -> None:
+    """Prepend the interpreter's ``bin`` dir to PATH so ninja is found.
+
+    torch's cpp_extension runs the build subprocess with ``cwd=build_directory``
+    (a cache dir), so relative PATH entries and the caller's working dir are not
+    reliable. The venv that spawned this interpreter always contains ninja.
+    """
+    venv_bin = pathlib.Path(sys.executable).resolve().parent
+    if str(venv_bin) not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = str(venv_bin) + os.pathsep + os.environ.get("PATH", "")
+
+
 def _build() -> "module":
+    _ensure_ninja_on_path()
     metal_src = (_ROOT / "ternary_add.metal").read_text()
     metal_hash = int(hashlib.sha256(metal_src.encode()).hexdigest()[:12], 16)
 

@@ -67,6 +67,7 @@ class FastFeedForwardBitNet(nn.Module):
         router_rank: str = "full",
         chunk_size: int | None = None,
         eps: float = 1e-8,
+        ternarize_threshold_scale: float = 1.0,
     ) -> None:
         super().__init__()
         if router_rank not in ("full", "r1"):
@@ -74,6 +75,10 @@ class FastFeedForwardBitNet(nn.Module):
 
         self.d_in = d_in
         self.d_out = d_out if d_out is not None else d_in
+        if ternarize_threshold_scale <= 0:
+            raise ValueError(
+                f"ternarize_threshold_scale must be positive, got {ternarize_threshold_scale}"
+            )
 
         if depth is None:
             if self.d_out & (self.d_out - 1):
@@ -91,6 +96,7 @@ class FastFeedForwardBitNet(nn.Module):
         self.router_rank = router_rank
         self.chunk_size = chunk_size
         self.eps = eps
+        self.ternarize_threshold_scale = ternarize_threshold_scale
 
         self.leaf_weight = nn.Parameter(
             torch.empty(self.num_leaves, self.d_out, self.d_in)
@@ -165,8 +171,15 @@ class FastFeedForwardBitNet(nn.Module):
     def _leaf_projection(self, x: torch.Tensor, leaf_idx: torch.Tensor) -> torch.Tensor:
         """Gather only the selected leaves and apply the ternary projection."""
         batch = x.shape[0]
-        wq = ste_ternarize(self.leaf_weight, eps=self.eps)
-        xq = absmax_quantize(x, bits=self.activation_bits, eps=self.eps)
+        wq = ste_ternarize(
+            self.leaf_weight,
+            eps=self.eps,
+            threshold_scale=self.ternarize_threshold_scale,
+        )
+        if self.activation_bits is None or self.activation_bits < 32:
+            xq = absmax_quantize(x, bits=self.activation_bits or 32, eps=self.eps)
+        else:
+            xq = x
         if self.chunk_size is None or batch <= self.chunk_size:
             w_sel = wq[leaf_idx]
             out = torch.bmm(xq.unsqueeze(1), w_sel.transpose(-1, -2)).squeeze(1)
@@ -222,7 +235,7 @@ class FastFeedForwardBitNet(nn.Module):
         from .fast_inference import extension_available
 
         if not extension_available():
-            return self._forward(x)
+            return self.forward(x)
         evaluator = getattr(self, "_packed_eval", None)
         if evaluator is None or evaluator.device != torch.device(x.device):
             evaluator = self.pack(device=x.device)
@@ -241,5 +254,6 @@ class FastFeedForwardBitNet(nn.Module):
         return (
             f"d_in={self.d_in}, d_out={self.d_out}, depth={self.depth}, "
             f"num_leaves={self.num_leaves}, router_rank={self.router_rank!r}, "
-            f"chunk_size={self.chunk_size}"
+            f"chunk_size={self.chunk_size}, "
+            f"ternarize_threshold_scale={self.ternarize_threshold_scale}"
         )

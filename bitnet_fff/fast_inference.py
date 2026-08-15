@@ -51,14 +51,20 @@ def extension_available() -> bool:
     return _EXT_AVAILABLE
 
 
-def pack_ternary_weights(weight: torch.Tensor, eps: float = 1e-8) -> tuple[torch.Tensor, int]:
+def pack_ternary_weights(
+    weight: torch.Tensor,
+    eps: float = 1e-8,
+    threshold_scale: float = 1.0,
+) -> tuple[torch.Tensor, int]:
     """AbsMean-ternarize ``(L, d_out, d_in)`` weights and bit-pack to uint8.
 
     Returns ``(packed, d_in_padded)`` with ``packed`` of shape
     ``(L, d_out, ceil(d_in/4))``. ``d_in_padded`` is the input width the
     kernels expect (``d_in`` rounded up to a multiple of 4).
+    ``threshold_scale`` must match the module's ``ternarize_threshold_scale``
+    so the fast path reproduces the training-time quantization.
     """
-    t = absmean_ternarize(weight.detach(), eps=eps)
+    t = absmean_ternarize(weight.detach(), eps=eps, threshold_scale=threshold_scale)
     d_in = t.shape[-1]
     pad = (-d_in) % 4
     if pad:
@@ -181,7 +187,9 @@ class PackedFFFEvaluator:
         )
         with torch.no_grad():
             self.packed, self.d_in_padded = pack_ternary_weights(
-                module.leaf_weight.data, eps=eps
+                module.leaf_weight.data,
+                eps=eps,
+                threshold_scale=getattr(module, "ternarize_threshold_scale", 1.0),
             )
             self.packed = self.packed.to(self.device)
             if module.leaf_bias is not None:
@@ -212,7 +220,7 @@ class PackedFFFEvaluator:
 
     def forward(self, x: torch.Tensor, leaf_idx: torch.Tensor) -> torch.Tensor:
         xp = self._padded(x)
-        if self.activation_bits <= 32:
+        if self.activation_bits < 32:
             xp = absmax_quantize(xp, bits=self.activation_bits, eps=self.eps)
         out = ternary_mm(xp, self.packed, self._leaf(leaf_idx))
         if self.bias is not None:
