@@ -214,10 +214,19 @@ class FastFeedForwardBitNet(nn.Module):
             return out.reshape(*shape[:-1], self.d_out)
         return self._forward(x)
 
-    def pack(self, device: torch.device | str | None = None) -> "PackedFFFEvaluator":
-        """Build a packed-ternary evaluator for fast inference on ``device``."""
-        from .fast_inference import PackedFFFEvaluator
+    def pack(
+        self, device: torch.device | str | None = None
+    ) -> "FusedPackedFFFEvaluator | PackedFFFEvaluator":
+        """Build a packed-ternary evaluator for fast inference on ``device``.
 
+        ``router_rank="full"`` modules get the fused single-pass evaluator
+        (:class:`FusedPackedFFFEvaluator`); ``"r1"`` modules fall back to the
+        classic externally-routed evaluator (:class:`PackedFFFEvaluator`).
+        """
+        from .fast_inference import FusedPackedFFFEvaluator, PackedFFFEvaluator
+
+        if self.router_rank == "full":
+            return FusedPackedFFFEvaluator(self, device=device)
         return PackedFFFEvaluator(self, device=device)
 
     def fast_forward(
@@ -228,26 +237,42 @@ class FastFeedForwardBitNet(nn.Module):
     ) -> torch.Tensor:
         """Zero-gather inference: routes, then evaluates only the selected leaves.
 
-        The first call packs + uploads the ternary weights (lazy); subsequent
-        calls reuse them. With ``router_rank="full"`` the fused kernel routes,
-        quantizes and evaluates in a single native call with no host round-trip.
-        Falls back to ``_forward`` if the native extension is unavailable.
+        In ``eval()`` mode with ``router_rank="full"`` the first call packs +
+        uploads the ternary weights and flattens the router (lazy) into a
+        :class:`FusedPackedFFFEvaluator`; every call then routes, quantizes and
+        evaluates in a single native call with no host round-trip. Falls back to
+        the reference PyTorch path (``forward``) when the native extension is not
+        compiled or when the module is in ``train()`` mode (the fused kernel has
+        no routing gradients), and to the classic packed path for ``"r1"``.
         """
-        from .fast_inference import extension_available
+        from .fast_inference import (
+            FusedPackedFFFEvaluator,
+            PackedFFFEvaluator,
+            extension_available,
+        )
 
-        if not extension_available():
+        if not extension_available() or self.training:
             return self.forward(x)
-        evaluator = getattr(self, "_packed_eval", None)
-        if evaluator is None or evaluator.device != torch.device(x.device):
-            evaluator = self.pack(device=x.device)
-            evaluator.chunk_size = chunk_size
-            self._packed_eval = evaluator
         if self.router_rank == "full":
+            evaluator = getattr(self, "_packed_eval", None)
+            if not isinstance(evaluator, FusedPackedFFFEvaluator) or (
+                evaluator.device != torch.device(x.device)
+            ):
+                evaluator = FusedPackedFFFEvaluator(self, device=x.device)
+                evaluator.chunk_size = chunk_size
+                self._packed_eval = evaluator
             if x.dim() > 2:
                 shape = x.shape
                 flat = x.reshape(-1, shape[-1])
                 return evaluator(flat).reshape(*shape[:-1], self.d_out)
             return evaluator(x)
+        evaluator = getattr(self, "_packed_eval", None)
+        if not isinstance(evaluator, PackedFFFEvaluator) or (
+            evaluator.device != torch.device(x.device)
+        ):
+            evaluator = PackedFFFEvaluator(self, device=x.device)
+            evaluator.chunk_size = chunk_size
+            self._packed_eval = evaluator
         if x.dim() > 2:
             shape = x.shape
             flat = x.reshape(-1, shape[-1])

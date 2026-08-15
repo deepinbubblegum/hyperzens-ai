@@ -10,6 +10,7 @@ import torch
 from bitnet_fff import FastFeedForwardBitNet
 from bitnet_fff.bitlinear import absmax_quantize, absmean_ternarize
 from bitnet_fff.fast_inference import (
+    FusedPackedFFFEvaluator,
     PackedFFFEvaluator,
     PackedTernaryMM,
     extension_available,
@@ -363,3 +364,108 @@ def test_fused_r1_fast_forward_matches_forward():
         ref = model(x)
         fast = model.fast_forward(x)
     assert torch.allclose(fast, ref, atol=1e-5)
+
+
+@requires_ext
+def test_fused_evaluator_router_buffers_flattened():
+    torch.manual_seed(0)
+    model = FastFeedForwardBitNet(d_in=6, d_out=8, depth=2, bias=True)
+    model.eval()
+    evalr = FusedPackedFFFEvaluator(model)
+    assert evalr.router_w.dtype == torch.float32
+    assert evalr.router_w.is_contiguous()
+    assert evalr.router_b.dtype == torch.float32
+    assert evalr.router_b.is_contiguous()
+    assert evalr.router_w.shape == (model.num_leaves - 1, evalr.d_in_padded)
+    assert evalr.router_b.shape == (model.num_leaves - 1,)
+    assert evalr.packed.dtype == torch.uint8
+    x = torch.randn(11, 6)
+    with torch.no_grad():
+        ref = model._forward(x)
+        out = evalr(x)
+    assert torch.allclose(out, ref, atol=1e-5)
+
+
+@requires_ext
+def test_fused_evaluator_3d_and_chunked():
+    torch.manual_seed(0)
+    model = FastFeedForwardBitNet(d_in=32, d_out=8, depth=2)
+    model.eval()
+    evalr = FusedPackedFFFEvaluator(model)
+    x = torch.randn(3, 4, 32)
+    with torch.no_grad():
+        ref = model(x)
+        out = evalr(x)
+    assert out.shape == ref.shape
+    assert torch.allclose(out, ref, atol=1e-5)
+    evalr.chunk_size = 5
+    x2 = torch.randn(13, 32)
+    with torch.no_grad():
+        chunked = evalr(x2)
+        full = FusedPackedFFFEvaluator(model)(x2)
+    assert torch.allclose(chunked, full, atol=1e-5)
+
+
+@requires_ext
+def test_fused_evaluator_matches_classic_evaluator():
+    torch.manual_seed(0)
+    model = FastFeedForwardBitNet(d_in=16, d_out=8, depth=2, bias=True)
+    model.eval()
+    x = torch.randn(21, 16)
+    leaf, _ = model._routing_forward(x)
+    fused = FusedPackedFFFEvaluator(model)(x)
+    classic = PackedFFFEvaluator(model)(x, leaf)
+    assert torch.allclose(fused, classic, atol=1e-5)
+
+
+@requires_ext
+def test_fused_evaluator_requires_full_rank():
+    torch.manual_seed(0)
+    model = FastFeedForwardBitNet(d_in=16, d_out=8, depth=2, router_rank="r1")
+    try:
+        FusedPackedFFFEvaluator(model)
+        raise AssertionError("expected ValueError for r1 router")
+    except ValueError:
+        pass
+
+
+@requires_ext
+def test_fast_forward_uses_fused_evaluator_in_eval():
+    torch.manual_seed(0)
+    model = FastFeedForwardBitNet(d_in=16, d_out=8, depth=2)
+    model.eval()
+    x = torch.randn(9, 16)
+    with torch.no_grad():
+        model.fast_forward(x)
+    assert isinstance(model._packed_eval, FusedPackedFFFEvaluator)
+
+
+@requires_ext
+def test_fast_forward_training_falls_back_to_reference():
+    torch.manual_seed(0)
+    model = FastFeedForwardBitNet(d_in=16, d_out=8, depth=2)
+    model.train()
+    x = torch.randn(7, 16, requires_grad=True)
+    with torch.no_grad():
+        ref = model(x)
+        fast = model.fast_forward(x)
+    assert torch.allclose(fast, ref, atol=1e-5)
+    assert not hasattr(model, "_packed_eval")
+    out = model.fast_forward(x)
+    assert out.requires_grad
+
+
+@requires_ext
+def test_fused_evaluator_mps_matches_cpu():
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
+    torch.manual_seed(0)
+    cpu = FastFeedForwardBitNet(d_in=32, d_out=8, depth=2, bias=True)
+    cpu.eval()
+    mps = FastFeedForwardBitNet(d_in=32, d_out=8, depth=2, bias=True).to("mps")
+    mps.eval()
+    mps.load_state_dict(cpu.state_dict())
+    x = torch.randn(17, 32)
+    fused_cpu = FusedPackedFFFEvaluator(cpu)(x)
+    fused_mps = FusedPackedFFFEvaluator(mps)(x.to("mps"))
+    assert torch.allclose(fused_mps.cpu(), fused_cpu, atol=1e-4)
