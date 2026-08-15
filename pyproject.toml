@@ -1,9 +1,0 @@
-[build-system]
-# Do NOT list torch here. Pep517 isolated builds would hide your venv CUDA
-# torch and/or download a mismatched CPU wheel.
-#
-# Recommended install (Linux RTX 3060 or macOS CPU):
-#   pip install torch
-#   pip install -e . --no-build-isolation
-requires = ["setuptools>=61", "wheel"]
-build-backend = "setuptools.build_meta"
