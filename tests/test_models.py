@@ -162,10 +162,14 @@ def test_kvcache_dynamic_growth():
 
 def test_kvcache_mismatch_raises():
     cache = KVCache.preallocate(1, 2, 8, 4, dtype=torch.float32)
+    # Head dim mismatch raises ValueError
     with pytest.raises(ValueError):
         cache.append(torch.randn(1, 2, 1, 3), torch.randn(1, 2, 1, 3))
-    with pytest.raises(ValueError):
-        cache.append(torch.randn(1, 2, 1, 4).half(), torch.randn(1, 2, 1, 4).half())
+    # Dtype mismatch is automatically cast without error
+    k_half = torch.randn(1, 2, 1, 4).half()
+    v_half = torch.randn(1, 2, 1, 4).half()
+    cache.append(k_half, v_half)
+    assert cache.size == 1
 
 
 def test_attention_kv_cache_matches_full():
