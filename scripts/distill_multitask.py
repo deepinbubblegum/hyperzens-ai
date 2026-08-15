@@ -35,6 +35,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import os
 import sys
@@ -140,8 +141,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     r = p.add_argument_group("run")
     r.add_argument("--steps", type=int, default=2000)
-    r.add_argument("--device", choices=("cpu", "mps"), default=None)
+    r.add_argument("--device", choices=("cuda", "cpu", "mps"), default=None)
     r.add_argument("--seed", type=int, default=0)
+    r.add_argument("--compile", action="store_true",
+                   help="wrap the student with torch.compile before training")
     r.add_argument("--log-every", type=int, default=10)
     r.add_argument("--save-every", type=int, default=500)
     r.add_argument("--empty-cache-every", type=int, default=100,
@@ -153,6 +156,59 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _resolve_device(device: str | None) -> torch.device:
+    """Pick the compute device: explicit flag, else CUDA -> MPS -> CPU."""
+    if device:
+        return torch.device(device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if is_mps_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _amp_autocast(device: torch.device) -> object:
+    """FP16 autocast context for CUDA; a no-op on MPS/CPU.
+
+    Uses ``torch.cuda.amp.autocast(dtype=torch.float16)`` so the forward pass
+    and loss computation run in mixed precision on CUDA, while MPS/CPU keep
+    their existing FP32/FP16-master path untouched.
+    """
+    if getattr(device, "type", None) == "cuda":
+        return torch.cuda.amp.autocast(dtype=torch.float16)
+    return contextlib.nullcontext()
+
+
+def _amp_step(scaler, optimizer, params, max_norm: float = 1.0) -> None:
+    """Unscale -> clip -> step with GradScaler semantics.
+
+    ``GradScaler.step()`` cannot drive the QAT ``FP16MasterAdamW`` directly
+    (it is not a ``torch.optim.Optimizer``: it has no ``param_groups``), so
+    the scale bookkeeping lives in the scaler while the unscale/step is applied
+    manually. If an unscaled gradient is non-finite the optimizer step is
+    skipped and the scale is halved. On MPS/CPU the scaler is disabled and this
+    is a plain clip-then-step.
+    """
+    if not scaler.is_enabled():
+        torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
+        optimizer.step()
+        return
+    scale = scaler.get_scale()
+    inv_scale = 1.0 / scale
+    found_inf = False
+    for p in params:
+        if p.grad is not None:
+            p.grad.mul_(inv_scale)
+            if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                found_inf = True
+    if found_inf:
+        scaler.update(new_scale=scale * 0.5)
+        return
+    torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
+    optimizer.step()
+    scaler.update()
+
+
 def accum_step(
     student,
     optimizer,
@@ -162,6 +218,7 @@ def accum_step(
     temperature: float,
     vocab: int,
     grad_accum: int,
+    scaler=None,
 ) -> tuple[float, float, float]:
     """One optimizer step over ``grad_accum`` micro-batches.
 
@@ -175,27 +232,34 @@ def accum_step(
     ``alpha * T^2 / vocab_size`` before blending with the hard-label CE, so the
     KD term lands on the same order of magnitude as the CE and the total loss
     stays in a normal ~1-20 range instead of being dominated by the KL.
+
+    **AMP** — on CUDA the forward pass and loss computation run under FP16
+    ``autocast`` and gradients are un-scaled/stepped through a
+    ``torch.cuda.amp.GradScaler`` (non-finite gradients skip the step); on
+    MPS/CPU the scaler is disabled and the step is a plain clip-then-step.
     """
+    if scaler is None:
+        scaler = torch.cuda.amp.GradScaler(enabled=False)
     optimizer.zero_grad()
     loss_acc = kd_acc = ce_acc = 0.0
     n = 0
     for batch in batches:
-        t_logits = distill_mod.teacher_logits(teacher, batch)
-        s_logits = student(batch)
-        _, kd, ce = distill_mod.distillation_loss(
-            s_logits, t_logits, batch, alpha, temperature, vocab
-        )
-        # distillation_loss returns kd = KL_batchmean * T^2, so the scaled KD
-        # term (alpha * T^2 / vocab) * KL_batchmean == (alpha / vocab) * kd.
-        kd = (alpha / vocab) * kd
-        loss = kd + (1.0 - alpha) * ce
-        (loss / grad_accum).backward()
+        with _amp_autocast(batch.device):
+            t_logits = distill_mod.teacher_logits(teacher, batch)
+            s_logits = student(batch)
+            _, kd, ce = distill_mod.distillation_loss(
+                s_logits, t_logits, batch, alpha, temperature, vocab
+            )
+            # distillation_loss returns kd = KL_batchmean * T^2, so the scaled KD
+            # term (alpha * T^2 / vocab) * KL_batchmean == (alpha / vocab) * kd.
+            kd = (alpha / vocab) * kd
+            loss = kd + (1.0 - alpha) * ce
+        scaler.scale(loss / grad_accum).backward()
         loss_acc += float(loss.item())
         kd_acc += float(kd.item())
         ce_acc += float(ce.item())
         n += 1
-    torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
-    optimizer.step()
+    _amp_step(scaler, optimizer, student.parameters(), max_norm=1.0)
     if n == 0:
         raise RuntimeError("accum_step requires at least one micro-batch")
     return loss_acc / n, kd_acc / n, ce_acc / n
@@ -314,9 +378,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--grad-accum-steps must be >= 1")
     if args.seq_len < 2:
         raise SystemExit("--seq-len must be >= 2 (distillation needs labels)")
-    device = torch.device(
-        args.device or ("mps" if is_mps_available() else "cpu")
-    )
+    device = _resolve_device(args.device)
     torch.manual_seed(args.seed)
 
     tok = train_qat.load_tokenizer(args.tokenizer, args.vocab_size)
@@ -367,6 +429,10 @@ def main(argv: list[str] | None = None) -> int:
         clip_grad_norm=args.clip_grad_norm,
     )
     scheduler = LinearWarmupScheduler(opt, args.warmup_steps)
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    if args.compile:
+        student = torch.compile(student)
+        print("[student] torch.compile enabled")
     print(f"[student] d_model={cfg.d_model} n_heads={cfg.n_heads} "
           f"n_layers={cfg.n_layers} fff_depth={cfg.fff_depth} "
           f"vocab={cfg.vocab_size} tie_weights={tie} alpha={args.alpha} "
@@ -374,6 +440,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.warmup_steps > 0:
         print(f"[sched] linear warmup 0 -> {args.lr:g} over "
               f"{args.warmup_steps} steps")
+    if device.type == "cuda":
+        print("[amp] cuda fp16 autocast + GradScaler")
 
     tasks = _select_tasks(args)
     weights = {t.name: t.weight for t in tasks}
@@ -439,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
             loss, kd, ce = accum_step(
                 student, opt, teacher, micro, args.alpha,
                 args.temperature, cfg.vocab_size, args.grad_accum_steps,
+                scaler,
             )
             scheduler.step()
             ema = loss if ema is None else 0.9 * ema + 0.1 * loss

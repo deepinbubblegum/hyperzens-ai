@@ -410,6 +410,50 @@ def test_main_o200k_base_sets_vocab_and_runs(monkeypatch, capsys):
     assert captured["vocab"] == 200019
 
 
+# --- device selection / compile ----------------------------------------------
+
+
+def test_resolve_device_priority_cuda_mps_cpu(monkeypatch):
+    mod = _load_chat_module()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(mod, "is_mps_available", lambda: True)
+    assert mod._resolve_device(None) == torch.device("cuda")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert mod._resolve_device(None) == torch.device("mps")
+    monkeypatch.setattr(mod, "is_mps_available", lambda: False)
+    assert mod._resolve_device(None) == torch.device("cpu")
+
+
+def test_resolve_device_explicit_choice():
+    mod = _load_chat_module()
+    assert mod._resolve_device("cpu") == torch.device("cpu")
+    assert mod._resolve_device("cuda") == torch.device("cuda")
+
+
+def test_compile_flag_default_off_and_accepted():
+    mod = _load_chat_module()
+    assert mod.parse_args([]).compile is False
+    assert mod.parse_args(["--compile"]).compile is True
+
+
+def test_main_compile_wraps_model(monkeypatch, capsys):
+    mod = _load_chat_module()
+    compiled = {}
+    monkeypatch.setattr(
+        torch, "compile", lambda model, **kwargs: compiled.setdefault("model", model)
+    )
+    monkeypatch.setattr("builtins.input", lambda _: "/quit")
+    rc = mod.main([
+        "--device", "cpu", "--tokenizer", "bytes", "--compile",
+        "--d-model", "16", "--n-heads", "2", "--n-layers", "1", "--fff-depth", "1",
+        "--max-seq-len", "64", "--max-new-tokens", "8",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert compiled["model"] is not None
+    assert "torch.compile enabled" in out
+
+
 # --- CLI smoke test ----------------------------------------------------------
 
 

@@ -10,6 +10,7 @@ blending, task/weight selection, and an end-to-end run with a mocked HF
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import re
@@ -155,6 +156,113 @@ def test_linear_warmup_state_dict_roundtrip():
     assert opt2.lr == pytest.approx(1e-3 * 6 / 10)
     sched2.step()
     assert opt2.lr == pytest.approx(1e-3 * 7 / 10)
+
+
+# --- device selection / AMP / compile ----------------------------------------
+
+
+def test_resolve_device_priority_cuda_mps_cpu(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(mod, "is_mps_available", lambda: True)
+    assert mod._resolve_device(None) == torch.device("cuda")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert mod._resolve_device(None) == torch.device("mps")
+    monkeypatch.setattr(mod, "is_mps_available", lambda: False)
+    assert mod._resolve_device(None) == torch.device("cpu")
+
+
+def test_resolve_device_explicit_choice():
+    assert mod._resolve_device("cpu") == torch.device("cpu")
+    assert mod._resolve_device("mps") == torch.device("mps")
+    assert mod._resolve_device("cuda") == torch.device("cuda")
+
+
+def test_device_arg_accepts_cuda():
+    assert mod.parse_args(["--device", "cuda"]).device == "cuda"
+
+
+def test_compile_flag_default_off_and_accepted():
+    assert mod.parse_args([]).compile is False
+    assert mod.parse_args(["--compile"]).compile is True
+
+
+def test_amp_autocast_is_noop_off_cuda():
+    assert isinstance(mod._amp_autocast(torch.device("cpu")), contextlib.nullcontext)
+    assert isinstance(mod._amp_autocast(torch.device("mps")), contextlib.nullcontext)
+    with pytest.warns(UserWarning, match="CUDA is not available"):
+        assert not isinstance(
+            mod._amp_autocast(torch.device("cuda")), contextlib.nullcontext
+        )
+
+
+class _FakeEnabledScaler:
+    def __init__(self):
+        self.updated = None
+
+    def is_enabled(self):
+        return True
+
+    def get_scale(self):
+        return 4.0
+
+    def update(self, new_scale=None):
+        self.updated = new_scale
+
+
+def test_amp_step_unscales_clips_steps_and_updates(monkeypatch):
+    student = _student()
+    opt = torch.optim.AdamW(student.parameters(), lr=1e-3)
+    scaler = _FakeEnabledScaler()
+    called = []
+    orig_step = opt.step
+
+    def step():
+        called.append(1)
+        orig_step()
+
+    opt.step = step
+    monkeypatch.setattr(
+        "torch.nn.utils.clip_grad_norm_",
+        lambda params, max_norm: torch.tensor(1.0),
+    )
+    p = next(iter(student.parameters()))
+    p.grad = torch.full_like(p, 2.0)
+    mod._amp_step(scaler, opt, student.parameters(), max_norm=1.0)
+    assert called == [1]
+    assert p.grad == pytest.approx(0.5)  # unscaled by the scale factor
+    assert scaler.updated is None
+
+
+def test_amp_step_skips_step_on_inf_grads():
+    student = _student()
+    opt = torch.optim.AdamW(student.parameters(), lr=1e-3)
+    scaler = _FakeEnabledScaler()
+    called = []
+    orig_step = opt.step
+
+    def step():
+        called.append(1)
+        orig_step()
+
+    opt.step = step
+    p = next(iter(student.parameters()))
+    p.grad = torch.full_like(p, float("inf"))
+    mod._amp_step(scaler, opt, student.parameters(), max_norm=1.0)
+    assert called == []
+    assert scaler.updated == 2.0  # scale halved on non-finite grads
+
+
+def test_main_compile_wraps_student(monkeypatch, tmp_path, capsys):
+    compiled = {}
+    monkeypatch.setattr(
+        torch, "compile", lambda model, **kwargs: compiled.setdefault("model", model)
+    )
+    _fake_load_dataset(monkeypatch, _recipe_fake_rows())
+    rc = mod.main(_e2e_args(tmp_path, steps=2) + ["--compile"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert compiled["model"] is not None
+    assert "torch.compile enabled" in out
 
 
 # --- distillation loss wiring ------------------------------------------------

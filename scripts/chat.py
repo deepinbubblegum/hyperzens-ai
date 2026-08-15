@@ -25,6 +25,7 @@ Commands inside the chat: ``/help``, ``/reset``, ``/quit`` (or ``/exit``).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import os
 import sys
@@ -43,6 +44,29 @@ _HELP = """Commands:
   /reset           clear the dialogue history
   /quit, /exit     leave the chat
 Enter text to talk to the model."""
+
+
+def _resolve_device(device: str | None) -> torch.device:
+    """Pick the compute device: explicit flag, else CUDA -> MPS -> CPU."""
+    if device:
+        return torch.device(device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if is_mps_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _amp_autocast(device: torch.device) -> object:
+    """FP16 autocast context for CUDA; a no-op on MPS/CPU.
+
+    Uses ``torch.cuda.amp.autocast(dtype=torch.float16)`` so generated forward
+    passes run in mixed precision on CUDA, while MPS/CPU keep the existing
+    FP32 path.
+    """
+    if getattr(device, "type", None) == "cuda":
+        return torch.cuda.amp.autocast(dtype=torch.float16)
+    return contextlib.nullcontext()
 
 
 def build_model(
@@ -198,7 +222,7 @@ def run_turn(
     t0 = time.perf_counter()
     decode_token = getattr(tokenizer, "decode_step", None)
     model.eval()
-    with torch.no_grad():
+    with torch.no_grad(), _amp_autocast(device):
         for piece in model.stream_generate(
             prompt,
             max_new_tokens=max_new_tokens,
@@ -328,8 +352,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g.add_argument("--checkpoint", default=None, help="state-dict path to load")
 
     d = p.add_argument_group("device / rng")
-    d.add_argument("--device", choices=("cpu", "mps"), default=None)
+    d.add_argument("--device", choices=("cuda", "cpu", "mps"), default=None)
     d.add_argument("--seed", type=int, default=0)
+    d.add_argument("--compile", action="store_true",
+                   help="wrap the model with torch.compile before chatting")
 
     t = p.add_argument_group("tokenizer")
     t.add_argument("--tokenizer", default=None,
@@ -371,9 +397,7 @@ def _cfg_from_args(args: argparse.Namespace, tok) -> BitNetFFTConfig:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    device = torch.device(
-        args.device or ("mps" if is_mps_available() else "cpu")
-    )
+    device = _resolve_device(args.device)
     torch.manual_seed(args.seed)
 
     tok = load_tokenizer(args.tokenizer, args.vocab_size)
@@ -418,6 +442,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     model = build_model(cfg, device, args.checkpoint, state=ckpt_state)
+    if args.compile:
+        model = torch.compile(model)
+        print("[model] torch.compile enabled")
     print(f"[model] params={sum(p.numel() for p in model.parameters()):,}")
 
     if args.eos_token_id is None:
