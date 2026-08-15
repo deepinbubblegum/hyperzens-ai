@@ -497,3 +497,13 @@ def test_cli_rejects_max_new_tokens_ge_seq_len():
     )
     assert proc.returncode != 0
     assert "exceeds max_seq_len" in proc.stderr
+
+
+def test_amp_autocast_devices():
+    mod = _load_chat_module()
+    import contextlib
+    assert isinstance(mod._amp_autocast(torch.device("cpu")), contextlib.nullcontext)
+    assert not isinstance(mod._amp_autocast(torch.device("mps")), contextlib.nullcontext)
+    with pytest.warns(UserWarning, match="CUDA is not available"):
+        assert not isinstance(mod._amp_autocast(torch.device("cuda")), contextlib.nullcontext)
+

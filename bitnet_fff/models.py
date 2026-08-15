@@ -198,11 +198,20 @@ class KVCache:
                 f"head_dim {key.shape[-1]} does not match cache "
                 f"{self.key_cache.shape[-1]}"
             )
-        if key.dtype != self.dtype or value.dtype != self.dtype:
-            raise ValueError(
-                f"cache dtype {self.dtype} vs incoming "
-                f"key/value {key.dtype}/{value.dtype}"
-            )
+        # Dynamically adopt key/value dtype and device if cache is empty
+        if self.size == 0 and (key.dtype != self.dtype or key.device != self.device):
+            self.key_cache = self.key_cache.to(dtype=key.dtype, device=key.device)
+            self.value_cache = self.value_cache.to(dtype=value.dtype, device=value.device)
+        else:
+            if key.dtype != self.dtype:
+                key = key.to(dtype=self.dtype)
+            if value.dtype != self.dtype:
+                value = value.to(dtype=self.dtype)
+            if key.device != self.device:
+                key = key.to(device=self.device)
+            if value.device != self.device:
+                value = value.to(device=self.device)
+
         start, end = past_length, past_length + key.shape[-2]
         if self.key_cache.shape[-2] < end:
             self._grow(end)

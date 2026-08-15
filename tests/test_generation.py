@@ -479,3 +479,51 @@ def test_cli_generates_and_reports_decode_benchmark():
     assert "latency" in proc.stdout and "ms/token" in proc.stdout
     assert "speed" in proc.stdout and "tokens/sec" in proc.stdout
     assert "generated 6/6 tokens" in proc.stdout
+
+
+def test_kv_cache_dtype_mismatch_auto_adoption():
+    cache = KVCache.preallocate(batch_size=2, n_heads=2, seq_len=16, head_dim=8, dtype=torch.float32)
+    assert cache.dtype == torch.float32
+    assert cache.size == 0
+
+    # Append FP16 keys/values to empty float32 cache -> cache dynamically adopts float16
+    k_fp16 = torch.randn(2, 2, 4, 8, dtype=torch.float16)
+    v_fp16 = torch.randn(2, 2, 4, 8, dtype=torch.float16)
+    cache.append(k_fp16, v_fp16, past_length=0)
+
+    assert cache.dtype == torch.float16
+    assert cache.size == 4
+    assert torch.allclose(cache.key_cache[:, :, :4], k_fp16)
+    assert torch.allclose(cache.value_cache[:, :, :4], v_fp16)
+
+    # Append float32 keys/values to float16 cache -> auto cast to float16
+    k_fp32 = torch.randn(2, 2, 2, 8, dtype=torch.float32)
+    v_fp32 = torch.randn(2, 2, 2, 8, dtype=torch.float32)
+    cache.append(k_fp32, v_fp32, past_length=4)
+
+    assert cache.dtype == torch.float16
+    assert cache.size == 6
+    assert torch.allclose(cache.key_cache[:, :, 4:6], k_fp32.to(torch.float16))
+    assert torch.allclose(cache.value_cache[:, :, 4:6], v_fp32.to(torch.float16))
+
+
+def test_generate_and_stream_with_fp16_autocast():
+    torch.manual_seed(0)
+    m = _model(vocab_size=64, d_model=32, n_heads=2, n_layers=2)
+    prompt = torch.randint(0, 64, (1, 4))
+
+    # Test generate() with autocast
+    dev = "mps" if torch.backends.mps.is_available() else "cpu"
+    if dev == "mps":
+        m = m.to("mps")
+        prompt = prompt.to("mps")
+        with torch.amp.autocast(device_type="mps", dtype=torch.float16):
+            out = m.generate(prompt, max_new_tokens=4, temperature=0.0)
+            assert out.shape == (1, 8)
+            tokens = list(m.stream_generate(prompt, max_new_tokens=4, temperature=0.0))
+            assert len(tokens) == 4
+    else:
+        out = m.generate(prompt, max_new_tokens=4, temperature=0.0)
+        assert out.shape == (1, 8)
+        tokens = list(m.stream_generate(prompt, max_new_tokens=4, temperature=0.0))
+        assert len(tokens) == 4

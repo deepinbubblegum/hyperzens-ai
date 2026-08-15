@@ -58,14 +58,15 @@ def _resolve_device(device: str | None) -> torch.device:
 
 
 def _amp_autocast(device: torch.device) -> object:
-    """FP16 autocast context for CUDA; a no-op on MPS/CPU.
+    """FP16 autocast context for CUDA / MPS; a no-op on CPU.
 
-    Uses ``torch.cuda.amp.autocast(dtype=torch.float16)`` so generated forward
-    passes run in mixed precision on CUDA, while MPS/CPU keep the existing
+    Uses ``torch.amp.autocast(device_type=device.type, dtype=torch.float16)`` so generated forward
+    passes run in mixed precision on CUDA and Apple Silicon (MPS), while CPU keeps the existing
     FP32 path.
     """
-    if getattr(device, "type", None) == "cuda":
-        return torch.cuda.amp.autocast(dtype=torch.float16)
+    dev_type = getattr(device, "type", None)
+    if dev_type in ("cuda", "mps"):
+        return torch.amp.autocast(device_type=dev_type, dtype=torch.float16)
     return contextlib.nullcontext()
 
 
