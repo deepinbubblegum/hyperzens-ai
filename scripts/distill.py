@@ -129,8 +129,8 @@ def distillation_loss(
     vocab: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(loss, kd, ce)`` with temperature-scaled KL distillation."""
-    s = student_logits.float()[:, :-1]
-    t = teacher_logits_.float()[:, :-1]
+    s = student_logits[:, :-1].float()
+    t = teacher_logits_[:, :-1].float()
     labels = labels[:, 1:]
     ce = F.cross_entropy(s.reshape(-1, vocab), labels.reshape(-1))
     T = temperature

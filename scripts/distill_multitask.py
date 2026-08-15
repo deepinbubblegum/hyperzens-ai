@@ -170,12 +170,12 @@ def _resolve_device(device: str | None) -> torch.device:
 def _amp_autocast(device: torch.device) -> object:
     """FP16 autocast context for CUDA; a no-op on MPS/CPU.
 
-    Uses ``torch.cuda.amp.autocast(dtype=torch.float16)`` so the forward pass
+    Uses ``torch.amp.autocast('cuda', dtype=torch.float16)`` so the forward pass
     and loss computation run in mixed precision on CUDA, while MPS/CPU keep
     their existing FP32/FP16-master path untouched.
     """
     if getattr(device, "type", None) == "cuda":
-        return torch.cuda.amp.autocast(dtype=torch.float16)
+        return torch.amp.autocast("cuda", dtype=torch.float16)
     return contextlib.nullcontext()
 
 
@@ -235,11 +235,11 @@ def accum_step(
 
     **AMP** — on CUDA the forward pass and loss computation run under FP16
     ``autocast`` and gradients are un-scaled/stepped through a
-    ``torch.cuda.amp.GradScaler`` (non-finite gradients skip the step); on
+    ``torch.amp.GradScaler('cuda')`` (non-finite gradients skip the step); on
     MPS/CPU the scaler is disabled and the step is a plain clip-then-step.
     """
     if scaler is None:
-        scaler = torch.cuda.amp.GradScaler(enabled=False)
+        scaler = torch.amp.GradScaler("cuda", enabled=False)
     optimizer.zero_grad()
     loss_acc = kd_acc = ce_acc = 0.0
     n = 0
@@ -429,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
         clip_grad_norm=args.clip_grad_norm,
     )
     scheduler = LinearWarmupScheduler(opt, args.warmup_steps)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     if args.compile:
         student = torch.compile(student)
         print("[student] torch.compile enabled")
