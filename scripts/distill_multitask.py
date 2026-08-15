@@ -52,6 +52,8 @@ from bitnet_fff.mps_utils import (
     mps_empty_cache,
 )
 
+from tqdm import tqdm
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -351,66 +353,86 @@ def main(argv: list[str] | None = None) -> int:
     best_path = train_qat.best_checkpoint_path(args.checkpoint)
     ema: float | None = None
     loss = kd = ce = 0.0
-    while step < args.steps:
-        micro = [next(stream).to(device) for _ in range(args.grad_accum_steps)]
-        loss, kd, ce = accum_step(
-            student, opt, teacher, micro, args.alpha,
-            args.temperature, cfg.vocab_size, args.grad_accum_steps,
-        )
-        ema = loss if ema is None else 0.9 * ema + 0.1 * loss
-        step += 1
-
-        if args.val_every > 0 and step % args.val_every == 0:
-            vmetrics, blended = validate_tasks(
-                student, val_streamers, device, args.val_batches, weights
+    bar = tqdm(
+        total=args.steps,
+        initial=step,
+        desc="[distill-mt]",
+        unit="it",
+        dynamic_ncols=True,
+        disable=None,
+    )
+    try:
+        while step < args.steps:
+            micro = [next(stream).to(device) for _ in range(args.grad_accum_steps)]
+            loss, kd, ce = accum_step(
+                student, opt, teacher, micro, args.alpha,
+                args.temperature, cfg.vocab_size, args.grad_accum_steps,
             )
-            line = " ".join(
-                f"{k}={v:.4f}" for k, v in sorted(vmetrics.items())
-                if v is not None
-            )
-            print(f"[val] step {step} | {line} | blended={blended:.4f}")
-            if blended < best_loss:
-                best_loss = blended
-                if best_path:
-                    train_qat.save_checkpoint(
-                        best_path, cfg, student.module.state_dict(),
-                        opt.state_dict(), step, loss,
-                        extra={
-                            "teacher": teacher_meta,
-                            "recipe": weights,
-                            "alpha": args.alpha,
-                            "temperature": args.temperature,
-                            "grad_accum_steps": args.grad_accum_steps,
-                            "best_loss": best_loss,
-                            "kind": "best",
-                        },
-                    )
-                    print(f"[distill-mt] best checkpoint -> {best_path} "
-                          f"(best_loss={best_loss:.4f})")
+            ema = loss if ema is None else 0.9 * ema + 0.1 * loss
+            step += 1
 
-        if step % args.log_every == 0 or step >= args.steps:
             mem = mps_driver_allocated_bytes()
-            mem_str = f" mem={mem / 1e6:.0f}MB" if mem else ""
-            print(f"[distill-mt] step {step}/{args.steps} loss={loss:.4f} "
-                  f"kd={kd:.4f} ce={ce:.4f} ema={ema:.4f}{mem_str}")
-
-        if step % args.empty_cache_every == 0:
-            mps_empty_cache()
-
-        if args.checkpoint and step % args.save_every == 0:
-            train_qat.save_checkpoint(
-                args.checkpoint, cfg, student.module.state_dict(),
-                opt.state_dict(), step, loss,
-                extra={
-                    "teacher": teacher_meta,
-                    "recipe": weights,
-                    "alpha": args.alpha,
-                    "temperature": args.temperature,
-                    "grad_accum_steps": args.grad_accum_steps,
-                    "best_loss": best_loss,
-                },
+            mem_mb = f"{mem / 1e6:.0f}MB" if mem else ""
+            mem_str = f" mem={mem_mb}" if mem_mb else ""
+            bar.set_postfix(
+                loss=f"{loss:.4f}",
+                ema=f"{ema:.4f}",
+                mem=mem_mb or "-",
+                refresh=False,
             )
-            print(f"[distill-mt] checkpoint -> {args.checkpoint}")
+            bar.update(1)
+
+            if args.val_every > 0 and step % args.val_every == 0:
+                vmetrics, blended = validate_tasks(
+                    student, val_streamers, device, args.val_batches, weights
+                )
+                line = " ".join(
+                    f"{k}={v:.4f}" for k, v in sorted(vmetrics.items())
+                    if v is not None
+                )
+                print(f"[val] step {step} | {line} | blended={blended:.4f}")
+                if blended < best_loss:
+                    best_loss = blended
+                    if best_path:
+                        train_qat.save_checkpoint(
+                            best_path, cfg, student.module.state_dict(),
+                            opt.state_dict(), step, loss,
+                            extra={
+                                "teacher": teacher_meta,
+                                "recipe": weights,
+                                "alpha": args.alpha,
+                                "temperature": args.temperature,
+                                "grad_accum_steps": args.grad_accum_steps,
+                                "best_loss": best_loss,
+                                "kind": "best",
+                            },
+                        )
+                        print(f"[distill-mt] best checkpoint -> {best_path} "
+                              f"(best_loss={best_loss:.4f})")
+
+            if step % args.log_every == 0 or step >= args.steps:
+                print(f"[distill-mt] step {step}/{args.steps} loss={loss:.4f} "
+                      f"kd={kd:.4f} ce={ce:.4f} ema={ema:.4f}{mem_str}")
+
+            if step % args.empty_cache_every == 0:
+                mps_empty_cache()
+
+            if args.checkpoint and step % args.save_every == 0:
+                train_qat.save_checkpoint(
+                    args.checkpoint, cfg, student.module.state_dict(),
+                    opt.state_dict(), step, loss,
+                    extra={
+                        "teacher": teacher_meta,
+                        "recipe": weights,
+                        "alpha": args.alpha,
+                        "temperature": args.temperature,
+                        "grad_accum_steps": args.grad_accum_steps,
+                        "best_loss": best_loss,
+                    },
+                )
+                print(f"[distill-mt] checkpoint -> {args.checkpoint}")
+    finally:
+        bar.close()
 
     if args.checkpoint:
         train_qat.save_checkpoint(
