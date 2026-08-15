@@ -168,27 +168,26 @@ def _resolve_device(device: str | None) -> torch.device:
 
 
 def _amp_autocast(device: torch.device) -> object:
-    """FP16 autocast context for CUDA; a no-op on MPS/CPU.
+    """BF16 autocast context for CUDA; a no-op on MPS/CPU.
 
-    Uses ``torch.amp.autocast('cuda', dtype=torch.float16)`` so the forward pass
-    and loss computation run in mixed precision on CUDA, while MPS/CPU keep
-    their existing FP32/FP16-master path untouched.
+    Uses ``torch.amp.autocast('cuda', dtype=torch.bfloat16)`` so the forward pass
+    and loss computation run in native bfloat16 on CUDA (Ampere Tensor Cores),
+    while MPS/CPU keep their existing FP32/FP16-master path untouched.
     """
     if getattr(device, "type", None) == "cuda":
-        return torch.amp.autocast("cuda", dtype=torch.float16)
+        return torch.amp.autocast("cuda", dtype=torch.bfloat16)
     return contextlib.nullcontext()
 
 
 def _amp_step(scaler, optimizer, model, max_norm: float = 1.0) -> None:
-    """Unscale -> clip -> step with GradScaler semantics.
+    """Unscale -> clip -> step with GradScaler semantics (or direct step for BF16/CPU/MPS).
 
-    1. Call scaler.unscale_(optimizer) if enabled.
-    2. Perform torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm).
-    3. Call scaler.step(optimizer).
-    4. Call scaler.update().
+    For BF16 on CUDA, or CPU/MPS, GradScaler is disabled because BF16 shares the
+    same 8-bit dynamic range as FP32 (no scaling needed). Gradients are clipped
+    and the optimizer steps directly.
     """
     params = list(model.parameters()) if hasattr(model, "parameters") else list(model)
-    if not scaler.is_enabled():
+    if scaler is None or not scaler.is_enabled():
         torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
         optimizer.step()
         return
@@ -243,13 +242,10 @@ def accum_step(
     KD term lands on the same order of magnitude as the CE and the total loss
     stays in a normal ~1-20 range instead of being dominated by the KL.
 
-    **AMP** — on CUDA the forward pass and loss computation run under FP16
-    ``autocast`` and gradients are un-scaled/stepped through a
-    ``torch.amp.GradScaler('cuda')`` (non-finite gradients skip the step); on
-    MPS/CPU the scaler is disabled and the step is a plain clip-then-step.
+    **AMP** — on CUDA the forward pass and loss computation run under BF16
+    ``autocast`` (GradScaler disabled as BF16 matches FP32 dynamic range); on
+    MPS/CPU the step is a plain clip-then-step.
     """
-    if scaler is None:
-        scaler = torch.amp.GradScaler("cuda", enabled=False)
     if not batches:
         raise RuntimeError("accum_step requires at least one micro-batch")
 
@@ -267,7 +263,11 @@ def accum_step(
             # term (alpha * T^2 / vocab) * KL_batchmean == (alpha / vocab) * kd.
             kd = (alpha / vocab) * kd
             loss = kd + (1.0 - alpha) * ce
-        scaler.scale(loss / grad_accum).backward()
+        scaled_loss = loss / grad_accum
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
         loss_acc += float(loss.item())
         kd_acc += float(kd.item())
         ce_acc += float(ce.item())
@@ -443,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
         clip_grad_norm=args.clip_grad_norm,
     )
     scheduler = LinearWarmupScheduler(opt, args.warmup_steps)
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
     if args.compile:
         student = torch.compile(student)
         print("[student] torch.compile enabled")
@@ -455,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[sched] linear warmup 0 -> {args.lr:g} over "
               f"{args.warmup_steps} steps")
     if device.type == "cuda":
-        print("[amp] cuda fp16 autocast + GradScaler")
+        print("[amp] cuda bf16 autocast (GradScaler disabled for BF16)")
 
     tasks = _select_tasks(args)
     weights = {t.name: t.weight for t in tasks}
