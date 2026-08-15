@@ -209,7 +209,44 @@ def test_main_loads_architecture_from_checkpoint(monkeypatch, tmp_path, capsys):
     assert "max_seq_len=32" in out
 
 
-def test_main_checkpoint_config_overrides_cli_flags(monkeypatch, tmp_path, capsys):
+def test_main_cli_flags_override_checkpoint_metadata(monkeypatch, tmp_path, capsys):
+    mod = _load_chat_module()
+    tok = _byte_tok()
+    # Embedded config metadata claims a different architecture than the actual
+    # checkpoint weights, so only a CLI override makes the model loadable.
+    meta_cfg = BitNetFFTConfig(
+        vocab_size=256, d_model=16, n_heads=2, n_layers=1, fff_depth=3,
+        max_seq_len=32,
+    ).bind_tokenizer(tok)
+    real_cfg = BitNetFFTConfig(
+        vocab_size=256, d_model=32, n_heads=2, n_layers=3, fff_depth=2,
+        max_seq_len=64,
+    ).bind_tokenizer(tok)
+    path = tmp_path / "meta.pt"
+    torch.save(
+        {"config": dataclasses.asdict(meta_cfg),
+         "model": BitNetFFTTransformer(real_cfg).state_dict()},
+        path,
+    )
+    monkeypatch.setattr("builtins.input", lambda _: "/quit")
+    rc = mod.main([
+        "--device", "cpu", "--tokenizer", "bytes", "--vocab-size", "256",
+        "--max-new-tokens", "8", "--checkpoint", str(path),
+        "--d-model", "32", "--n-heads", "2", "--n-layers", "3", "--fff-depth", "2",
+        "--max-seq-len", "64",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "architecture loaded from checkpoint" in out
+    assert "CLI overrides applied" in out
+    assert "d-model" in out and "n-layers" in out and "max-seq-len" in out
+    assert "d_model=32" in out and "n_layers=3" in out and "fff_depth=2" in out
+    assert "max_seq_len=64" in out
+
+
+def test_main_checkpoint_defaults_keep_checkpoint_arch(monkeypatch, tmp_path, capsys):
+    # No explicit arch flags on the command line -> checkpoint metadata wins,
+    # even though the CLI defaults differ from it.
     mod = _load_chat_module()
     cfg = BitNetFFTConfig(
         vocab_size=256, d_model=16, n_heads=2, n_layers=1, fff_depth=1,
@@ -220,12 +257,13 @@ def test_main_checkpoint_config_overrides_cli_flags(monkeypatch, tmp_path, capsy
     rc = mod.main([
         "--device", "cpu", "--tokenizer", "bytes", "--vocab-size", "256",
         "--max-new-tokens", "8", "--checkpoint", path,
-        "--d-model", "128", "--n-layers", "4", "--fff-depth", "3",
     ])
     out = capsys.readouterr().out
     assert rc == 0
+    assert "architecture loaded from checkpoint" in out
+    assert "CLI overrides applied" not in out
     assert "d_model=16" in out and "n_layers=1" in out and "fff_depth=1" in out
-    assert "[cfg] architecture loaded from checkpoint" in out
+    assert "max_seq_len=32" in out
 
 
 def test_main_plain_state_dict_uses_cli_arch(monkeypatch, tmp_path, capsys):
@@ -256,6 +294,27 @@ def test_main_rejects_max_new_tokens_vs_checkpoint_seq_len(tmp_path):
             "--device", "cpu", "--tokenizer", "bytes", "--vocab-size", "256",
             "--max-new-tokens", "32", "--checkpoint", path,
         ])
+
+
+def test_cli_arch_overrides_detects_user_flags():
+    mod = _load_chat_module()
+    defaults = mod.parse_args([])
+    args = mod.parse_args(["--d-model", "64", "--max-seq-len", "256", "--tie-weights"])
+    kwargs, names = mod._cli_arch_overrides(args, defaults)
+    assert kwargs["d_model"] == 64
+    assert kwargs["max_seq_len"] == 256
+    assert kwargs["tie_weights"] is True
+    assert names == ["d-model", "max-seq-len", "tie-weights"]
+    kwargs2, names2 = mod._cli_arch_overrides(mod.parse_args([]), defaults)
+    assert kwargs2 == {} and names2 == []
+
+
+def test_cli_arch_overrides_maps_no_fff_bias():
+    mod = _load_chat_module()
+    defaults = mod.parse_args([])
+    kwargs, names = mod._cli_arch_overrides(mod.parse_args(["--no-fff-bias"]), defaults)
+    assert kwargs["fff_bias"] is False
+    assert names == ["no-fff-bias"]
 
 
 # --- CLI smoke test ----------------------------------------------------------
@@ -300,4 +359,4 @@ def test_cli_rejects_max_new_tokens_ge_seq_len():
         input="hi\n", cwd=REPO, capture_output=True, text=True, timeout=120,
     )
     assert proc.returncode != 0
-    assert "must be <" in proc.stderr
+    assert "exceeds max_seq_len" in proc.stderr

@@ -25,6 +25,7 @@ Commands inside the chat: ``/help``, ``/reset``, ``/quit`` (or ``/exit``).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 import sys
 import time
@@ -78,6 +79,42 @@ def _checkpoint_config(state: dict) -> BitNetFFTConfig | None:
     if not known:
         return None
     return BitNetFFTConfig(**known)
+
+
+def _cli_arch_overrides(
+    args: argparse.Namespace,
+    defaults: argparse.Namespace,
+) -> tuple[dict, list[str]]:
+    """Architecture flags the user explicitly supplied (vs parser defaults).
+
+    Every architecture-related argparse value is compared against its parser
+    default, so a flag that appears on the command line overrides the
+    checkpoint metadata while the plain defaults keep the checkpoint's values.
+    Returns ``(cfg_kwargs, names)`` ready for ``dataclasses.replace(cfg, **cfg_kwargs)``.
+    """
+    mapping = [
+        ("d_model", "d_model"),
+        ("n_heads", "n_heads"),
+        ("n_layers", "n_layers"),
+        ("fff_depth", "fff_depth"),
+        ("vocab_size", "vocab_size"),
+        ("max_seq_len", "max_seq_len"),
+        ("activation_bits", "activation_bits"),
+        ("attention_activation_bits", "attention_activation_bits"),
+        ("router_rank", "router_rank"),
+        ("tie_weights", "tie_weights"),
+        ("no_fff_bias", "fff_bias"),
+    ]
+    kwargs: dict = {}
+    names: list[str] = []
+    for arg_name, cfg_name in mapping:
+        if getattr(args, arg_name) != getattr(defaults, arg_name):
+            value = getattr(args, arg_name)
+            if arg_name == "no_fff_bias":
+                value = not value
+            kwargs[cfg_name] = value
+            names.append(arg_name.replace("_", "-"))
+    return kwargs, names
 
 
 def build_history_prompt(
@@ -212,6 +249,12 @@ def chat_loop(
         prompt_ids = build_history_prompt(
             messages, tokenizer, history_budget, model.cfg.vocab_size
         )
+        if len(prompt_ids) + args.max_new_tokens > model.cfg.max_seq_len:
+            raise SystemExit(
+                f"prompt_tokens ({len(prompt_ids)}) + max_new_tokens "
+                f"({args.max_new_tokens}) exceeds max_seq_len "
+                f"({model.cfg.max_seq_len})"
+            )
         sys.stdout.write("Assistant > ")
         sys.stdout.flush()
         text, stats = run_turn(
@@ -313,6 +356,9 @@ def main(argv: list[str] | None = None) -> int:
         cfg = _checkpoint_config(ckpt_state)
         if cfg is not None:
             saved_vocab = cfg.vocab_size
+            overrides, names = _cli_arch_overrides(args, parse_args([]))
+            if overrides:
+                cfg = dataclasses.replace(cfg, **overrides)
             cfg.use_fast_inference = not args.no_fast_inference
             cfg = cfg.bind_tokenizer(tok)
             print(f"[cfg] architecture loaded from checkpoint "
@@ -320,6 +366,8 @@ def main(argv: list[str] | None = None) -> int:
                   f"n_layers={cfg.n_layers} fff_depth={cfg.fff_depth} "
                   f"max_seq_len={cfg.max_seq_len} vocab={cfg.vocab_size} "
                   f"tie_weights={cfg.tie_weights})")
+            if names:
+                print(f"[cfg] CLI overrides applied: {', '.join(names)}")
             if saved_vocab != tok.vocab_size:
                 print(f"[cfg] WARNING: checkpoint vocab_size={saved_vocab} "
                       f"!= tokenizer vocab_size={tok.vocab_size}")
@@ -328,8 +376,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.max_new_tokens >= cfg.max_seq_len:
         raise SystemExit(
-            f"--max-new-tokens ({args.max_new_tokens}) must be < "
-            f"max-seq-len ({cfg.max_seq_len})"
+            f"prompt_tokens (>= 1) + max_new_tokens ({args.max_new_tokens}) "
+            f"exceeds max_seq_len ({cfg.max_seq_len})"
         )
 
     model = build_model(cfg, device, args.checkpoint, state=ckpt_state)
