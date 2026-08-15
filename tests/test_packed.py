@@ -1,0 +1,229 @@
+"""Tests for the packed-ternary fast-inference path (native CPU + Metal kernels)."""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+
+from bitnet_fff import FastFeedForwardBitNet
+from bitnet_fff.bitlinear import absmax_quantize, absmean_ternarize
+from bitnet_fff.fast_inference import (
+    PackedFFFEvaluator,
+    PackedTernaryMM,
+    extension_available,
+    pack_ternary_weights,
+    ternary_mm,
+    unpack_ternary_weights,
+)
+
+requires_ext = pytest.mark.skipif(
+    not extension_available(),
+    reason="packed-ternary native extension not built",
+)
+
+
+def _packed(w: torch.Tensor) -> torch.Tensor:
+    packed, _ = pack_ternary_weights(w)
+    return packed
+
+
+def _fp_ref(x: torch.Tensor, w: torch.Tensor, leaf: torch.Tensor) -> torch.Tensor:
+    t = absmean_ternarize(w)
+    return torch.bmm(x.unsqueeze(1), t[leaf].transpose(-1, -2)).squeeze(1)
+
+
+@requires_ext
+def test_pack_roundtrip():
+    torch.manual_seed(0)
+    w = torch.randn(4, 5, 8)
+    t = absmean_ternarize(w)
+    packed, d_in_pad = pack_ternary_weights(w)
+    assert d_in_pad == 8
+    assert packed.dtype == torch.uint8
+    assert packed.shape == (4, 5, 2)
+    decoded = unpack_ternary_weights(packed)
+    assert torch.equal(decoded, t)
+
+
+@requires_ext
+def test_pack_pads_non_multiple_of_four():
+    torch.manual_seed(0)
+    w = torch.randn(2, 3, 6)
+    packed, d_in_pad = pack_ternary_weights(w)
+    assert d_in_pad == 8
+    assert packed.shape == (2, 3, 2)
+    decoded = unpack_ternary_weights(packed)[..., :6]
+    assert torch.equal(decoded, absmean_ternarize(w))
+
+
+@pytest.mark.parametrize("leaf_dtype", [torch.int64, torch.int32])
+@requires_ext
+def test_cpu_matches_fp32_reference(leaf_dtype):
+    torch.manual_seed(0)
+    B, d_in, d_out, L = 17, 8, 5, 4
+    x = torch.randn(B, d_in)
+    w = torch.randn(L, d_out, d_in)
+    leaf = torch.randint(0, L, (B,)).to(leaf_dtype)
+    ref = _fp_ref(x, w, leaf.to(torch.long))
+    out = ternary_mm(x, _packed(w), leaf)
+    assert out.dtype == torch.float32
+    assert out.shape == (B, d_out)
+    assert torch.allclose(out, ref, atol=1e-5)
+
+
+@requires_ext
+def test_cpu_large_matches_reference():
+    torch.manual_seed(0)
+    B, d_in, d_out, L = 512, 256, 256, 8
+    x = torch.randn(B, d_in)
+    w = torch.randn(L, d_out, d_in)
+    leaf = torch.randint(0, L, (B,))
+    ref = _fp_ref(x, w, leaf)
+    out = ternary_mm(x, _packed(w), leaf)
+    assert torch.allclose(out, ref, atol=1e-4)
+
+
+@requires_ext
+def test_mps_matches_cpu():
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
+    torch.manual_seed(0)
+    B, d_in, d_out, L = 64, 32, 16, 4
+    x = torch.randn(B, d_in)
+    w = torch.randn(L, d_out, d_in)
+    leaf = torch.randint(0, L, (B,))
+    cpu_out = ternary_mm(x, _packed(w), leaf)
+    mps_out = ternary_mm(
+        x.to("mps"), _packed(w).to("mps"), leaf.to(torch.int32).to("mps")
+    )
+    assert torch.allclose(mps_out.cpu(), cpu_out, atol=1e-5)
+
+
+@requires_ext
+def test_mps_matches_fp32_reference_large():
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
+    torch.manual_seed(0)
+    B, d_in, d_out, L = 512, 256, 256, 8
+    x = torch.randn(B, d_in)
+    w = torch.randn(L, d_out, d_in)
+    leaf = torch.randint(0, L, (B,))
+    ref = _fp_ref(x, w, leaf)
+    out = ternary_mm(x.to("mps"), _packed(w).to("mps"), leaf.to(torch.int32).to("mps"))
+    assert torch.allclose(out.cpu(), ref, atol=1e-4)
+
+
+@requires_ext
+def test_mps_stress_with_interleaved_ops():
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
+    torch.manual_seed(0)
+    _, d_in, d_out, L = 1, 256, 256, 8
+    w = torch.randn(L, d_out, d_in)
+    packed_m = _packed(w).to("mps")
+    t = absmean_ternarize(w)
+    for i in range(15):
+        B = 1 + i * 7
+        x = torch.randn(B, d_in)
+        leaf = torch.randint(0, L, (B,))
+        _ = torch.mm(x.to("mps"), torch.ones(d_in, 16, device="mps"))  # interleave
+        ref = _fp_ref(x, t, leaf)
+        out = ternary_mm(
+            x.to("mps"), packed_m, leaf.to(torch.int32).to("mps")
+        )
+        assert torch.allclose(out.cpu(), ref, atol=1e-4), f"iter {i}"
+
+
+@requires_ext
+def test_evaluator_matches_module_forward():
+    torch.manual_seed(0)
+    model = FastFeedForwardBitNet(d_in=32, d_out=8, depth=2)
+    model.eval()
+    x = torch.randn(23, 32)
+    with torch.no_grad():
+        ref = model._forward(x)
+    evalr = PackedFFFEvaluator(model)
+    leaf, _ = model._routing_forward(x)
+    out = evalr(x, leaf)
+    assert torch.allclose(out, ref, atol=1e-5)
+
+
+@requires_ext
+def test_evaluator_padded_din_matches_module_forward():
+    torch.manual_seed(0)
+    model = FastFeedForwardBitNet(d_in=6, d_out=8, depth=2)
+    model.eval()
+    x = torch.randn(11, 6)
+    with torch.no_grad():
+        ref = model._forward(x)
+    evalr = PackedFFFEvaluator(model)
+    leaf, _ = model._routing_forward(x)
+    out = evalr(x, leaf)
+    assert torch.allclose(out, ref, atol=1e-5)
+    assert evalr.d_in_padded == 8
+
+
+@requires_ext
+def test_evaluator_chunked_matches_full():
+    torch.manual_seed(0)
+    model = FastFeedForwardBitNet(d_in=64, d_out=16, depth=3)
+    model.eval()
+    x = torch.randn(50, 64)
+    leaf, _ = model._routing_forward(x)
+    full = PackedFFFEvaluator(model, chunk_size=None)(x, leaf)
+    chunked = PackedFFFEvaluator(model, chunk_size=8)(x, leaf)
+    assert torch.allclose(full, chunked, atol=1e-5)
+
+
+@requires_ext
+def test_fast_forward_matches_forward():
+    torch.manual_seed(0)
+    model = FastFeedForwardBitNet(d_in=32, d_out=16, depth=2)
+    model.eval()
+    x = torch.randn(19, 32)
+    with torch.no_grad():
+        ref = model(x)
+        fast = model.fast_forward(x)
+    assert torch.allclose(fast, ref, atol=1e-5)
+    x3 = torch.randn(4, 5, 32)
+    with torch.no_grad():
+        ref3 = model(x3)
+        fast3 = model.fast_forward(x3)
+    assert torch.allclose(fast3, ref3, atol=1e-5)
+
+
+@requires_ext
+def test_packed_autograd_backward():
+    torch.manual_seed(0)
+    B, d_in, d_out, L = 11, 8, 5, 4
+    x = torch.randn(B, d_in, requires_grad=True)
+    w = torch.randn(L, d_out, d_in, requires_grad=True)
+    leaf = torch.randint(0, L, (B,))
+    out = PackedTernaryMM.apply(x, w, leaf, 1e-8)
+    out.sum().backward()
+    assert x.grad is not None and w.grad is not None
+    assert x.grad.shape == (B, d_in)
+    assert w.grad.shape == (L, d_out, d_in)
+    packed, _ = pack_ternary_weights(w.detach())
+    # numeric: grad flows to routed leaves only
+    assert torch.allclose(x.grad, unpack_ternary_weights(packed)[leaf].sum(dim=1), atol=1e-5)
+    # grad_w is zero for leaves that were never routed
+    routed = set(leaf.unique().tolist())
+    for l in range(L):
+        if l not in routed:
+            assert torch.allclose(w.grad[l], torch.zeros_like(w.grad[l]), atol=0.0)
+
+
+@requires_ext
+def test_activations_quantized_path_matches_reference():
+    torch.manual_seed(0)
+    model = FastFeedForwardBitNet(d_in=16, d_out=8, depth=2, activation_bits=8)
+    model.eval()
+    x = torch.randn(13, 16)
+    with torch.no_grad():
+        ref = model._forward(x)
+    leaf, _ = model._routing_forward(x)
+    evalr = PackedFFFEvaluator(model)
+    assert torch.allclose(evalr(x, leaf), ref, atol=1e-5)

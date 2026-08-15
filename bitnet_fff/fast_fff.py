@@ -201,6 +201,42 @@ class FastFeedForwardBitNet(nn.Module):
             return out.reshape(*shape[:-1], self.d_out)
         return self._forward(x)
 
+    def pack(self, device: torch.device | str | None = None) -> "PackedFFFEvaluator":
+        """Build a packed-ternary evaluator for fast inference on ``device``."""
+        from .fast_inference import PackedFFFEvaluator
+
+        return PackedFFFEvaluator(self, device=device)
+
+    def fast_forward(
+        self,
+        x: torch.Tensor,
+        chunk_size: int | None = None,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Zero-gather inference: routes, then evaluates only the selected leaves.
+
+        The first call packs + uploads the ternary weights (lazy); subsequent
+        calls reuse them. Falls back to ``_forward`` if the native extension is
+        unavailable.
+        """
+        from .fast_inference import extension_available
+
+        if not extension_available():
+            return self._forward(x)
+        evaluator = getattr(self, "_packed_eval", None)
+        if evaluator is None or evaluator.device != torch.device(x.device):
+            evaluator = self.pack(device=x.device)
+            evaluator.chunk_size = chunk_size
+            self._packed_eval = evaluator
+        if x.dim() > 2:
+            shape = x.shape
+            flat = x.reshape(-1, shape[-1])
+            leaf_idx, _ = self._routing_forward(flat)
+            out = evaluator(flat, leaf_idx)
+            return out.reshape(*shape[:-1], self.d_out)
+        leaf_idx, _ = self._routing_forward(x)
+        return evaluator(x, leaf_idx)
+
     def extra_repr(self) -> str:
         return (
             f"d_in={self.d_in}, d_out={self.d_out}, depth={self.depth}, "
