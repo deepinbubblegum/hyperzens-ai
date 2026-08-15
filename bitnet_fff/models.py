@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Iterator
 
 import torch
 import torch.nn as nn
@@ -644,6 +644,121 @@ class BitNetFFTTransformer(nn.Module):
 
                 out = torch.cat([tokens, generated], dim=1)
                 return out.squeeze(0) if squeeze else out
+        finally:
+            self.train(was_training)
+
+    def stream_generate(
+        self,
+        prompt_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        eos_token_id: int | None = None,
+        decode_token: Callable[[int], str] | None = None,
+    ) -> Iterator[str | int | tuple[str, ...] | torch.Tensor]:
+        """Autoregressively stream a continuation, one token (or token text) at a time.
+
+        A generator twin of :meth:`generate` for zero-latency typewriter output:
+        the prompt is prefilled once into fresh per-layer :class:`KVCache`
+        buffers and each decode step runs a single cached token through the
+        model plus the fused single-pass FFF kernel
+        (:meth:`FastFeedForwardBitNet.fast_forward`), exactly like ``generate``,
+        but control returns to the caller after **every** sampled token instead
+        of only at the end.
+
+        Yielded item per step:
+            * ``decode_token`` is ``None`` — the raw token id (``int`` for a
+              single-row prompt, else a ``torch.Tensor`` of shape ``(batch,)``).
+            * ``decode_token`` is a callable ``(int) -> str`` — the decoded text
+              piece (``str`` for a single-row prompt, else a tuple of strings).
+              Pass a streaming decoder (e.g. ``BPETokenizer.decode_step``) so
+              multi-byte UTF-8 split across BPE tokens reassembles correctly.
+
+        The whole loop runs under ``torch.inference_mode()``; ``eval()`` mode is
+        entered when iteration starts and restored when the generator is
+        exhausted or closed early (so it is safe to ``break`` out of the stream).
+        Early ``eos_token_id`` termination is honoured (a per-step host-device
+        sync, as in :meth:`generate`). Sampling parameters match :meth:`generate`.
+        """
+        if max_new_tokens < 1:
+            raise ValueError(f"max_new_tokens must be >= 1, got {max_new_tokens}")
+        if self.embed is None or self.head is None:
+            raise ValueError("stream_generate() requires a token model (vocab_size > 0)")
+        if eos_token_id is None:
+            eos_token_id = self.cfg.eos_token_id
+
+        was_training = self.training
+        self.eval()
+        try:
+            with torch.inference_mode():
+                squeeze = prompt_ids.ndim == 1
+                tokens = prompt_ids if not squeeze else prompt_ids.unsqueeze(0)
+                if tokens.ndim != 2:
+                    raise ValueError(
+                        f"prompt_ids must be 1D or 2D, got {tuple(prompt_ids.shape)}"
+                    )
+                batch, prompt_len = tokens.shape
+                if prompt_len < 1:
+                    raise ValueError("prompt_ids must contain at least one token")
+                if prompt_len + max_new_tokens > self.cfg.max_seq_len:
+                    raise ValueError(
+                        f"prompt_len + max_new_tokens ({prompt_len} + "
+                        f"{max_new_tokens}) exceeds max_seq_len "
+                        f"{self.cfg.max_seq_len}"
+                    )
+
+                device = next(self.parameters()).device
+                dtype = next(self.parameters()).dtype
+                head_dim = self.cfg.d_model // self.cfg.n_heads
+                caches = [
+                    KVCache.preallocate(
+                        batch,
+                        self.cfg.n_heads,
+                        self.cfg.max_seq_len,
+                        head_dim,
+                        dtype=dtype,
+                        device=device,
+                    )
+                    for _ in self.layers
+                ]
+
+                def _emit(ids: torch.Tensor):
+                    if decode_token is not None:
+                        if batch == 1:
+                            return decode_token(int(ids[0, 0]))
+                        return tuple(decode_token(int(i)) for i in ids[:, 0])
+                    if batch == 1:
+                        return int(ids[0, 0])
+                    return ids[:, 0]
+
+                # Prefill: full prompt once; the last row's logits already
+                # predict the first new token.
+                prefill = self(tokens, kv_cache=caches, past_length=0)
+                next_ids = _sample_from_logits(
+                    prefill[:, -1], temperature, top_k, top_p
+                )
+                done = torch.zeros(batch, dtype=torch.bool, device=device)
+                if eos_token_id is not None:
+                    done = (next_ids == eos_token_id).squeeze(-1)
+                    next_ids = next_ids.masked_fill(done.unsqueeze(-1), eos_token_id)
+                yield _emit(next_ids)
+
+                for step in range(1, max_new_tokens):
+                    if eos_token_id is not None and bool(done.all()):
+                        break
+                    logits = self(
+                        next_ids, kv_cache=caches, past_length=prompt_len + step - 1
+                    )
+                    next_ids = _sample_from_logits(
+                        logits[:, -1], temperature, top_k, top_p
+                    )
+                    if eos_token_id is not None:
+                        done = done | (next_ids == eos_token_id).squeeze(-1)
+                        next_ids = next_ids.masked_fill(
+                            done.unsqueeze(-1), eos_token_id
+                        )
+                    yield _emit(next_ids)
         finally:
             self.train(was_training)
 

@@ -185,6 +185,103 @@ def test_generation_shorter_than_max_new_tokens_with_eos(monkeypatch):
     assert out[1].shape[0] == 3 + 5
 
 
+# --- stream_generate (typewriter streaming) ----------------------------------
+
+
+def test_stream_generate_matches_generate_greedy():
+    """stream_generate yields exactly the tokens generate() produces."""
+    m = _model()
+    prompt = torch.randint(0, m.cfg.vocab_size, (5,))
+    with torch.no_grad():
+        full = m.generate(prompt, max_new_tokens=8, temperature=0.0)
+        ids = list(m.stream_generate(prompt, max_new_tokens=8, temperature=0.0))
+    assert ids == full[5:].tolist()
+
+
+def test_stream_generate_stops_at_eos(monkeypatch):
+    m = _model()
+    _patch_sampler(monkeypatch, [7, 7, 42, 7, 7, 7, 7, 7])
+    prompt = torch.tensor([5, 6, 7])
+    with torch.no_grad():
+        ids = list(m.stream_generate(
+            prompt, max_new_tokens=8, temperature=1.0, eos_token_id=42
+        ))
+    assert ids == [7, 7, 42]
+
+
+def test_stream_generate_truncates_at_immediate_eos(monkeypatch):
+    m = _model()
+    _patch_sampler(monkeypatch, [42])
+    prompt = torch.tensor([5, 6, 7])
+    with torch.no_grad():
+        ids = list(m.stream_generate(
+            prompt, max_new_tokens=8, temperature=1.0, eos_token_id=42
+        ))
+    assert ids == [42]
+
+
+def test_stream_generate_respects_max_new_tokens_no_eos(monkeypatch):
+    m = _model()
+    _patch_sampler(monkeypatch, [7])
+    prompt = torch.tensor([5, 6, 7])
+    with torch.no_grad():
+        ids = list(m.stream_generate(
+            prompt, max_new_tokens=5, temperature=1.0, eos_token_id=42
+        ))
+    assert ids == [7] * 5
+
+
+def test_stream_generate_decodes_text_pieces(monkeypatch):
+    m = _model()
+    _patch_sampler(monkeypatch, [40, 41, 33])
+    prompt = torch.tensor([5, 6])
+    with torch.no_grad():
+        pieces = list(m.stream_generate(
+            prompt, max_new_tokens=3, temperature=1.0, decode_token=chr
+        ))
+    assert pieces == ["(", ")", "!"]
+
+
+def test_stream_generate_batch_returns_per_row_ids(monkeypatch):
+    m = _model()
+
+    def sampler(logits, temperature, top_k, top_p):
+        b = logits.shape[0]
+        return torch.full((b, 1), 7, device=logits.device)
+
+    import bitnet_fff.models as models_mod
+
+    monkeypatch.setattr(models_mod, "_sample_from_logits", sampler)
+    prompt = torch.tensor([[5, 6, 7], [8, 9, 10]])
+    with torch.no_grad():
+        steps = list(m.stream_generate(
+            prompt, max_new_tokens=4, temperature=1.0
+        ))
+    assert len(steps) == 4
+    assert all(s.shape == (2,) and (s == 7).all() for s in steps)
+
+
+def test_stream_generate_close_restores_training_state():
+    m = _model()
+    m.train()
+    assert m.training
+    prompt = torch.tensor([5, 6, 7])
+    with torch.no_grad():
+        stream = m.stream_generate(prompt, max_new_tokens=8, temperature=0.0)
+        next(stream)
+        assert not m.training  # eval() active while streaming
+        stream.close()
+    assert m.training  # finally restores the original mode
+
+
+def test_stream_generate_requires_token_model():
+    m = BitNetFFTTransformer(_cfg(vocab_size=0))
+    m.eval()
+    prompt = torch.tensor([1, 2, 3])
+    with pytest.raises(ValueError):
+        next(m.stream_generate(prompt, max_new_tokens=2))
+
+
 # --- CLI smoke tests ---------------------------------------------------------
 
 
