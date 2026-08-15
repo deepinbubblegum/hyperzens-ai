@@ -99,6 +99,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     o = p.add_argument_group("optimizer / QAT")
     o.add_argument("--lr", type=float, default=1e-3)
+    o.add_argument("--warmup-steps", type=int, default=100,
+                   help="Number of warmup steps (linear LR ramp 0 -> --lr)")
     o.add_argument("--beta1", type=float, default=0.9)
     o.add_argument("--beta2", type=float, default=0.999)
     o.add_argument("--weight-decay", type=float, default=0.01)
@@ -260,6 +262,52 @@ def _select_tasks(args: argparse.Namespace) -> list:
     return tasks
 
 
+class LinearWarmupScheduler:
+    """Linear LR warmup for the custom FP16-master AdamW optimizer.
+
+    ``torch.optim.lr_scheduler.LambdaLR`` cannot drive the optimizer returned
+    by :func:`train_qat.make_qat_model` (``FP16MasterAdamW`` is not a
+    ``torch.optim.Optimizer`` subclass: it has no ``param_groups``/``defaults``),
+    so this mirrors LambdaLR's linear warmup by scaling the optimizer's ``lr``
+    attribute directly: the learning rate ramps linearly from 0 to the base
+    ``--lr`` over ``warmup_steps`` optimizer steps and then stays constant.
+    Call :meth:`step` once per optimizer step; the state is checkpointed so a
+    resumed run continues the warmup instead of restarting it.
+    """
+
+    def __init__(self, optimizer, warmup_steps: int, last_step: int = 0) -> None:
+        self.optimizer = optimizer
+        self.base_lr = float(optimizer.lr)
+        self.warmup_steps = max(int(warmup_steps), 0)
+        self.last_step = int(last_step)
+        optimizer.lr = self._lr_for(self.last_step)
+
+    def step(self) -> None:
+        self.last_step += 1
+        self.optimizer.lr = self._lr_for(self.last_step)
+
+    def get_last_lr(self) -> list[float]:
+        return [self.optimizer.lr]
+
+    def _lr_for(self, step: int) -> float:
+        if self.warmup_steps <= 0:
+            return self.base_lr
+        return self.base_lr * min(1.0, step / self.warmup_steps)
+
+    def state_dict(self) -> dict:
+        return {
+            "base_lr": self.base_lr,
+            "warmup_steps": self.warmup_steps,
+            "last_step": self.last_step,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.base_lr = float(state.get("base_lr", self.base_lr))
+        self.warmup_steps = int(state.get("warmup_steps", self.warmup_steps))
+        self.last_step = int(state.get("last_step", self.last_step))
+        self.optimizer.lr = self._lr_for(self.last_step)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.grad_accum_steps < 1:
@@ -318,10 +366,14 @@ def main(argv: list[str] | None = None) -> int:
         weight_decay=args.weight_decay,
         clip_grad_norm=args.clip_grad_norm,
     )
+    scheduler = LinearWarmupScheduler(opt, args.warmup_steps)
     print(f"[student] d_model={cfg.d_model} n_heads={cfg.n_heads} "
           f"n_layers={cfg.n_layers} fff_depth={cfg.fff_depth} "
           f"vocab={cfg.vocab_size} tie_weights={tie} alpha={args.alpha} "
           f"T={args.temperature} device={device}")
+    if args.warmup_steps > 0:
+        print(f"[sched] linear warmup 0 -> {args.lr:g} over "
+              f"{args.warmup_steps} steps")
 
     tasks = _select_tasks(args)
     weights = {t.name: t.weight for t in tasks}
@@ -365,6 +417,8 @@ def main(argv: list[str] | None = None) -> int:
         opt.load_state_dict(ckpt["optimizer"])
         step = int(ckpt.get("step", 0))
         best_loss = float(ckpt.get("best_loss", best_loss))
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
         print(f"[distill-mt] resumed from step {step} "
               f"(best_loss={best_loss:.4f})")
 
@@ -386,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
                 student, opt, teacher, micro, args.alpha,
                 args.temperature, cfg.vocab_size, args.grad_accum_steps,
             )
+            scheduler.step()
             ema = loss if ema is None else 0.9 * ema + 0.1 * loss
             step += 1
 
@@ -421,6 +476,7 @@ def main(argv: list[str] | None = None) -> int:
                                 "alpha": args.alpha,
                                 "temperature": args.temperature,
                                 "grad_accum_steps": args.grad_accum_steps,
+                                "scheduler": scheduler.state_dict(),
                                 "best_loss": best_loss,
                                 "kind": "best",
                             },
@@ -430,7 +486,8 @@ def main(argv: list[str] | None = None) -> int:
 
             if step % args.log_every == 0 or step >= args.steps:
                 print(f"[distill-mt] step {step}/{args.steps} loss={loss:.4f} "
-                      f"kd={kd:.4f} ce={ce:.4f} ema={ema:.4f}{mem_str}")
+                      f"kd={kd:.4f} ce={ce:.4f} ema={ema:.4f} "
+                      f"lr={scheduler.get_last_lr()[0]:.3g}{mem_str}")
 
             if step % args.empty_cache_every == 0:
                 mps_empty_cache()
@@ -445,6 +502,7 @@ def main(argv: list[str] | None = None) -> int:
                         "alpha": args.alpha,
                         "temperature": args.temperature,
                         "grad_accum_steps": args.grad_accum_steps,
+                        "scheduler": scheduler.state_dict(),
                         "best_loss": best_loss,
                     },
                 )
@@ -462,6 +520,7 @@ def main(argv: list[str] | None = None) -> int:
                 "alpha": args.alpha,
                 "temperature": args.temperature,
                 "grad_accum_steps": args.grad_accum_steps,
+                "scheduler": scheduler.state_dict(),
                 "best_loss": best_loss,
             },
         )

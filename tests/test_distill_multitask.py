@@ -107,6 +107,56 @@ def test_no_tie_weights_overrides():
     assert args.no_tie_weights is True
 
 
+# --- linear warmup scheduler -------------------------------------------------
+
+
+def test_warmup_steps_arg_default_and_override():
+    assert mod.parse_args([]).warmup_steps == 100
+    assert mod.parse_args(["--warmup-steps", "5"]).warmup_steps == 5
+
+
+class _DummyOptimizer:
+    def __init__(self, lr=1e-3):
+        self.lr = lr
+
+
+def test_linear_warmup_ramps_from_zero_to_base_lr():
+    opt = _DummyOptimizer(lr=1e-3)
+    sched = mod.LinearWarmupScheduler(opt, warmup_steps=10)
+    assert sched.last_step == 0
+    assert opt.lr == 0.0  # first step runs at lr=0
+    for step in range(1, 11):
+        sched.step()
+        assert opt.lr == pytest.approx(1e-3 * step / 10)
+    # past warmup the lr stays constant at the base
+    sched.step()
+    assert opt.lr == 1e-3
+
+
+def test_linear_warmup_zero_steps_is_constant():
+    opt = _DummyOptimizer(lr=2e-3)
+    sched = mod.LinearWarmupScheduler(opt, warmup_steps=0)
+    assert opt.lr == 2e-3
+    sched.step()
+    assert opt.lr == 2e-3
+
+
+def test_linear_warmup_state_dict_roundtrip():
+    opt = _DummyOptimizer(lr=1e-3)
+    sched = mod.LinearWarmupScheduler(opt, warmup_steps=10)
+    for _ in range(6):
+        sched.step()
+    assert opt.lr == pytest.approx(1e-3 * 6 / 10)
+
+    opt2 = _DummyOptimizer(lr=1e-3)
+    sched2 = mod.LinearWarmupScheduler(opt2, warmup_steps=10)
+    sched2.load_state_dict(sched.state_dict())
+    assert sched2.last_step == 6
+    assert opt2.lr == pytest.approx(1e-3 * 6 / 10)
+    sched2.step()
+    assert opt2.lr == pytest.approx(1e-3 * 7 / 10)
+
+
 # --- distillation loss wiring ------------------------------------------------
 
 
@@ -308,7 +358,7 @@ def _e2e_args(tmp_path, steps=6):
         "--vocab-size", "256", "--max-seq-len", "64", "--seq-len", "8",
         "--batch-size", "2", "--grad-accum-steps", "2",
         "--steps", str(steps), "--val-every", "2", "--val-batches", "1",
-        "--log-every", "2", "--save-every", "3", "--no-fp16",
+        "--log-every", "2", "--save-every", "3", "--no-fp16", "--warmup-steps", "2",
         "--checkpoint", str(tmp_path / "mt_student.pt"),
     ]
 
@@ -341,6 +391,8 @@ def test_main_e2e_mocked_datasets(monkeypatch, tmp_path, capsys):
     assert "math=40%" in out and "code=20%" in out
     assert "[val] step 2" in out and "[val] step 4" in out
     assert "blended=" in out
+    assert "[sched] linear warmup" in out
+    assert "lr=" in out
     assert (tmp_path / "mt_student.pt").exists()
     assert (tmp_path / "checkpoint_best.pt").exists()
 
