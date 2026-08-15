@@ -11,6 +11,7 @@ from . import qat
 from . import profiler
 from . import tokenizer
 from . import tuning
+from . import dataset
 
 __all__ = [
     "BitLinear",
@@ -25,6 +26,7 @@ __all__ = [
     "profiler",
     "tokenizer",
     "tuning",
+    "dataset",
 ]
 
 __version__ = "0.1.0"
