@@ -54,6 +54,7 @@ from bitnet_fff.mps_utils import (
     mps_driver_allocated_bytes,
     mps_empty_cache,
 )
+from bitnet_fff.tokenizer import TikTokenizer
 
 from tqdm import tqdm
 
@@ -113,8 +114,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="comma-separated sampling ratios matching --tasks "
                         "(defaults to the recipe: 0.4,0.4,0.2)")
     d.add_argument("--tokenizer", default=None,
-                   help="HuggingFace tokenizer name (default gpt2 BPE; "
-                        "'bytes' for the byte-level fallback)")
+                   help="tokenizer name (default gpt2 BPE; 'bytes' for the "
+                        "byte-level fallback; 'o200k_base' for the fixed-vocab "
+                        "tiktoken encoding)")
     d.add_argument("--seq-len", type=int, default=64)
     d.add_argument("--batch-size", type=int, default=8,
                    help="micro-batch size per forward")
@@ -272,11 +274,13 @@ def main(argv: list[str] | None = None) -> int:
     tok = train_qat.load_tokenizer(args.tokenizer, args.vocab_size)
     if isinstance(tok, train_qat.BPETokenizer):
         print(f"[tokenizer] BPE {tok.name} vocab={tok.vocab_size}")
+    elif isinstance(tok, TikTokenizer):
+        print(f"[tokenizer] tiktoken {tok.name} vocab={tok.vocab_size}")
     else:
         print(f"[tokenizer] byte-level fallback vocab={tok.vocab_size}")
 
     student_vocab = args.vocab_size
-    if isinstance(tok, train_qat.BPETokenizer):
+    if isinstance(tok, (train_qat.BPETokenizer, TikTokenizer)):
         student_vocab = int(tok.vocab_size)
     teacher, teacher_meta = distill_mod.load_teacher(
         args.teacher, device, student_vocab, args

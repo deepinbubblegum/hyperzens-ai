@@ -6,6 +6,10 @@ byte-accurate **streaming decoder** (:meth:`BPETokenizer.decode_step`) that
 assembles generated token ids into text token-by-token without corrupting
 multi-byte UTF-8 sequences that a BPE splits across several tokens.
 
+:class:`TikTokenizer` wraps a ``tiktoken`` encoding (``o200k_base``, the
+GPT-4o vocabulary) with the same interface, including the byte-accurate
+streaming decoder built on :meth:`tiktoken.Encoding.decode_single_token_bytes`.
+
 A :class:`ByteTokenizer` remains as an explicit offline fallback (``bytes`` /
 no ``transformers``); :func:`load_tokenizer` always prefers BPE and only drops
 to bytes when BPE is impossible. Both expose the ``encode`` / ``decode`` /
@@ -20,6 +24,7 @@ from functools import lru_cache
 
 DEFAULT_BPE_TOKENIZER = "gpt2"
 _BYTE_FALLBACK_NAME = "bytes"
+TIKTOKEN_NAME = "o200k_base"
 
 
 def _bytes_to_unicode() -> dict[int, int]:
@@ -183,6 +188,105 @@ def _load_auto_tokenizer(name: str, **kwargs):
     return AutoTokenizer.from_pretrained(name, **kwargs)
 
 
+@lru_cache(maxsize=8)
+def _load_tiktoken_encoding(name: str):
+    import tiktoken
+
+    return tiktoken.get_encoding(name)
+
+
+class TikTokenizer:
+    """Tiktoken BPE tokenizer wrapping a ``tiktoken.Encoding`` (o200k_base).
+
+    ``o200k_base`` is the GPT-4o encoding: its vocabulary is intrinsic to the
+    encoding at ``n_vocab`` (~200,019 tokens), so ``vocab_size`` is read from
+    the encoding rather than user-supplied. Exposes the same ``encode`` /
+    ``decode`` / ``vocab_size`` / ``bos_token_id`` / ``eos_token_id`` /
+    ``pad_token_id`` / ``decode_step`` / ``reset_stream`` interface as
+    :class:`BPETokenizer`, so the model config binds it identically.
+
+    Attributes:
+        name: tiktoken encoding name (``o200k_base``).
+        eos_token_id / pad_token_id: the ``<|endoftext|>`` special token id
+            when the encoding defines it, else ``None``.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self._enc = _load_tiktoken_encoding(name)
+        self._buf = b""
+
+    # -- vocabulary / special ids ---------------------------------------------
+
+    @property
+    def vocab_size(self) -> int:
+        return int(self._enc.n_vocab)
+
+    @property
+    def bos_token_id(self) -> int | None:
+        return None  # tiktoken encodings do not define a BOS token
+
+    @property
+    def eos_token_id(self) -> int | None:
+        for tok in ("<|endoftext|>",):
+            try:
+                return int(self._enc.encode_single_token(tok))
+            except KeyError:
+                continue
+        return None
+
+    @property
+    def pad_token_id(self) -> int | None:
+        return self.eos_token_id  # no pad token defined
+
+    # -- encode / decode -------------------------------------------------------
+
+    def encode(self, text: str) -> list[int]:
+        return self._enc.encode(text)
+
+    def decode(self, ids) -> str:
+        return self._enc.decode(list(int(i) for i in ids))
+
+    # -- streaming decode -------------------------------------------------------
+
+    def decode_step(self, token_id: int) -> str:
+        """Convert one generated token id to text, streaming-safe.
+
+        Tiktoken is byte-level, so each token id maps to a raw byte string
+        (:meth:`tiktoken.Encoding.decode_single_token_bytes`) that may end in
+        the middle of a multi-byte UTF-8 character; bytes are buffered and only
+        complete UTF-8 sequences are emitted, exactly like
+        :meth:`BPETokenizer.decode_step`. Call :meth:`reset_stream` between
+        independent generations.
+        """
+        self._buf += self._enc.decode_single_token_bytes(token_id)
+        return self._emit_utf8()
+
+    def reset_stream(self) -> str:
+        """Flush pending bytes (incomplete UTF-8 tail) and reset the stream."""
+        out = self._buf
+        self._buf = b""
+        return out.decode("utf-8", errors="replace") if out else ""
+
+    # -- helpers ----------------------------------------------------------------
+
+    def _emit_utf8(self) -> str:
+        buf = self._buf
+        cut = len(buf)
+        while cut > 0:
+            try:
+                text = buf[:cut].decode("utf-8")
+            except UnicodeDecodeError:
+                cut -= 1
+                continue
+            self._buf = buf[cut:]
+            return text
+        return ""
+
+    def __repr__(self) -> str:
+        return f"TikTokenizer(name={self.name!r}, vocab_size={self.vocab_size})"
+
+
 class ByteTokenizer:
     """Byte-level fallback tokenizer (id <-> raw UTF-8 byte).
 
@@ -221,15 +325,19 @@ class ByteTokenizer:
 
 def load_tokenizer(
     name: str | None, vocab_size: int = 256, **from_kwargs
-) -> BPETokenizer | ByteTokenizer:
+) -> BPETokenizer | TikTokenizer | ByteTokenizer:
     """Return a production tokenizer (BPE preferred, byte-level fallback).
 
-    ``name`` of ``"bytes"`` forces the byte-level fallback. Otherwise a
-    HuggingFace ``AutoTokenizer`` is used (``gpt2`` when ``name`` is ``None``);
-    if ``transformers`` is not installed the byte-level fallback is returned.
+    ``name`` of ``"bytes"`` forces the byte-level fallback; ``"o200k_base"``
+    loads the fixed-vocabulary tiktoken encoding (:class:`TikTokenizer`).
+    Otherwise a HuggingFace ``AutoTokenizer`` is used (``gpt2`` when ``name``
+    is ``None``); if ``transformers`` is not installed the byte-level fallback
+    is returned.
     """
     if name == _BYTE_FALLBACK_NAME:
         return ByteTokenizer(vocab_size)
+    if name == TIKTOKEN_NAME:
+        return TikTokenizer(name)
     try:
         import transformers  # noqa: F401
     except ImportError:
@@ -240,7 +348,9 @@ def load_tokenizer(
 __all__ = [
     "BPETokenizer",
     "ByteTokenizer",
+    "TikTokenizer",
     "load_tokenizer",
     "DEFAULT_BPE_TOKENIZER",
+    "TIKTOKEN_NAME",
     "_BYTE_FALLBACK_NAME",
 ]

@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bitnet_fff.models import BitNetFFTConfig, BitNetFFTTransformer
 from bitnet_fff.mps_utils import is_mps_available, mps_synchronize
-from bitnet_fff.tokenizer import load_tokenizer
+from bitnet_fff.tokenizer import TikTokenizer, load_tokenizer
 
 _HELP = """Commands:
   /help            show this help
@@ -333,8 +333,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     t = p.add_argument_group("tokenizer")
     t.add_argument("--tokenizer", default=None,
-                   help="HuggingFace tokenizer name (default gpt2 BPE; "
-                        "'bytes' for the byte-level fallback)")
+                   help="tokenizer name (default gpt2 BPE; 'bytes' for the "
+                        "byte-level fallback; 'o200k_base' for the fixed-vocab "
+                        "tiktoken encoding)")
 
     s = p.add_argument_group("generation")
     s.add_argument("--max-new-tokens", type=int, default=64)
@@ -376,8 +377,12 @@ def main(argv: list[str] | None = None) -> int:
     torch.manual_seed(args.seed)
 
     tok = load_tokenizer(args.tokenizer, args.vocab_size)
-    if hasattr(tok, "name"):
+    if isinstance(tok, TikTokenizer):
+        print(f"[tokenizer] tiktoken {tok.name} vocab={tok.vocab_size}")
+        args.vocab_size = int(tok.vocab_size)
+    elif hasattr(tok, "name"):
         print(f"[tokenizer] BPE {tok.name} vocab={tok.vocab_size}")
+        args.vocab_size = int(tok.vocab_size)
     else:
         print(f"[tokenizer] {tok}")
 

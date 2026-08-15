@@ -23,7 +23,12 @@ import torch.nn.functional as F
 from bitnet_fff.models import BitNetFFTConfig, BitNetFFTTransformer
 from bitnet_fff.mps_utils import is_mps_available
 from bitnet_fff.qat import BitNetQAT
-from bitnet_fff.tokenizer import BPETokenizer, ByteTokenizer, load_tokenizer
+from bitnet_fff.tokenizer import (
+    BPETokenizer,
+    ByteTokenizer,
+    TikTokenizer,
+    load_tokenizer,
+)
 
 GPT2_VOCAB = 50257
 
@@ -47,6 +52,69 @@ def test_load_tokenizer_prefers_bpe():
     assert isinstance(load_tokenizer(None), BPETokenizer)
     assert isinstance(load_tokenizer("bytes", 256), ByteTokenizer)
     assert load_tokenizer(None).vocab_size == GPT2_VOCAB
+
+
+# --- tiktoken o200k_base --------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def tik():
+    pytest.importorskip("tiktoken")
+    return load_tokenizer("o200k_base")
+
+
+def test_tiktoken_vocab_and_special_ids(tik):
+    assert isinstance(tik, TikTokenizer)
+    assert tik.name == "o200k_base"
+    assert tik.vocab_size == 200019  # intrinsic to the encoding, not supplied
+    assert tik.bos_token_id is None
+    assert tik.eos_token_id == 199999  # <|endoftext|>
+    assert tik.pad_token_id == 199999  # no pad -> eos fallback
+    assert 0 <= tik.eos_token_id < tik.vocab_size
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Hello, world!",
+        "héllo wörld 😀",
+        "日本語のテストです。",
+        "  leading and trailing  ",
+        "line1\nline2\ttab",
+        "3🙏🎉 mixed emoji",
+        "a" * 120,
+    ],
+)
+def test_tiktoken_encode_decode_roundtrip(tik, text):
+    ids = tik.encode(text)
+    assert isinstance(ids, list) and ids
+    assert all(0 <= i < tik.vocab_size for i in ids)
+    assert tik.decode(ids) == text
+
+
+def test_tiktoken_decode_step_streaming_exact(tik):
+    text = "héllo wörld 😀 café 日本語 3🙏🎉  "
+    pieces = [tik.decode_step(i) for i in tik.encode(text)]
+    assert "".join(pieces) == text
+    tik.reset_stream()
+    assert tik._buf == b""
+
+
+def test_tiktoken_decode_matches_full_decode(tik):
+    ids = tik.encode("Once upon a time")
+    pieces = [tik.decode_step(int(i)) for i in ids]
+    assert "".join(pieces) == tik.decode(ids)
+    tik.reset_stream()
+
+
+def test_tiktoken_binds_config_vocab(tik):
+    cfg = BitNetFFTConfig.from_tokenizer(
+        tik, d_model=32, n_heads=2, n_layers=1, fff_depth=2, max_seq_len=32
+    )
+    assert cfg.vocab_size == tik.vocab_size
+    assert cfg.bos_token_id is None
+    assert cfg.eos_token_id == tik.eos_token_id
+    assert cfg.pad_token_id == tik.pad_token_id
 
 
 # --- roundtrip ------------------------------------------------------------------

@@ -387,6 +387,29 @@ def test_cli_arch_overrides_maps_no_fff_bias():
     assert names == ["no-fff-bias"]
 
 
+def test_main_o200k_base_sets_vocab_and_runs(monkeypatch, capsys):
+    pytest.importorskip("tiktoken")
+    mod = _load_chat_module()
+    captured = {}
+    real_build = mod.build_model
+
+    def fake_build(cfg, device, checkpoint=None, state=None):
+        captured["vocab"] = cfg.vocab_size
+        return real_build(cfg, device, checkpoint, state)
+
+    monkeypatch.setattr(mod, "build_model", fake_build)
+    monkeypatch.setattr("builtins.input", lambda _: "/quit")
+    rc = mod.main([
+        "--device", "cpu", "--tokenizer", "o200k_base",
+        "--d-model", "16", "--n-heads", "2", "--n-layers", "1", "--fff-depth", "1",
+        "--max-seq-len", "64", "--max-new-tokens", "8",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "tiktoken o200k_base vocab=200019" in out
+    assert captured["vocab"] == 200019
+
+
 # --- CLI smoke test ----------------------------------------------------------
 
 

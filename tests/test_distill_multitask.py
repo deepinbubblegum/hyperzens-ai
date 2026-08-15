@@ -16,6 +16,8 @@ import re
 import sys
 import torch
 
+import pytest
+
 from bitnet_fff.models import BitNetFFTConfig, BitNetFFTTransformer
 from bitnet_fff.mps_utils import mps_empty_cache
 from bitnet_fff.tokenizer import ByteTokenizer
@@ -385,3 +387,16 @@ def test_main_resume_loads_state(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "resume" in out
+
+
+def test_main_o200k_base_sets_student_vocab(monkeypatch, tmp_path, capsys):
+    pytest.importorskip("tiktoken")
+    _fake_load_dataset(monkeypatch, _recipe_fake_rows())
+    args = [a if a != "bytes" else "o200k_base" for a in _e2e_args(tmp_path, steps=2)]
+    rc = mod.main(args)
+    out = capsys.readouterr().out
+    assert rc == 0
+    # the student's vocab is taken from the encoding (~200k), not --vocab-size
+    assert "[tokenizer] tiktoken o200k_base vocab=200019" in out
+    assert "vocab=200019" in out
+    assert "[teacher]" in out
