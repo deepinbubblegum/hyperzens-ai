@@ -13,11 +13,18 @@ Kullback-Leibler divergence between teacher and student logits:
     loss = alpha * T**2 * KL(softmax(s/T) || softmax(t/T)) + (1 - alpha) * CE(s)
 
 Checkpoints (``torch.save``) store the student config, weights, optimizer state
-and a teacher descriptor so runs are fully resumable.
+and a teacher descriptor so runs are fully resumable (``--resume``).
+
+Data streams lazily from HuggingFace datasets or local text through
+:class:`~scripts.train_qat.StreamingTextDataloader` (token-buffer packing, no
+padding). A validation loop (``--val-data`` / ``--val-every``) saves the best
+student to ``checkpoint_best.pt``; step logs include MPS Unified Memory usage.
 
 Usage:
     python scripts/distill.py --data data/ --teacher hf://Qwen/Qwen2.5-0.5B \
         --checkpoint ckpts/distill_student.pt --steps 3000 --device mps
+    python scripts/distill.py --data hf://roneneldan/TinyStories \
+        --teacher teacher.pt --val-every 500 --checkpoint ckpts/distill.pt
     python scripts/distill.py --data data/ --teacher teacher.pt \
         --alpha 0.7 --temperature 2.0 --steps 1000
 """
@@ -36,7 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from bitnet_fff.models import BitNetFFTConfig, BitNetFFTTransformer
-from bitnet_fff.mps_utils import is_mps_available
+from bitnet_fff.mps_utils import is_mps_available, mps_driver_allocated_bytes
 from bitnet_fff.qat import BitNetQAT
 
 import train_qat
@@ -203,6 +210,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     d.add_argument("--batch-size", type=int, default=8)
     d.add_argument("--max-examples", type=int, default=None)
 
+    v = p.add_argument_group("validation")
+    v.add_argument("--val-data", default=None,
+                   help="validation source (hf://<ds> or local .txt/dir); "
+                        "defaults to the 'validation' split of --data")
+    v.add_argument("--val-every", type=int, default=200,
+                   help="compute validation loss every N steps (0 disables)")
+    v.add_argument("--val-batches", type=int, default=10,
+                   help="max validation batches per validation run")
+    v.add_argument("--val-batch-size", type=int, default=None,
+                   help="validation batch size (defaults to --batch-size)")
+
     r = p.add_argument_group("run")
     r.add_argument("--steps", type=int, default=2000)
     r.add_argument("--device", choices=("cpu", "mps"), default=None)
@@ -211,6 +229,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     r.add_argument("--checkpoint", default=None,
                    help="where to save the distilled student (torch.save)")
     r.add_argument("--save-every", type=int, default=500)
+    r.add_argument("--resume", default=None,
+                   help="checkpoint to resume from (auto-resumes step, "
+                        "optimizer, and best-validation state)")
     return p.parse_args(argv)
 
 
@@ -243,29 +264,92 @@ def main(argv: list[str] | None = None) -> int:
           f"vocab={student_cfg.vocab_size} alpha={args.alpha} "
           f"T={args.temperature} device={device}")
 
-    stream = train_qat.iter_batches(
-        train_qat.tokenize_stream(args.data, tok, student_vocab, args.max_examples),
-        args.seq_len, args.batch_size, student_vocab,
-    )
-    ema: float | None = None
     step = 0
+    best_loss = float("inf")
+    if args.resume:
+        ckpt = train_qat.load_checkpoint(args.resume)
+        student.module.load_state_dict(ckpt["model"])
+        opt.load_state_dict(ckpt["optimizer"])
+        step = int(ckpt.get("step", 0))
+        best_loss = float(ckpt.get("best_loss", best_loss))
+        print(f"[distill] resumed from step {step} "
+              f"(best_loss={best_loss:.4f})")
+
+    loader = train_qat.StreamingTextDataloader(
+        args.data, tok, student_vocab, args.seq_len, args.batch_size,
+        max_examples=args.max_examples, seed=args.seed,
+    )
+
+    val_loader: train_qat.StreamingTextDataloader | None = None
+    val_every = args.val_every
+    if val_every > 0:
+        val_source = args.val_data or (
+            args.data if args.data.startswith(train_qat.HF_STREAM) else None
+        )
+        if val_source:
+            val_loader = train_qat.StreamingTextDataloader(
+                val_source, tok, student_vocab, args.seq_len,
+                args.val_batch_size or args.batch_size,
+                split="validation", seed=args.seed,
+            )
+            print(f"[val] streaming validation from {val_source} "
+                  f"(split=validation, batch={args.val_batch_size or args.batch_size}, "
+                  f"every {val_every} steps)")
+        else:
+            val_every = 0
+            print("[val] no validation source; pass --val-data or --data hf://<ds>")
+
+    best_path = train_qat.best_checkpoint_path(args.checkpoint)
+    ema: float | None = None
     loss = kd = ce = None
-    for batch in stream:
+    for batch in loader:
         loss, kd, ce = distill_step(
             student, opt, teacher, batch.to(device), args.alpha,
             args.temperature, student_cfg.vocab_size,
         )
         ema = loss if ema is None else 0.9 * ema + 0.1 * loss
         step += 1
+
+        candidate: float | None = None
+        if val_every and val_loader is not None and step % val_every == 0:
+            val_loss = train_qat.validate(
+                student, val_loader, device, args.val_batches
+            )
+            if val_loss is not None:
+                print(f"[val] step {step} val_loss={val_loss:.4f}")
+                candidate = val_loss
+            else:
+                print(f"[val] step {step} validation stream empty; "
+                      "disabling further validation")
+                val_every = 0
+        elif val_every == 0 and ema is not None and step % args.save_every == 0:
+            candidate = ema
+
+        if candidate is not None and candidate < best_loss:
+            best_loss = candidate
+            if best_path:
+                train_qat.save_checkpoint(
+                    best_path, student_cfg, student.module.state_dict(),
+                    opt.state_dict(), step, loss,
+                    extra={"teacher": teacher_meta, "alpha": args.alpha,
+                           "temperature": args.temperature,
+                           "best_loss": best_loss, "kind": "best"},
+                )
+                print(f"[distill] best checkpoint -> {best_path} "
+                      f"(best_loss={best_loss:.4f})")
+
         if step % args.log_every == 0 or step >= args.steps:
+            mem = mps_driver_allocated_bytes()
+            mem_str = f" mem={mem / 1e6:.0f}MB" if mem else ""
             print(f"[distill] step {step}/{args.steps} loss={loss:.4f} "
-                  f"kd={kd:.4f} ce={ce:.4f} ema={ema:.4f}")
+                  f"kd={kd:.4f} ce={ce:.4f} ema={ema:.4f}{mem_str}")
         if args.checkpoint and step % args.save_every == 0:
             train_qat.save_checkpoint(
                 args.checkpoint, student_cfg, student.module.state_dict(),
                 opt.state_dict(), step, loss,
                 extra={"teacher": teacher_meta, "alpha": args.alpha,
-                       "temperature": args.temperature},
+                       "temperature": args.temperature,
+                       "best_loss": best_loss},
             )
         if step >= args.steps:
             break
@@ -274,7 +358,8 @@ def main(argv: list[str] | None = None) -> int:
             args.checkpoint, student_cfg, student.module.state_dict(),
             opt.state_dict(), step, loss,
             extra={"teacher": teacher_meta, "alpha": args.alpha,
-                   "temperature": args.temperature},
+                   "temperature": args.temperature,
+                   "best_loss": best_loss},
         )
         print(f"[distill] student checkpoint -> {args.checkpoint}")
     if step == 0:

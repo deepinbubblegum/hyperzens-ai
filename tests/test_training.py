@@ -4,7 +4,10 @@ Verifies that the QAT training step (BitNetQAT + FP16MasterAdamW with dynamic
 activation scaling and cross-entropy) reduces loss over a small number of
 iterations on a dummy text batch, that the teacher-student distillation
 pipeline (KL + CE blend) also reduces loss, and that checkpointing and the
-byte-level streaming data loader behave correctly.
+byte-level streaming data loader behave correctly. Also covers the streaming
+HuggingFace dataset engine (``load_dataset(..., streaming=True)``, split
+fallback, token-buffer packing), the validation loop, ``checkpoint_best.pt``
+saving, and ``--resume`` continuation.
 """
 
 from __future__ import annotations
@@ -49,6 +52,16 @@ def _train_args(**overrides) -> dict:
 def _dummy_batch(batch: int = 4, seq: int = 8) -> torch.Tensor:
     torch.manual_seed(7)
     return torch.randint(0, VOCAB, (batch, seq))
+
+
+class _FakeDS:
+    """Minimal stand-in for a datasets IterableDataset (yields dict rows)."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __iter__(self):
+        return iter(self.rows)
 
 
 # --- QAT training loop ------------------------------------------------------
@@ -116,10 +129,176 @@ def test_tokenize_stream_from_file(tmp_path):
     assert sum(len(c) for c in chunks) == len("hello world " * 20)
 
 
-def test_tokenize_stream_hf_requires_datasets():
+def test_tokenize_stream_hf_streaming_split_fallback(monkeypatch):
+    """openwebtext has no validation split -> automatic 'test' fallback."""
+    calls = []
+
+    def fake_load_dataset(name, split="train", streaming=False, **kw):
+        calls.append((name, split, streaming))
+        if name == "openwebtext" and split == "validation":
+            raise ValueError("no 'validation' split")
+        return _FakeDS([{"text": "example text " * 5} for _ in range(10)])
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+    chunks = list(train_qat.tokenize_stream(
+        "hf://openwebtext", train_qat.ByteTokenizer(256), 256,
+        max_examples=2, split="validation",
+    ))
+    assert calls == [("openwebtext", "validation", True),
+                     ("openwebtext", "test", True)]
+    assert len(chunks) == 2
+    assert calls[1][1] == "test"
+
+
+def test_tokenize_stream_hf_train_split(monkeypatch):
+    calls = []
+
+    def fake_load_dataset(name, split="train", streaming=False, **kw):
+        calls.append((name, split, streaming))
+        return _FakeDS([{"text": "hello world " * 5} for _ in range(5)])
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+    chunks = list(train_qat.tokenize_stream(
+        "hf://roneneldan/TinyStories", train_qat.ByteTokenizer(256), 256,
+        max_examples=1,
+    ))
+    assert calls == [("roneneldan/TinyStories", "train", True)]
+    assert len(chunks) == 1
+
+
+def test_tokenize_stream_hf_no_streamable_split_exits(monkeypatch):
+    def fake_load_dataset(name, split="train", streaming=False, **kw):
+        raise ValueError(f"no '{split}' split")
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
     with pytest.raises(SystemExit):
-        list(train_qat.tokenize_stream("hf://roneneldan/TinyStories",
-                                       train_qat.ByteTokenizer(256), 256, max_examples=1))
+        list(train_qat.tokenize_stream(
+            "hf://roneneldan/TinyStories", train_qat.ByteTokenizer(256), 256,
+            max_examples=1,
+        ))
+
+
+def test_streaming_dataloader_packs_tokens_no_padding(tmp_path):
+    tok = train_qat.ByteTokenizer(256)
+    text = "the quick brown fox jumps over the lazy dog. " * 8
+    data = tmp_path / "train.txt"
+    data.write_text(text)
+    # 360 bytes -> 22 full 16-token windows -> 5 batches of 4 (2 partial rows dropped)
+    loader = train_qat.StreamingTextDataloader(
+        str(data), tok, 256, seq_len=16, batch_size=4,
+    )
+    batches = list(loader)
+    assert len(batches) == 5
+    for b in batches:
+        assert b.shape == (4, 16)
+
+
+def test_streaming_dataloader_drops_partial_batch(tmp_path):
+    tok = train_qat.ByteTokenizer(256)
+    data = tmp_path / "train.txt"
+    data.write_text("hello " * 9)  # 54 bytes -> 3 windows of 16, batch 2
+    loader = train_qat.StreamingTextDataloader(
+        str(data), tok, 256, seq_len=16, batch_size=2,
+    )
+    batches = list(loader)
+    assert len(batches) == 1
+    assert batches[0].shape == (2, 16)
+
+
+def test_streaming_dataloader_hf_source(monkeypatch):
+    def fake_load_dataset(name, split="train", streaming=False, **kw):
+        return _FakeDS([{"text": "streaming dataset text " * 4} for _ in range(20)])
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+    loader = train_qat.StreamingTextDataloader(
+        "hf://roneneldan/TinyStories", train_qat.ByteTokenizer(256), 256,
+        seq_len=8, batch_size=4,
+    )
+    batches = list(loader)
+    assert batches
+    assert batches[0].shape == (4, 8)
+    assert (batches[0] < 256).all()
+
+
+# --- validation / best checkpoint / resume -------------------------------------
+
+
+def test_validate_returns_mean_ce(tmp_path):
+    args = train_qat.parse_args(["--data", "x"])
+    cfg = train_qat.build_cfg(args)
+    qat, opt = train_qat.make_qat_model(cfg, torch.device("cpu"), fp16=False, lr=1e-3)
+    data = tmp_path / "val.txt"
+    data.write_text("the quick brown fox jumps over the lazy dog. " * 30)
+    loader = train_qat.StreamingTextDataloader(
+        str(data), train_qat.ByteTokenizer(256), 256, seq_len=8, batch_size=4,
+    )
+    val = train_qat.validate(qat, loader, torch.device("cpu"), max_batches=2)
+    batches = list(loader)
+    manual = sum(float(train_qat.next_token_loss(qat, b).detach())
+                 for b in batches[:2]) / 2
+    assert val == pytest.approx(manual)
+    assert val > 0
+
+
+def test_validate_empty_stream_returns_none(tmp_path):
+    args = train_qat.parse_args(["--data", "x"])
+    cfg = train_qat.build_cfg(args)
+    qat, _ = train_qat.make_qat_model(cfg, torch.device("cpu"), fp16=False, lr=1e-3)
+    empty = tmp_path / "empty.txt"
+    empty.write_text("")
+    loader = train_qat.StreamingTextDataloader(
+        str(empty), train_qat.ByteTokenizer(256), 256, seq_len=8, batch_size=4,
+    )
+    assert train_qat.validate(qat, loader, torch.device("cpu")) is None
+
+
+def test_best_checkpoint_path():
+    assert train_qat.best_checkpoint_path(None) is None
+    assert train_qat.best_checkpoint_path("runs/model.pt").endswith(
+        os.path.join("runs", "checkpoint_best.pt")
+    )
+    assert train_qat.best_checkpoint_path("model.pt").endswith("checkpoint_best.pt")
+
+
+def test_checkpoint_resume_restores_best_loss(tmp_path):
+    args = train_qat.parse_args(["--data", "x"])
+    cfg = train_qat.build_cfg(args)
+    qat, opt = train_qat.make_qat_model(cfg, torch.device("cpu"), fp16=False, lr=1e-3)
+    path = str(tmp_path / "ckpt.pt")
+    train_qat.save_checkpoint(path, cfg, qat.module.state_dict(), opt.state_dict(),
+                              step=7, loss=1.5, extra={"best_loss": 1.2})
+    ckpt = train_qat.load_checkpoint(path)
+    assert ckpt["step"] == 7
+    assert ckpt["best_loss"] == pytest.approx(1.2)
+
+
+def test_train_main_validation_best_checkpoint_and_resume(tmp_path, capsys):
+    """End-to-end: validation loop saves checkpoint_best.pt; --resume continues."""
+    train_txt = tmp_path / "train.txt"
+    val_txt = tmp_path / "val.txt"
+    train_txt.write_text("the quick brown fox jumps over the lazy dog. " * 30)
+    val_txt.write_text("a different validation paragraph about horses and stars. " * 12)
+    ckpt = str(tmp_path / "model.pt")
+    best = str(tmp_path / "checkpoint_best.pt")
+    common = [
+        "--data", str(train_txt), "--val-data", str(val_txt),
+        "--device", "cpu", "--tokenizer", "bytes",
+        "--d-model", "16", "--n-heads", "2", "--n-layers", "1", "--fff-depth", "1",
+        "--vocab-size", "256", "--max-seq-len", "32", "--seq-len", "8",
+        "--batch-size", "2", "--steps", "6", "--val-every", "3", "--val-batches", "2",
+        "--log-every", "3", "--save-every", "2", "--no-fp16", "--checkpoint", ckpt,
+    ]
+    assert train_qat.main(common) == 0
+    out = capsys.readouterr().out
+    assert "val_loss=" in out and "checkpoint_best.pt" in out
+    assert os.path.exists(best)
+    best_ckpt = train_qat.load_checkpoint(best)
+    assert best_ckpt["kind"] == "best"
+    assert best_ckpt["best_loss"] < float("inf")
+
+    assert train_qat.main(common + ["--resume", ckpt]) == 0
+    out = capsys.readouterr().out
+    assert "resumed from step" in out
 
 
 # --- checkpointing -----------------------------------------------------------

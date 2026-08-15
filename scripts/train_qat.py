@@ -8,14 +8,21 @@ held by :class:`FP16MasterAdamW` (all Adam math in FP32). The transformer's
 internal straight-through quantizers do the real BitNet work: per-token AbsMax
 activation scaling on attention/FFF inputs, and STE ternary leaf weights.
 
-Data can be streamed either from HuggingFace datasets
-(``--data hf://roneneldan/TinyStories``) or from local ``.txt`` files/dirs.
-Text is tokenized as bytes (GPT-2 style) when ``transformers`` is unavailable.
+Data is streamed lazily through :class:`StreamingTextDataloader` from
+HuggingFace datasets (``--data hf://roneneldan/TinyStories``,
+``--data hf://openwebtext``) or local ``.txt`` files/dirs, with token-buffer
+packing into fixed ``seq_len`` windows (no padding). A validation loop
+(``--val-data`` / ``--val-every``) tracks the best model into
+``checkpoint_best.pt``; ``--resume`` auto-continues from any saved checkpoint.
+Training-step logs include the MPS Unified Memory usage
+(``mps_driver_allocated_bytes``).
 
 Usage:
     python scripts/train_qat.py --data data/ --seq-len 64 --batch-size 8 --steps 2000
     python scripts/train_qat.py --data hf://roneneldan/TinyStories --steps 5000 \
         --d-model 256 --n-layers 4 --device mps
+    python scripts/train_qat.py --data hf://openwebtext --val-every 500 \
+        --checkpoint runs/qat.pt --resume runs/qat.pt
 """
 
 from __future__ import annotations
@@ -32,7 +39,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bitnet_fff.models import BitNetFFTConfig, BitNetFFTTransformer
-from bitnet_fff.mps_utils import is_mps_available
+from bitnet_fff.mps_utils import is_mps_available, mps_driver_allocated_bytes
 from bitnet_fff.qat import BitNetQAT
 from bitnet_fff.tokenizer import ByteTokenizer, BPETokenizer, load_tokenizer
 
@@ -47,12 +54,21 @@ def _encode_clamped(tokenizer, text: str, vocab_size: int) -> list[int]:
 
 
 def tokenize_stream(
-    source: str, tokenizer, vocab_size: int, max_examples: int | None = None
+    source: str,
+    tokenizer,
+    vocab_size: int,
+    max_examples: int | None = None,
+    split: str = "train",
+    seed: int = 0,
 ):
     """Yield lists of token ids from a text source.
 
     ``source`` is a ``.txt`` file, a directory of ``.txt`` files, or an
-    ``hf://`` dataset name (requires ``datasets``).
+    ``hf://`` dataset name streamed with ``datasets.load_dataset(...,
+    streaming=True)``. For HuggingFace sources ``split`` selects the stream
+    (``"train"`` / ``"validation"`` / ``"test"``); a validation split that does
+    not exist automatically falls back to ``"test"`` so the same dataset can
+    serve both training and validation.
     """
     count = 0
 
@@ -74,7 +90,20 @@ def tokenize_stream(
                 f"'{name}' requires the 'datasets' package; install it or use "
                 "a local text file/dir for --data"
             )
-        ds = load_dataset(name, split="train", streaming=True)
+        attempts = [split] + (["test"] if split != "train" else [])
+        ds = None
+        last_err: Exception | None = None
+        for s in attempts:
+            try:
+                ds = load_dataset(name, split=s, streaming=True)
+                break
+            except Exception as e:  # missing/unsupported split, bad shard, ...
+                last_err = e
+        if ds is None:
+            raise SystemExit(
+                f"dataset {name!r}: no streamable split in {attempts} "
+                f"({last_err})"
+            )
         for example in ds:
             if max_examples is not None and count >= max_examples:
                 break
@@ -112,6 +141,63 @@ def iter_batches(token_stream, seq_len: int, batch_size: int, vocab_size: int):
             if len(rows) == batch_size:
                 yield torch.tensor(rows, dtype=torch.long)
                 rows = []
+
+
+class StreamingTextDataloader:
+    """Stream text chunks and pack tokens into fixed-window batches.
+
+    A :term:`streaming dataloader`: text is pulled lazily from the source (a
+    HuggingFace dataset via ``load_dataset(..., streaming=True)``, a ``.txt``
+    file, or a directory of ``.txt`` files), tokenized, and **packed** into
+    non-overlapping ``seq_len`` windows grouped into ``(batch_size, seq_len)``
+    long tensors. Windows never straddle the batch boundary and no padding is
+    added — a trailing partial window or an incomplete final batch is dropped.
+    Re-iterating a loader starts a fresh stream, so the same instance can be
+    used for repeated validation passes.
+
+    Args:
+        source: ``hf://<dataset>``, a ``.txt`` file, or a directory.
+        tokenizer: object with ``encode(str) -> list[int]``.
+        vocab_size: clamp token ids below this bound.
+        seq_len: fixed sequence-window length per row.
+        batch_size: rows per yielded batch.
+        split: dataset split to stream (ignored for local files).
+        max_examples: cap the number of tokenized text examples.
+        seed: reserved for reproducibility (streams are consumed in order).
+    """
+
+    def __init__(
+        self,
+        source: str,
+        tokenizer,
+        vocab_size: int,
+        seq_len: int,
+        batch_size: int,
+        split: str = "train",
+        max_examples: int | None = None,
+        seed: int = 0,
+    ) -> None:
+        self.source = source
+        self.tokenizer = tokenizer
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+        self.batch_size = batch_size
+        self.split = split
+        self.max_examples = max_examples
+        self.seed = seed
+
+    def __iter__(self):
+        stream = tokenize_stream(
+            self.source,
+            self.tokenizer,
+            self.vocab_size,
+            self.max_examples,
+            split=self.split,
+            seed=self.seed,
+        )
+        yield from iter_batches(
+            stream, self.seq_len, self.batch_size, self.vocab_size
+        )
 
 
 def build_cfg(args: argparse.Namespace) -> BitNetFFTConfig:
@@ -161,17 +247,53 @@ def make_qat_model(
     return qat, optimizer
 
 
+def next_token_loss(qat: BitNetQAT, input_ids: torch.Tensor) -> torch.Tensor:
+    """Next-token cross-entropy over the logits vs the shifted ids."""
+    logits = qat(input_ids)
+    vocab = logits.shape[-1]
+    return F.cross_entropy(
+        logits[:, :-1].reshape(-1, vocab).float(), input_ids[:, 1:].reshape(-1)
+    )
+
+
 def train_step(qat: BitNetQAT, optimizer, input_ids: torch.Tensor) -> float:
     """One next-token-prediction QAT step; returns the CE loss."""
     optimizer.zero_grad()
-    logits = qat(input_ids)
-    vocab = logits.shape[-1]
-    loss = F.cross_entropy(
-        logits[:, :-1].reshape(-1, vocab).float(), input_ids[:, 1:].reshape(-1)
-    )
+    loss = next_token_loss(qat, input_ids)
     loss.backward()
     optimizer.step()
     return float(loss.item())
+
+
+def validate(
+    qat: BitNetQAT,
+    dataloader: StreamingTextDataloader,
+    device: torch.device,
+    max_batches: int = 10,
+) -> float | None:
+    """Mean next-token CE loss over a validation stream (no grads).
+
+    Returns ``None`` when the validation stream yields no batches (e.g. the
+    requested split does not exist), letting the caller disable validation.
+    """
+    total = 0.0
+    count = 0
+    with torch.no_grad():
+        for i, batch in enumerate(dataloader):
+            if i >= max_batches:
+                break
+            total += float(next_token_loss(qat, batch.to(device)).item())
+            count += 1
+    return total / count if count else None
+
+
+def best_checkpoint_path(checkpoint: str | None) -> str | None:
+    """Path for ``checkpoint_best.pt`` next to ``checkpoint`` (or ``None``)."""
+    if not checkpoint:
+        return None
+    return os.path.join(
+        os.path.dirname(os.path.abspath(checkpoint)) or ".", "checkpoint_best.pt"
+    )
 
 
 def save_checkpoint(
@@ -240,6 +362,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     d.add_argument("--max-examples", type=int, default=None,
                    help="cap streamed examples")
 
+    v = p.add_argument_group("validation")
+    v.add_argument("--val-data", default=None,
+                   help="validation source (hf://<ds> or local .txt/dir); "
+                        "defaults to the 'validation' split of --data")
+    v.add_argument("--val-every", type=int, default=200,
+                   help="compute validation loss every N steps (0 disables)")
+    v.add_argument("--val-batches", type=int, default=10,
+                   help="max validation batches per validation run")
+    v.add_argument("--val-batch-size", type=int, default=None,
+                   help="validation batch size (defaults to --batch-size)")
+    v.add_argument("--val-max-examples", type=int, default=None,
+                   help="cap streamed validation examples")
+
     t = p.add_argument_group("run")
     t.add_argument("--steps", type=int, default=2000)
     t.add_argument("--device", choices=("cpu", "mps"), default=None)
@@ -247,7 +382,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     t.add_argument("--log-every", type=int, default=10)
     t.add_argument("--save-every", type=int, default=500)
     t.add_argument("--checkpoint", default=None, help="output checkpoint path")
-    t.add_argument("--resume", default=None, help="checkpoint to resume from")
+    t.add_argument("--resume", default=None,
+                   help="checkpoint to resume from (auto-resumes step, "
+                        "optimizer, and best-validation state)")
     return p.parse_args(argv)
 
 
@@ -278,34 +415,88 @@ def main(argv: list[str] | None = None) -> int:
           f"quant_mode={args.quant_mode} device={device}")
 
     step = 0
+    best_loss = float("inf")
     if args.resume:
         ckpt = load_checkpoint(args.resume)
         qat.module.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
-        step = int(ckpt["step"])
-        print(f"[qat] resumed from step {step}")
+        step = int(ckpt.get("step", 0))
+        best_loss = float(ckpt.get("best_loss", best_loss))
+        print(f"[qat] resumed from step {step} "
+              f"(best_loss={best_loss:.4f})")
 
-    stream = iter_batches(
-        tokenize_stream(args.data, tok, cfg.vocab_size, args.max_examples),
-        args.seq_len, args.batch_size, cfg.vocab_size,
+    loader = StreamingTextDataloader(
+        args.data, tok, cfg.vocab_size, args.seq_len, args.batch_size,
+        max_examples=args.max_examples, seed=args.seed,
     )
+
+    val_loader: StreamingTextDataloader | None = None
+    val_every = args.val_every
+    if val_every > 0:
+        val_source = args.val_data or (
+            args.data if args.data.startswith(HF_STREAM) else None
+        )
+        if val_source:
+            val_loader = StreamingTextDataloader(
+                val_source, tok, cfg.vocab_size, args.seq_len,
+                args.val_batch_size or args.batch_size,
+                split="validation",
+                max_examples=args.val_max_examples, seed=args.seed,
+            )
+            print(f"[val] streaming validation from {val_source} "
+                  f"(split=validation, batch={args.val_batch_size or args.batch_size}, "
+                  f"every {val_every} steps)")
+        else:
+            val_every = 0
+            print("[val] no validation source; pass --val-data or --data hf://<ds>")
+
+    best_path = best_checkpoint_path(args.checkpoint)
     losses: list[float] = []
     ema: float | None = None
-    for batch in stream:
+    for batch in loader:
         loss = train_step(qat, opt, batch.to(device))
         losses.append(loss)
         ema = loss if ema is None else 0.9 * ema + 0.1 * loss
         step += 1
+
+        candidate: float | None = None
+        if val_every and val_loader is not None and step % val_every == 0:
+            val_loss = validate(qat, val_loader, device, args.val_batches)
+            if val_loss is not None:
+                print(f"[val] step {step} val_loss={val_loss:.4f}")
+                candidate = val_loss
+            else:
+                print(f"[val] step {step} validation stream empty; "
+                      "disabling further validation")
+                val_every = 0
+        elif val_every == 0 and ema is not None and step % args.save_every == 0:
+            candidate = ema
+
+        if candidate is not None and candidate < best_loss:
+            best_loss = candidate
+            if best_path:
+                save_checkpoint(
+                    best_path, cfg, qat.module.state_dict(), opt.state_dict(),
+                    step, loss, extra={"best_loss": best_loss, "kind": "best"},
+                )
+                print(f"[qat] best checkpoint -> {best_path} "
+                      f"(best_loss={best_loss:.4f})")
+
         if step % args.log_every == 0 or step >= args.steps:
-            print(f"[qat] step {step}/{args.steps} loss={loss:.4f} ema={ema:.4f}")
+            mem = mps_driver_allocated_bytes()
+            mem_str = f" mem={mem / 1e6:.0f}MB" if mem else ""
+            print(f"[qat] step {step}/{args.steps} loss={loss:.4f} "
+                  f"ema={ema:.4f}{mem_str}")
         if args.checkpoint and step % args.save_every == 0:
             save_checkpoint(args.checkpoint, cfg, qat.module.state_dict(),
-                            opt.state_dict(), step, loss)
+                            opt.state_dict(), step, loss,
+                            extra={"best_loss": best_loss})
         if step >= args.steps:
             break
     if args.checkpoint:
         save_checkpoint(args.checkpoint, cfg, qat.module.state_dict(),
-                        opt.state_dict(), step, losses[-1] if losses else None)
+                        opt.state_dict(), step, losses[-1] if losses else None,
+                        extra={"best_loss": best_loss})
         print(f"[qat] checkpoint -> {args.checkpoint}")
     final_loss = losses[-1] if losses else None
     print(f"[qat] done: {step} steps, "
