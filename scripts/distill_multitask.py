@@ -179,34 +179,44 @@ def _amp_autocast(device: torch.device) -> object:
     return contextlib.nullcontext()
 
 
-def _amp_step(scaler, optimizer, params, max_norm: float = 1.0) -> None:
+def _amp_step(scaler, optimizer, model, max_norm: float = 1.0) -> None:
     """Unscale -> clip -> step with GradScaler semantics.
 
-    ``GradScaler.step()`` cannot drive the QAT ``FP16MasterAdamW`` directly
-    (it is not a ``torch.optim.Optimizer``: it has no ``param_groups``), so
-    the scale bookkeeping lives in the scaler while the unscale/step is applied
-    manually. If an unscaled gradient is non-finite the optimizer step is
-    skipped and the scale is halved. On MPS/CPU the scaler is disabled and this
-    is a plain clip-then-step.
+    1. Call scaler.unscale_(optimizer) if enabled.
+    2. Perform torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm).
+    3. Call scaler.step(optimizer).
+    4. Call scaler.update().
     """
+    params = list(model.parameters()) if hasattr(model, "parameters") else list(model)
     if not scaler.is_enabled():
         torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
         optimizer.step()
         return
-    scale = scaler.get_scale()
-    inv_scale = 1.0 / scale
-    found_inf = False
-    for p in params:
-        if p.grad is not None:
-            p.grad.mul_(inv_scale)
-            if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
-                found_inf = True
-    if found_inf:
-        scaler.update(new_scale=scale * 0.5)
-        return
+
+    if hasattr(scaler, "unscale_"):
+        scaler.unscale_(optimizer)
+    elif hasattr(scaler, "get_scale"):
+        scale = scaler.get_scale()
+        inv_scale = 1.0 / scale
+        found_inf = False
+        for p in params:
+            if p.grad is not None:
+                p.grad.mul_(inv_scale)
+                if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                    found_inf = True
+        if found_inf:
+            scaler.update(new_scale=scale * 0.5)
+            return
+
     torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
-    optimizer.step()
-    scaler.update()
+
+    if hasattr(scaler, "step"):
+        scaler.step(optimizer)
+    else:
+        optimizer.step()
+
+    if hasattr(scaler, "update"):
+        scaler.update()
 
 
 def accum_step(
@@ -240,9 +250,12 @@ def accum_step(
     """
     if scaler is None:
         scaler = torch.amp.GradScaler("cuda", enabled=False)
+    if not batches:
+        raise RuntimeError("accum_step requires at least one micro-batch")
+
+    # zero_grad is called only at the start of the accumulation cycle
     optimizer.zero_grad()
     loss_acc = kd_acc = ce_acc = 0.0
-    n = 0
     for batch in batches:
         with _amp_autocast(batch.device):
             t_logits = distill_mod.teacher_logits(teacher, batch)
@@ -258,10 +271,11 @@ def accum_step(
         loss_acc += float(loss.item())
         kd_acc += float(kd.item())
         ce_acc += float(ce.item())
-        n += 1
-    _amp_step(scaler, optimizer, student.parameters(), max_norm=1.0)
-    if n == 0:
-        raise RuntimeError("accum_step requires at least one micro-batch")
+
+    # _amp_step is called only at the end of the gradient accumulation cycle
+    params = list(student.parameters())
+    _amp_step(scaler, optimizer, params, max_norm=1.0)
+    n = len(batches)
     return loss_acc / n, kd_acc / n, ce_acc / n
 
 

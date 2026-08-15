@@ -159,6 +159,7 @@ class FP16MasterAdamW:
         self.eps = eps
         self.weight_decay = weight_decay
         self.clip_grad_norm = clip_grad_norm
+        self.param_groups = [{"params": self.params, "lr": lr, "weight_decay": weight_decay}]
         self.state: dict = {}
         self.steps = 0
 

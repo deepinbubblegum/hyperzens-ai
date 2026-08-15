@@ -252,6 +252,77 @@ def test_amp_step_skips_step_on_inf_grads():
     assert scaler.updated == 2.0  # scale halved on non-finite grads
 
 
+def test_amp_step_accepts_model_or_generator(monkeypatch):
+    student = _student()
+    opt = torch.optim.AdamW(student.parameters(), lr=1e-3)
+    scaler = _FakeEnabledScaler()
+    monkeypatch.setattr(
+        "torch.nn.utils.clip_grad_norm_",
+        lambda params, max_norm: torch.tensor(1.0),
+    )
+    for p in student.parameters():
+        p.grad = torch.full_like(p, 1.0)
+
+    # Test with model instance
+    mod._amp_step(scaler, opt, student, max_norm=1.0)
+
+    # Test with generator
+    for p in student.parameters():
+        p.grad = torch.full_like(p, 1.0)
+    mod._amp_step(scaler, opt, student.parameters(), max_norm=1.0)
+
+
+def test_amp_step_calls_scaler_unscale_and_step(monkeypatch):
+    student = _student()
+    opt = torch.optim.AdamW(student.parameters(), lr=1e-3)
+    events = []
+
+    class _MockScaler:
+        def is_enabled(self):
+            return True
+
+        def unscale_(self, optimizer):
+            events.append("unscale")
+
+        def step(self, optimizer):
+            events.append("step")
+
+        def update(self):
+            events.append("update")
+
+    monkeypatch.setattr(
+        "torch.nn.utils.clip_grad_norm_",
+        lambda params, max_norm: events.append("clip") or torch.tensor(1.0),
+    )
+
+    scaler = _MockScaler()
+    mod._amp_step(scaler, opt, student, max_norm=1.0)
+    assert events == ["unscale", "clip", "step", "update"]
+
+
+def test_accum_step_zero_grad_and_amp_step_boundary(monkeypatch):
+    student = _student()
+    teacher = _teacher()
+    opt = torch.optim.AdamW(student.parameters(), lr=1e-3)
+    zero_grad_calls = []
+    amp_step_calls = []
+
+    orig_zero = opt.zero_grad
+    opt.zero_grad = lambda: zero_grad_calls.append(1) or orig_zero()
+
+    orig_amp = mod._amp_step
+    monkeypatch.setattr(
+        mod, "_amp_step",
+        lambda scaler, optimizer, model, max_norm=1.0: amp_step_calls.append(1) or orig_amp(scaler, optimizer, model, max_norm)
+    )
+
+    batches = [_batch(n=2), _batch(n=2), _batch(n=2)]
+    mod.accum_step(student, opt, teacher, batches, 0.7, 2.0, 64, grad_accum=3)
+
+    assert len(zero_grad_calls) == 1, "zero_grad must be called only once per accumulation cycle"
+    assert len(amp_step_calls) == 1, "_amp_step must be called only once per accumulation cycle"
+
+
 def test_main_compile_wraps_student(monkeypatch, tmp_path, capsys):
     compiled = {}
     monkeypatch.setattr(
