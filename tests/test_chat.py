@@ -9,6 +9,7 @@ stats. Plus a subprocess smoke test of the interactive loop driven from stdin.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import os
 import subprocess
@@ -117,6 +118,117 @@ def test_format_stats():
     )
     assert "12 tokens" in s
     assert "tok/s" in s and "ms/token" in s and "0.50 s" in s
+
+
+# --- checkpoint architecture config ------------------------------------------
+
+
+def _save_ckpt(tmp_path, name, cfg, with_config=True):
+    tok = _byte_tok()
+    bound = cfg.bind_tokenizer(tok)
+    model = BitNetFFTTransformer(bound)
+    path = tmp_path / name
+    payload = {"model": model.state_dict()}
+    if with_config:
+        payload["config"] = dataclasses.asdict(bound)
+    torch.save(payload, path)
+    return str(path), bound
+
+
+def test_checkpoint_config_reconstructs_architecture():
+    mod = _load_chat_module()
+    cfg = BitNetFFTConfig(
+        vocab_size=256, d_model=16, n_heads=2, n_layers=1, fff_depth=1,
+        max_seq_len=32, tie_weights=True,
+    ).bind_tokenizer(_byte_tok())
+    saved = dataclasses.asdict(cfg)
+    assert mod._checkpoint_config({"config": saved}).d_model == 16
+    assert mod._checkpoint_config({"config": saved}).n_layers == 1
+    assert mod._checkpoint_config({"config": saved}).fff_depth == 1
+
+
+def test_checkpoint_config_drops_unknown_keys():
+    mod = _load_chat_module()
+    cfg = BitNetFFTConfig(
+        vocab_size=256, d_model=16, n_heads=2, n_layers=1, max_seq_len=32,
+    ).bind_tokenizer(_byte_tok())
+    saved = dataclasses.asdict(cfg)
+    saved["some_future_field"] = 999
+    assert mod._checkpoint_config({"config": saved}).d_model == 16
+
+
+def test_checkpoint_config_none_without_config_key():
+    mod = _load_chat_module()
+    assert mod._checkpoint_config({"model": {}}) is None
+    assert mod._checkpoint_config({}) is None
+
+
+def test_main_loads_architecture_from_checkpoint(monkeypatch, tmp_path, capsys):
+    mod = _load_chat_module()
+    cfg = BitNetFFTConfig(
+        vocab_size=256, d_model=16, n_heads=2, n_layers=1, fff_depth=1,
+        max_seq_len=32,
+    )
+    path, _ = _save_ckpt(tmp_path, "arch.pt", cfg)
+    monkeypatch.setattr("builtins.input", lambda _: "/quit")
+    rc = mod.main([
+        "--device", "cpu", "--tokenizer", "bytes", "--vocab-size", "256",
+        "--max-new-tokens", "8", "--checkpoint", path,
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "architecture loaded from checkpoint" in out
+    assert "d_model=16" in out and "n_layers=1" in out and "fff_depth=1" in out
+    assert "max_seq_len=32" in out
+
+
+def test_main_checkpoint_config_overrides_cli_flags(monkeypatch, tmp_path, capsys):
+    mod = _load_chat_module()
+    cfg = BitNetFFTConfig(
+        vocab_size=256, d_model=16, n_heads=2, n_layers=1, fff_depth=1,
+        max_seq_len=32,
+    )
+    path, _ = _save_ckpt(tmp_path, "arch.pt", cfg)
+    monkeypatch.setattr("builtins.input", lambda _: "/quit")
+    rc = mod.main([
+        "--device", "cpu", "--tokenizer", "bytes", "--vocab-size", "256",
+        "--max-new-tokens", "8", "--checkpoint", path,
+        "--d-model", "128", "--n-layers", "4", "--fff-depth", "3",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "d_model=16" in out and "n_layers=1" in out and "fff_depth=1" in out
+    assert "[cfg] architecture loaded from checkpoint" in out
+
+
+def test_main_plain_state_dict_uses_cli_arch(monkeypatch, tmp_path, capsys):
+    mod = _load_chat_module()
+    cfg = BitNetFFTConfig(vocab_size=256, d_model=32, n_heads=2, n_layers=1,
+                          max_seq_len=64)
+    path, _ = _save_ckpt(tmp_path, "plain.pt", cfg, with_config=False)
+    monkeypatch.setattr("builtins.input", lambda _: "/quit")
+    rc = mod.main([
+        "--device", "cpu", "--tokenizer", "bytes", "--vocab-size", "256",
+        "--d-model", "32", "--n-heads", "2", "--n-layers", "1",
+        "--max-seq-len", "64", "--max-new-tokens", "8", "--checkpoint", path,
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "architecture loaded from checkpoint" not in out
+    assert "d_model=32" in out
+
+
+def test_main_rejects_max_new_tokens_vs_checkpoint_seq_len(tmp_path):
+    mod = _load_chat_module()
+    cfg = BitNetFFTConfig(
+        vocab_size=256, d_model=16, n_heads=2, n_layers=1, max_seq_len=16,
+    )
+    path, _ = _save_ckpt(tmp_path, "small.pt", cfg)
+    with pytest.raises(SystemExit):
+        mod.main([
+            "--device", "cpu", "--tokenizer", "bytes", "--vocab-size", "256",
+            "--max-new-tokens", "32", "--checkpoint", path,
+        ])
 
 
 # --- CLI smoke test ----------------------------------------------------------

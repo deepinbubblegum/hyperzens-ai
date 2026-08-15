@@ -13,6 +13,12 @@ Usage:
         --max-new-tokens 96 --system "You are a helpful assistant."
     python scripts/chat.py --device cpu --tokenizer bytes  # offline fallback
 
+When ``--checkpoint`` points to a checkpoint saved by ``train_qat`` (which
+embeds the full ``BitNetFFTConfig`` as ``"config"``), the architecture is
+restored from the checkpoint automatically, so no ``--d-model``/``--n-layers``/
+``--fff-depth`` flags are needed. Explicit CLI architecture flags are then
+ignored; ``--no-fast-inference`` still overrides the fused-kernel path.
+
 Commands inside the chat: ``/help``, ``/reset``, ``/quit`` (or ``/exit``).
 """
 
@@ -42,15 +48,36 @@ def build_model(
     cfg: BitNetFFTConfig,
     device: torch.device,
     checkpoint: str | None = None,
+    state: dict | None = None,
 ) -> BitNetFFTTransformer:
     model = BitNetFFTTransformer(cfg).to(device)
-    if checkpoint:
-        state = torch.load(checkpoint, map_location=device)
+    if checkpoint or state is not None:
+        if state is None:
+            state = torch.load(checkpoint, map_location=device)
         state = state.get("model", state)
         model.load_state_dict(state)
         print(f"[model] loaded checkpoint {checkpoint}")
     model.eval()
     return model
+
+
+def _checkpoint_config(state: dict) -> BitNetFFTConfig | None:
+    """Rebuild a :class:`BitNetFFTConfig` from a checkpoint's ``"config"`` dict.
+
+    Checkpoints saved by ``train_qat.save_checkpoint`` store the full config
+    (``dataclasses.asdict``), so the architecture (``d_model``, ``n_heads``,
+    ``n_layers``, ``fff_depth``, ``max_seq_len``, ...) can be recovered without
+    passing CLI flags. Unknown or ``None`` keys are dropped so older checkpoints
+    stay compatible.
+    """
+    saved = state.get("config")
+    if not isinstance(saved, dict):
+        return None
+    allowed = set(BitNetFFTConfig.__dataclass_fields__)
+    known = {k: v for k, v in saved.items() if k in allowed and v is not None}
+    if not known:
+        return None
+    return BitNetFFTConfig(**known)
 
 
 def build_history_prompt(
@@ -244,26 +271,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    device = torch.device(
-        args.device or ("mps" if is_mps_available() else "cpu")
-    )
-    torch.manual_seed(args.seed)
-
-    if args.max_new_tokens >= args.max_seq_len:
-        raise SystemExit(
-            f"--max-new-tokens ({args.max_new_tokens}) must be < "
-            f"--max-seq-len ({args.max_seq_len})"
-        )
-
-    tok = load_tokenizer(args.tokenizer, args.vocab_size)
-    if hasattr(tok, "name"):
-        print(f"[tokenizer] BPE {tok.name} vocab={tok.vocab_size}")
-    else:
-        print(f"[tokenizer] {tok}")
-
-    cfg = BitNetFFTConfig(
+def _cfg_from_args(args: argparse.Namespace, tok) -> BitNetFFTConfig:
+    return BitNetFFTConfig(
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
@@ -276,7 +285,48 @@ def main(argv: list[str] | None = None) -> int:
         use_fast_inference=not args.no_fast_inference,
         tie_weights=args.tie_weights,
     ).bind_tokenizer(tok)
-    model = build_model(cfg, device, args.checkpoint)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    device = torch.device(
+        args.device or ("mps" if is_mps_available() else "cpu")
+    )
+    torch.manual_seed(args.seed)
+
+    tok = load_tokenizer(args.tokenizer, args.vocab_size)
+    if hasattr(tok, "name"):
+        print(f"[tokenizer] BPE {tok.name} vocab={tok.vocab_size}")
+    else:
+        print(f"[tokenizer] {tok}")
+
+    ckpt_state: dict | None = None
+    cfg: BitNetFFTConfig | None = None
+    if args.checkpoint:
+        ckpt_state = torch.load(args.checkpoint, map_location=device)
+        cfg = _checkpoint_config(ckpt_state)
+        if cfg is not None:
+            saved_vocab = cfg.vocab_size
+            cfg.use_fast_inference = not args.no_fast_inference
+            cfg = cfg.bind_tokenizer(tok)
+            print(f"[cfg] architecture loaded from checkpoint "
+                  f"(d_model={cfg.d_model} n_heads={cfg.n_heads} "
+                  f"n_layers={cfg.n_layers} fff_depth={cfg.fff_depth} "
+                  f"max_seq_len={cfg.max_seq_len} vocab={cfg.vocab_size} "
+                  f"tie_weights={cfg.tie_weights})")
+            if saved_vocab != tok.vocab_size:
+                print(f"[cfg] WARNING: checkpoint vocab_size={saved_vocab} "
+                      f"!= tokenizer vocab_size={tok.vocab_size}")
+    if cfg is None:
+        cfg = _cfg_from_args(args, tok)
+
+    if args.max_new_tokens >= cfg.max_seq_len:
+        raise SystemExit(
+            f"--max-new-tokens ({args.max_new_tokens}) must be < "
+            f"max-seq-len ({cfg.max_seq_len})"
+        )
+
+    model = build_model(cfg, device, args.checkpoint, state=ckpt_state)
     print(f"[model] params={sum(p.numel() for p in model.parameters()):,}")
 
     if args.eos_token_id is None:
