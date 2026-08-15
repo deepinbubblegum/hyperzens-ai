@@ -59,6 +59,9 @@ class BitNetFFTConfig:
             path when available (falls back to the reference path otherwise).
         eps: numerical stability for quantizers.
         attention_activation_bits: ``None`` to reuse ``activation_bits``.
+        bos_token_id / eos_token_id / pad_token_id: special token ids bound
+            from the tokenizer via :meth:`bind_tokenizer` (used by
+            :meth:`BitNetFFTTransformer.generate` as the default eos).
     """
 
     vocab_size: int = 256
@@ -78,6 +81,9 @@ class BitNetFFTConfig:
     eps: float = 1e-8
     attention_activation_bits: int | None = None
     chunk_size: int | None = None
+    bos_token_id: int | None = None
+    eos_token_id: int | None = None
+    pad_token_id: int | None = None
 
     @property
     def fff_out(self) -> int:
@@ -86,6 +92,31 @@ class BitNetFFTConfig:
     @property
     def fff_capacity(self) -> int:
         return (1 << self.fff_depth) * self.fff_out
+
+    def bind_tokenizer(self, tokenizer) -> "BitNetFFTConfig":
+        """Bind ``vocab_size`` (+ special token ids) from a tokenizer.
+
+        Works with any object exposing ``vocab_size`` / ``bos_token_id`` /
+        ``eos_token_id`` / ``pad_token_id`` (e.g.
+        :class:`bitnet_fff.tokenizer.BPETokenizer` or the byte fallback), so a
+        model can be built directly against the tokenizer that will feed it.
+        """
+        vocab = int(getattr(tokenizer, "vocab_size", self.vocab_size))
+        if vocab <= 0:
+            raise ValueError(f"tokenizer.vocab_size must be > 0, got {vocab}")
+        self.vocab_size = vocab
+        self.bos_token_id = getattr(tokenizer, "bos_token_id", None)
+        self.eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        self.pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        return self
+
+    @classmethod
+    def from_tokenizer(
+        cls, tokenizer, **overrides
+    ) -> "BitNetFFTConfig":
+        """Build a config with ``vocab_size`` bound from ``tokenizer``."""
+        cfg = cls(**overrides)
+        return cfg.bind_tokenizer(tokenizer)
 
 
 @dataclass
@@ -527,6 +558,8 @@ class BitNetFFTTransformer(nn.Module):
             raise ValueError(f"max_new_tokens must be >= 1, got {max_new_tokens}")
         if self.embed is None or self.head is None:
             raise ValueError("generate() requires a token model (vocab_size > 0)")
+        if eos_token_id is None:
+            eos_token_id = self.cfg.eos_token_id
 
         was_training = self.training
         self.eval()

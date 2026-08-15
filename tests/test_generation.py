@@ -199,8 +199,8 @@ def _load_script_module():
 
 def test_byte_tokenizer_fallback_roundtrip():
     mod = _load_script_module()
-    tok, is_hf = mod.load_tokenizer(None, 256)
-    assert not is_hf
+    tok = mod.load_tokenizer("bytes", 256)
+    assert isinstance(tok, mod.ByteTokenizer)
     ids = tok.encode("héllo wörld")
     assert tok.decode(ids) == "héllo wörld"
     assert all(0 <= i < 256 for i in ids)
@@ -208,7 +208,7 @@ def test_byte_tokenizer_fallback_roundtrip():
 
 def test_byte_tokenizer_vocab_too_small_raises():
     mod = _load_script_module()
-    tok, _ = mod.load_tokenizer(None, 64)
+    tok = mod.load_tokenizer("bytes", 64)
     with pytest.raises(ValueError):
         tok.encode("hello world")  # 'w' == byte 119 >= 64
 
@@ -231,6 +231,7 @@ def test_cli_generates_and_reports_decode_benchmark():
         [
             sys.executable, "scripts/generate.py",
             "--device", "cpu",
+            "--tokenizer", "bytes",
             "--d-model", "32", "--n-heads", "2", "--n-layers", "1",
             "--fff-depth", "2", "--vocab-size", "256",
             "--max-seq-len", "48",

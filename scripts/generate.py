@@ -33,57 +33,7 @@ from bitnet_fff.models import (
     _sample_from_logits,
 )
 from bitnet_fff.mps_utils import is_mps_available, mps_synchronize
-
-
-class ByteTokenizer:
-    """Byte-level fallback tokenizer (GPT-2 style: id <-> raw UTF-8 byte).
-
-    Used when ``transformers`` is not installed or ``--tokenizer`` is omitted.
-    Each id is a byte (0..255), so ``vocab_size`` must be at least 256 for
-    arbitrary UTF-8 text; shorter vocabularies truncate per-id silently via the
-    caller's clamping.
-    """
-
-    def __init__(self, vocab_size: int) -> None:
-        self.vocab_size = vocab_size
-
-    def encode(self, text: str) -> list[int]:
-        ids = list(text.encode("utf-8"))
-        if any(i >= self.vocab_size for i in ids):
-            raise ValueError(
-                f"text byte {max(ids)} >= vocab_size {self.vocab_size}; "
-                "raise --vocab-size (>= 256) or pass --tokenizer"
-            )
-        return ids
-
-    def decode(self, ids) -> str:
-        return bytes(int(i) for i in ids).decode("utf-8", errors="replace")
-
-    def __repr__(self) -> str:
-        return f"ByteTokenizer(vocab_size={self.vocab_size})"
-
-
-def load_tokenizer(
-    name: str | None, vocab_size: int
-) -> tuple[object, bool]:
-    """Load a HuggingFace tokenizer or fall back to the byte-level one.
-
-    Returns ``(tokenizer, is_hf)`` where ``is_hf`` is ``True`` only when a real
-    ``transformers`` tokenizer was loaded.
-    """
-    if not name:
-        return ByteTokenizer(vocab_size), False
-    try:
-        from transformers import AutoTokenizer
-    except ImportError:
-        print(
-            "[tokenizer] 'transformers' is not installed; "
-            "falling back to the byte-level tokenizer",
-            file=sys.stderr,
-        )
-        return ByteTokenizer(vocab_size), False
-    tok = AutoTokenizer.from_pretrained(name)
-    return tok, True
+from bitnet_fff.tokenizer import BPETokenizer, ByteTokenizer, load_tokenizer
 
 
 def build_model(
@@ -195,7 +145,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     t = p.add_argument_group("tokenizer")
     t.add_argument("--tokenizer", default=None,
-                   help="HuggingFace tokenizer name (e.g. 'gpt2'); byte fallback if unset")
+                   help="HuggingFace tokenizer name (default gpt2 BPE; "
+                        "'bytes' for the byte-level fallback)")
 
     s = p.add_argument_group("generation")
     s.add_argument("--prompt", default="The quick brown fox jumps over the lazy dog.")
@@ -217,11 +168,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     torch.manual_seed(args.seed)
 
-    tok, is_hf = load_tokenizer(args.tokenizer, args.vocab_size)
-    print(f"[tokenizer] {'HF:' + str(args.tokenizer) if is_hf else repr(tok)}")
+    tok = load_tokenizer(args.tokenizer, args.vocab_size)
+    is_hf = isinstance(tok, BPETokenizer)
+    if is_hf:
+        print(f"[tokenizer] BPE {tok.name} vocab={tok.vocab_size}")
+    else:
+        print(f"[tokenizer] {tok}")
 
     cfg = BitNetFFTConfig(
-        vocab_size=args.vocab_size,
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
@@ -233,21 +187,21 @@ def main(argv: list[str] | None = None) -> int:
         fff_bias=not args.no_fff_bias,
         use_fast_inference=not args.no_fast_inference,
         tie_weights=args.tie_weights,
-    )
+    ).bind_tokenizer(tok)
     model = build_model(cfg, device, args.checkpoint)
 
     eos = args.eos_token_id
-    if eos is None and is_hf and getattr(tok, "eos_token_id", None) is not None:
-        eos = int(tok.eos_token_id)
+    if eos is None:
+        eos = cfg.eos_token_id
 
     raw = tok.encode(args.prompt)
-    if any(i >= args.vocab_size for i in raw):
+    if any(i >= cfg.vocab_size for i in raw):
         print(
-            f"[tokenizer] clipping {sum(i >= args.vocab_size for i in raw)} "
-            f"ids to vocab_size {args.vocab_size}",
+            f"[tokenizer] clipping {sum(i >= cfg.vocab_size for i in raw)} "
+            f"ids to vocab_size {cfg.vocab_size}",
             file=sys.stderr,
         )
-    ids = [min(i, args.vocab_size - 1) for i in raw]
+    ids = [min(i, cfg.vocab_size - 1) for i in raw]
     if not ids:
         raise SystemExit("empty prompt after tokenization")
     prompt = torch.tensor([ids], dtype=torch.long, device=device)

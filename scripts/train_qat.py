@@ -34,46 +34,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bitnet_fff.models import BitNetFFTConfig, BitNetFFTTransformer
 from bitnet_fff.mps_utils import is_mps_available
 from bitnet_fff.qat import BitNetQAT
+from bitnet_fff.tokenizer import ByteTokenizer, BPETokenizer, load_tokenizer
 
 HF_STREAM = "hf://"
-
-
-class ByteTokenizer:
-    """Byte-level tokenizer (GPT-2 style: id <-> raw UTF-8 byte)."""
-
-    def __init__(self, vocab_size: int) -> None:
-        self.vocab_size = vocab_size
-
-    def encode(self, text: str) -> list[int]:
-        ids = list(text.encode("utf-8"))
-        if any(i >= self.vocab_size for i in ids):
-            raise ValueError(
-                f"text byte {max(ids)} >= vocab_size {self.vocab_size}; "
-                "raise --vocab-size (>= 256)"
-            )
-        return ids
-
-    def decode(self, ids) -> str:
-        return bytes(int(i) for i in ids).decode("utf-8", errors="replace")
-
-
-def load_tokenizer(name: str | None, vocab_size: int):
-    """Return a tokenizer object with ``encode(str) -> list[int]`` / ``decode``.
-
-    Uses a HuggingFace ``AutoTokenizer`` when ``name`` is given and
-    ``transformers`` is installed, otherwise the byte-level fallback.
-    """
-    if not name:
-        return ByteTokenizer(vocab_size)
-    try:
-        from transformers import AutoTokenizer
-    except ImportError:
-        print(
-            "[tokenizer] 'transformers' not installed; byte-level fallback",
-            file=sys.stderr,
-        )
-        return ByteTokenizer(vocab_size)
-    return AutoTokenizer.from_pretrained(name)
 
 
 def _encode_clamped(tokenizer, text: str, vocab_size: int) -> list[int]:
@@ -270,7 +233,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     d.add_argument("--data", required=True,
                    help="text file, directory of .txt files, or hf://<dataset>")
     d.add_argument("--tokenizer", default=None,
-                   help="HuggingFace tokenizer name (byte fallback if unset)")
+                   help="HuggingFace tokenizer name (default gpt2 BPE; "
+                        "'bytes' for the byte-level fallback)")
     d.add_argument("--seq-len", type=int, default=64)
     d.add_argument("--batch-size", type=int, default=8)
     d.add_argument("--max-examples", type=int, default=None,
@@ -293,7 +257,11 @@ def main(argv: list[str] | None = None) -> int:
     torch.manual_seed(args.seed)
 
     tok = load_tokenizer(args.tokenizer, args.vocab_size)
-    cfg = build_cfg(args)
+    cfg = build_cfg(args).bind_tokenizer(tok)
+    if isinstance(tok, BPETokenizer):
+        print(f"[tokenizer] BPE {tok.name} vocab={cfg.vocab_size}")
+    else:
+        print(f"[tokenizer] byte-level fallback vocab={cfg.vocab_size}")
     qat, opt = make_qat_model(
         cfg, device,
         fp16=not args.no_fp16,
@@ -318,8 +286,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[qat] resumed from step {step}")
 
     stream = iter_batches(
-        tokenize_stream(args.data, tok, args.vocab_size, args.max_examples),
-        args.seq_len, args.batch_size, args.vocab_size,
+        tokenize_stream(args.data, tok, cfg.vocab_size, args.max_examples),
+        args.seq_len, args.batch_size, cfg.vocab_size,
     )
     losses: list[float] = []
     ema: float | None = None

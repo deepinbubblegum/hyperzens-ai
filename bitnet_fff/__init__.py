@@ -9,6 +9,7 @@ from . import fast_inference
 from . import models
 from . import qat
 from . import profiler
+from . import tokenizer
 from . import tuning
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "models",
     "qat",
     "profiler",
+    "tokenizer",
     "tuning",
 ]
 

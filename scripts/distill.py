@@ -74,6 +74,13 @@ def load_teacher(
     if spec != "local":
         ckpt = train_qat.load_checkpoint(spec)
         cfg = BitNetFFTConfig(**ckpt["config"])
+        if cfg.vocab_size != student_vocab:
+            print(
+                f"[teacher] warning: checkpoint vocab {cfg.vocab_size} != "
+                f"student/tokenizer vocab {student_vocab}; logits will not "
+                "align for distillation",
+                file=sys.stderr,
+            )
         model = BitNetFFTTransformer(cfg).to(device)
         model.load_state_dict(ckpt["model"])
         meta = {"type": "checkpoint", "path": spec, "config": ckpt["config"]}
@@ -189,7 +196,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     d = p.add_argument_group("data")
     d.add_argument("--data", required=True,
                    help="text file, directory of .txt files, or hf://<dataset>")
-    d.add_argument("--tokenizer", default=None)
+    d.add_argument("--tokenizer", default=None,
+                   help="HuggingFace tokenizer name (default gpt2 BPE; "
+                        "'bytes' for the byte-level fallback)")
     d.add_argument("--seq-len", type=int, default=64)
     d.add_argument("--batch-size", type=int, default=8)
     d.add_argument("--max-examples", type=int, default=None)
@@ -211,16 +220,18 @@ def main(argv: list[str] | None = None) -> int:
     torch.manual_seed(args.seed)
 
     tok = train_qat.load_tokenizer(args.tokenizer, args.vocab_size)
-    teacher, teacher_meta = load_teacher(args.teacher, device, args.vocab_size, args)
+    student_vocab = args.vocab_size
+    if isinstance(tok, train_qat.BPETokenizer):
+        student_vocab = int(tok.vocab_size)
+        print(f"[tokenizer] BPE {tok.name} vocab={student_vocab}")
+    teacher, teacher_meta = load_teacher(args.teacher, device, student_vocab, args)
     print(f"[teacher] {teacher_meta.get('type')}: "
           f"{teacher_meta.get('name', teacher_meta.get('path', 'local'))}")
-
-    student_vocab = args.vocab_size
     if teacher_meta.get("type") == "hf":
         student_vocab = teacher_meta["vocab_size"]
-        if args.vocab_size != student_vocab:
-            print(f"[student] forcing vocab_size={student_vocab} to match teacher")
-            args.vocab_size = student_vocab
+    if args.vocab_size != student_vocab:
+        print(f"[student] forcing vocab_size={student_vocab}")
+        args.vocab_size = student_vocab
 
     student_cfg = train_qat.build_cfg(args)
     student, opt = train_qat.make_qat_model(
