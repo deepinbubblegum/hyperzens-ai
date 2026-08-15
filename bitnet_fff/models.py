@@ -25,6 +25,7 @@ from .fast_fff import FastFeedForwardBitNet
 
 __all__ = [
     "BitNetFFTConfig",
+    "KVCache",
     "BitNetAttention",
     "BitNetFFTBlock",
     "BitNetFFTTransformer",
@@ -87,6 +88,97 @@ class BitNetFFTConfig:
         return (1 << self.fff_depth) * self.fff_out
 
 
+@dataclass
+class KVCache:
+    """Append-only key/value cache for autoregressive token generation.
+
+    ``key_cache`` / ``value_cache`` are ``(batch_size, n_heads, seq_len,
+    head_dim)`` buffers. The sequence dimension is dynamic: :meth:`append`
+    writes new keys/values at ``[past_length:past_length + seq]`` and grows
+    the buffers (doubling, preserving the filled prefix) whenever the capacity
+    is exceeded, so past tokens are never recomputed. Use :meth:`preallocate`
+    to size the buffers up front and avoid re-allocations during long
+    generation runs. Works with float16/float32 on CPU or MPS.
+
+    Attributes:
+        key_cache: ``(B, n_heads, seq_len, head_dim)`` key states.
+        value_cache: ``(B, n_heads, seq_len, head_dim)`` value states.
+        size: number of filled positions along the sequence dimension.
+    """
+
+    key_cache: torch.Tensor
+    value_cache: torch.Tensor
+    size: int = 0
+
+    @classmethod
+    def preallocate(
+        cls,
+        batch_size: int,
+        n_heads: int,
+        seq_len: int,
+        head_dim: int,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+    ) -> "KVCache":
+        """Build a cache with fixed-capacity ``(B, n_heads, seq_len, head_dim)`` buffers.
+
+        ``dtype`` defaults to ``torch.get_default_dtype()`` (float32); pass
+        ``torch.float16`` to halve the memory on MPS.
+        """
+        shape = (batch_size, n_heads, seq_len, head_dim)
+        return cls(
+            key_cache=torch.empty(shape, dtype=dtype, device=device),
+            value_cache=torch.empty(shape, dtype=dtype, device=device),
+        )
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.key_cache.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.key_cache.device
+
+    def _grow(self, min_len: int) -> None:
+        cap = max(min_len, 2 * self.key_cache.shape[-2])
+        shape = self.key_cache.shape[:-2] + (cap, self.key_cache.shape[-1])
+        new_k = torch.empty(shape, dtype=self.dtype, device=self.device)
+        new_v = torch.empty(shape, dtype=self.dtype, device=self.device)
+        new_k[..., : self.size, :] = self.key_cache[..., : self.size, :]
+        new_v[..., : self.size, :] = self.value_cache[..., : self.size, :]
+        self.key_cache, self.value_cache = new_k, new_v
+
+    def append(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        past_length: int = 0,
+    ) -> None:
+        """Write ``key``/``value`` at ``[past_length:past_length + seq]``.
+
+        Keys/values are written in place when capacity allows (pre-allocated
+        mode); otherwise the buffers are grown first. ``size`` advances to the
+        last written position so a subsequent call passes ``past_length =
+        cache.size``.
+        """
+        if key.shape[-1] != self.key_cache.shape[-1]:
+            raise ValueError(
+                f"head_dim {key.shape[-1]} does not match cache "
+                f"{self.key_cache.shape[-1]}"
+            )
+        if key.dtype != self.dtype or value.dtype != self.dtype:
+            raise ValueError(
+                f"cache dtype {self.dtype} vs incoming "
+                f"key/value {key.dtype}/{value.dtype}"
+            )
+        start, end = past_length, past_length + key.shape[-2]
+        if self.key_cache.shape[-2] < end:
+            self._grow(end)
+        self.key_cache[:, :, start:end] = key
+        self.value_cache[:, :, start:end] = value
+        self.size = max(self.size, end)
+
+
 class BitNetAttention(nn.Module):
     """Multi-head attention with optional BitNet activation quantization.
 
@@ -95,6 +187,12 @@ class BitNetAttention(nn.Module):
     low-precision attention. The compatibility mask is a right-aligned
     lower-triangular ``(seq, seq)`` additive bias, so both full attention and
     causal (generative) attention are supported.
+
+    Autoregressive generation: pass a :class:`KVCache` (plus ``past_length``)
+    to append the new keys/values along the sequence dimension and attend only
+    to them, without recomputing the projections of previous tokens. The
+    per-token AbsMax activation quantization is preserved exactly, because
+    each token is scaled by its own row only.
     """
 
     def __init__(
@@ -125,7 +223,19 @@ class BitNetAttention(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
         need_weights: bool = False,
+        kv_cache: KVCache | None = None,
+        past_length: int = 0,
     ) -> torch.Tensor:
+        """Run attention on ``x`` (shape ``(*batch, seq, d_model)``).
+
+        When ``kv_cache`` is given, ``x`` holds only the new tokens; their
+        keys/values are appended at ``[past_length:past_length + seq]`` and
+        attention attends over the full cached sequence ``(B, n_heads,
+        past_length + seq, head_dim)``. A ``None`` mask becomes a causal
+        ``(seq, past_length + seq)`` mask automatically; an explicit
+        ``(seq, seq)`` mask is left-padded with zeros so cached keys stay
+        visible.
+        """
         *batch, seq, _ = x.shape
         if self.activation_bits is not None and self.activation_bits < 32:
             x = absmax_quantize(x, bits=self.activation_bits, eps=self.eps)
@@ -137,6 +247,29 @@ class BitNetAttention(nn.Module):
         q = q.reshape(B, seq, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(B, seq, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(B, seq, self.n_heads, self.head_dim).transpose(1, 2)
+
+        if kv_cache is not None:
+            kv_cache.append(k, v, past_length=past_length)
+            k = kv_cache.key_cache[..., : kv_cache.size, :]
+            v = kv_cache.value_cache[..., : kv_cache.size, :]
+
+        full_len = kv_cache.size if kv_cache is not None else seq
+
+        if kv_cache is not None:
+            if mask is None:
+                if full_len > 1:
+                    mask = _causal_mask(full_len, x.device)[-seq:]
+            elif mask.shape[-1] < full_len:
+                pad = full_len - mask.shape[-1]
+                mask = torch.cat(
+                    [
+                        torch.zeros(
+                            *mask.shape[:-1], pad, device=mask.device, dtype=mask.dtype
+                        ),
+                        mask,
+                    ],
+                    dim=-1,
+                )
 
         scores = q @ k.transpose(-1, -2) / math.sqrt(self.head_dim)
         if mask is not None:
@@ -155,6 +288,31 @@ class BitNetAttention(nn.Module):
 def _causal_mask(seq: int, device: torch.device) -> torch.Tensor:
     m = torch.triu(torch.full((seq, seq), float("-inf"), device=device), diagonal=1)
     return m
+
+
+def _per_layer_caches(
+    kv_cache: KVCache | list[KVCache] | None, n_layers: int
+) -> list[KVCache | None]:
+    """Expand a per-model cache into one cache per transformer layer.
+
+    A bare :class:`KVCache` is only allowed for single-layer models (each
+    layer needs its own key/value storage); otherwise a list of ``n_layers``
+    caches is required so layer N never overwrites layer M's states.
+    """
+    if kv_cache is None:
+        return [None] * n_layers
+    if isinstance(kv_cache, (list, tuple)):
+        if len(kv_cache) != n_layers:
+            raise ValueError(
+                f"expected {n_layers} KVCache entries, got {len(kv_cache)}"
+            )
+        return list(kv_cache)
+    if n_layers != 1:
+        raise ValueError(
+            "provide one KVCache per layer (a list) for n_layers > 1; "
+            f"got a single cache for {n_layers} layers"
+        )
+    return [kv_cache]
 
 
 class BitNetFFTBlock(nn.Module):
@@ -202,9 +360,11 @@ class BitNetFFTBlock(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
+        kv_cache: KVCache | None = None,
+        past_length: int = 0,
     ) -> torch.Tensor:
         h = self.norm1(x)
-        h = self.attn(h, mask=mask)
+        h = self.attn(h, mask=mask, kv_cache=kv_cache, past_length=past_length)
         x = x + self.dropout(h)
         h = self.norm2(x)
         h = self._fff_forward(h)
@@ -243,11 +403,16 @@ class BitNetFFTTransformer(nn.Module):
             if cfg.tie_weights and self.embed is not None:
                 self.head.weight = self.embed.weight
 
-    def _apply_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
+    def _apply_embeddings(
+        self, token_ids: torch.Tensor, pos_start: int = 0
+    ) -> torch.Tensor:
         if self.embed is None:
             raise ValueError("config.vocab_size must be > 0 to embed tokens")
         pos = torch.arange(
-            token_ids.shape[-1], dtype=torch.long, device=token_ids.device
+            pos_start,
+            pos_start + token_ids.shape[-1],
+            dtype=torch.long,
+            device=token_ids.device,
         )
         return self.embed(token_ids) + self.pos(pos)
 
@@ -255,14 +420,24 @@ class BitNetFFTTransformer(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
+        kv_cache: KVCache | list[KVCache] | None = None,
+        past_length: int = 0,
         **_: object,
     ) -> torch.Tensor:
+        """Run the transformer on ``x`` (token ids or ``d_model`` rows).
+
+        ``kv_cache`` may be a single :class:`KVCache` (broadcast to every
+        layer) or a list/tuple with one cache per layer; ``past_length`` is the
+        number of already-generated tokens so each step only embeds/projects
+        the new token.
+        """
         if self.embed is not None:
-            x = self._apply_embeddings(x)
+            x = self._apply_embeddings(x, pos_start=past_length)
         if mask is None and x.shape[-2] > 1:
             mask = _causal_mask(x.shape[-2], x.device)
-        for layer in self.layers:
-            x = layer(x, mask=mask)
+        layer_caches = _per_layer_caches(kv_cache, len(self.layers))
+        for layer, layer_cache in zip(self.layers, layer_caches):
+            x = layer(x, mask=mask, kv_cache=layer_cache, past_length=past_length)
         x = self.norm(x)
         if self.head is not None:
             x = self.head(x)
