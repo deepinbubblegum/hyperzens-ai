@@ -14,7 +14,7 @@ tasks flow seamlessly across batch boundaries.
 
 * Reasoning/Math (40%): ``open-r1/OpenR1-Math-220k``
 * General instruction (40%): ``Open-Orca/SlimOrca-Dedup``
-* Code/Logic (20%): ``m-a-p/CodeFeedback``
+* Code/Logic (20%): ``nickrosh/Evol-Instruct-Code-80k-v1``
 
 Only streaming HuggingFace sources are supported; ``load_dataset`` is imported
 lazily per iteration so tests (and offline runs) can substitute a fake source.
@@ -38,7 +38,7 @@ __all__ = [
 
 OPENR1_MATH = "open-r1/OpenR1-Math-220k"
 SLIMORCA = "Open-Orca/SlimOrca-Dedup"
-CODEFEEDBACK = "m-a-p/CodeFeedback"
+CODEFEEDBACK = "nickrosh/Evol-Instruct-Code-80k-v1"
 
 
 @dataclass(frozen=True)
@@ -95,6 +95,13 @@ def _codefeedback_format(ex: dict) -> str | None:
         value = ex.get(key)
         if isinstance(value, str) and value.strip():
             return value + "\n"
+    instruction = ex.get("instruction")
+    output = ex.get("output")
+    if isinstance(instruction, str) and isinstance(output, str):
+        instruction = instruction.strip()
+        output = output.strip()
+        if instruction or output:
+            return f"Q: {instruction}\nA: {output}\n"
     return None
 
 

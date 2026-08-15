@@ -279,8 +279,9 @@ def _recipe_fake_rows():
                                {"from": "assistant", "value": f"a{i}"}]}
             for i in range(100)
         ],
-        "m-a-p/CodeFeedback": [
-            {"content": f"def f{i}():\n    pass\n"} for i in range(100)
+        "nickrosh/Evol-Instruct-Code-80k-v1": [
+            {"instruction": f"write a function for {i}",
+             "output": f"def f{i}():\n    return {i}\n"} for i in range(100)
         ],
     }
 
