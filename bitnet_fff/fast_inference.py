@@ -30,6 +30,7 @@ __all__ = [
     "pack_ternary_weights",
     "unpack_ternary_weights",
     "ternary_mm",
+    "fused_ternary_fff",
     "PackedTernaryMM",
     "PackedFFFEvaluator",
 ]
@@ -110,6 +111,45 @@ def ternary_mm(
     return torch.ops.ternary_packed.ternary_mm(x.contiguous(), packed, leaf)
 
 
+def fused_ternary_fff(
+    x: torch.Tensor,
+    router_w: torch.Tensor,
+    router_b: torch.Tensor,
+    packed: torch.Tensor,
+    depth: int,
+    activation_bits: int,
+    leaf_bias: torch.Tensor | None = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Fused single-pass routing + packed-ternary leaf matmul.
+
+    Routes ``x`` through the decision tree ``router_w``/``router_b`` inside the
+    native kernel (``router_w`` rows must be padded to ``x.shape[-1]``), AbsMax-
+    quantizes activations in-kernel (skipped when ``activation_bits >= 32``), and
+    evaluates only the routed leaf's packed rows. Routing never round-trips to
+    the host and no per-branch buffers are materialized.
+    """
+    if not extension_available():
+        raise RuntimeError("packed-ternary native extension is not available")
+    if x.dtype != torch.float32:
+        x = x.to(torch.float32)
+    if router_w.dtype != torch.float32:
+        router_w = router_w.to(torch.float32)
+    if router_b.dtype != torch.float32:
+        router_b = router_b.to(torch.float32)
+    lb = leaf_bias.to(torch.float32).contiguous() if leaf_bias is not None else None
+    return torch.ops.ternary_packed.fused_ternary_fff(
+        x.contiguous(),
+        router_w.contiguous(),
+        router_b.contiguous(),
+        packed.to(torch.uint8).contiguous(),
+        depth,
+        activation_bits,
+        lb,
+        float(eps),
+    )
+
+
 class PackedTernaryMM(torch.autograd.Function):
     """Autograd wrapper over the packed op (STE backward, for fine-tuning).
 
@@ -158,11 +198,13 @@ class PackedTernaryMM(torch.autograd.Function):
 class PackedFFFEvaluator:
     """Zero-gather, buffer-recycled inference path for a ``FastFeedForwardBitNet``.
 
-    Packed ternary weights + leaf bias are materialized once on ``device``.
-    Each ``forward(x, leaf_idx)`` runs routing externally and then evaluates only
-    the selected leaf rows through the native kernel. ``chunk_size`` bounds the
-    peak footprint by splitting the batch. A small per-batch buffer pool reuses
-    the padded-input scratch across calls.
+    Packed ternary weights + leaf bias + (for ``router_rank="full"``) the router
+    are materialized once on ``device``. Calling ``evaluator(x)`` uses the fused
+    single-pass kernel: routing, activation quantization and the selected leaf's
+    packed GEMM all happen in one native call with no host round-trip. Calling
+    ``evaluator(x, leaf_idx)`` keeps the classic externally-routed path (``leaf``
+    selected in torch, then only the routed leaf rows evaluated). ``chunk_size``
+    bounds the peak footprint by splitting the batch.
     """
 
     def __init__(
@@ -178,6 +220,7 @@ class PackedFFFEvaluator:
         self.d_out = module.d_out
         self.num_leaves = module.num_leaves
         self.activation_bits = module.activation_bits
+        self.router_rank = getattr(module, "router_rank", "full")
         self.eps = eps
         self.chunk_size = chunk_size
         self.device = (
@@ -196,6 +239,13 @@ class PackedFFFEvaluator:
                 self.bias = module.leaf_bias.detach().to(self.device)
             else:
                 self.bias = None
+            if self.router_rank == "full":
+                self.router_w = module.router_weight.detach().to(self.device)
+                if self.d_in_padded > self.d_in:
+                    self.router_w = F.pad(
+                        self.router_w, (0, self.d_in_padded - self.d_in)
+                    )
+                self.router_b = module.router_bias.detach().to(self.device)
         self._pool: dict[int, torch.Tensor] = {}
 
     def _padded(self, x: torch.Tensor) -> torch.Tensor:
@@ -236,7 +286,34 @@ class PackedFFFEvaluator:
         ]
         return torch.cat(pieces, dim=0)
 
-    def __call__(self, x: torch.Tensor, leaf_idx: torch.Tensor) -> torch.Tensor:
+    def _fused(self, x: torch.Tensor) -> torch.Tensor:
+        if self.chunk_size is not None and x.shape[0] > self.chunk_size:
+            pieces = [
+                self._fused(x[s : s + self.chunk_size])
+                for s in range(0, x.shape[0], self.chunk_size)
+            ]
+            return torch.cat(pieces, dim=0)
+        xp = self._padded(x)
+        return fused_ternary_fff(
+            xp,
+            self.router_w,
+            self.router_b,
+            self.packed,
+            self.module.depth,
+            self.activation_bits,
+            self.bias,
+            self.eps,
+        )
+
+    def __call__(
+        self, x: torch.Tensor, leaf_idx: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if leaf_idx is None:
+            if self.router_rank == "full":
+                return self._fused(x)
+            raise ValueError(
+                "router_rank='r1' routing is not fused; pass leaf_idx explicitly"
+            )
         if self.chunk_size is not None and x.shape[0] > self.chunk_size:
             return self.forward_chunked(x, leaf_idx)
         return self.forward(x, leaf_idx)

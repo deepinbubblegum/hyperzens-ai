@@ -77,7 +77,7 @@ def main() -> None:
 
     methods: dict[str, object] = {
         "fff fp32 forward": lambda: model(x),
-        "fff fast_forward (packed)": lambda: model.fast_forward(x),
+        "fff fast_forward (fused)": lambda: model.fast_forward(x),
         "dense linear": lambda: dense(x),
     }
     if args.chunk is not None:
@@ -104,9 +104,14 @@ def main() -> None:
               f"{peak_mb:>12.1f}{tok_s:>16,.0f}")
 
     # memory accounting for the packed path
-    packed_mb = tensor_bytes(model._packed_eval.packed) / 1e6 if hasattr(model, "_packed_eval") else 0.0
+    evalr = model._packed_eval
+    packed_mb = tensor_bytes(evalr.packed) / 1e6 if evalr is not None else 0.0
+    fused_extra_mb = (
+        tensor_bytes(evalr.router_w) + tensor_bytes(evalr.router_b)
+    ) / 1e6 if evalr is not None else 0.0
     print(f"\npacked weights: {packed_mb:.2f} MB "
-          f"({tensor_bytes(model.leaf_weight.data) / 1e6:.2f} MB fp32 leaf_weight)")
+          f"({tensor_bytes(model.leaf_weight.data) / 1e6:.2f} MB fp32 leaf_weight, "
+          f"+{fused_extra_mb:.2f} MB router)")
     print(f"leaf-gather temp (fp32 path) vs packed path: "
           f"{model.leaf_gather_temp_bytes(args.batch) / 1e6:.1f} MB -> "
           f"{args.batch * (args.d_in + args.d_out) * 4 / 1e6:.1f} MB")

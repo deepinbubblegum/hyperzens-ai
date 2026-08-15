@@ -229,8 +229,9 @@ class FastFeedForwardBitNet(nn.Module):
         """Zero-gather inference: routes, then evaluates only the selected leaves.
 
         The first call packs + uploads the ternary weights (lazy); subsequent
-        calls reuse them. Falls back to ``_forward`` if the native extension is
-        unavailable.
+        calls reuse them. With ``router_rank="full"`` the fused kernel routes,
+        quantizes and evaluates in a single native call with no host round-trip.
+        Falls back to ``_forward`` if the native extension is unavailable.
         """
         from .fast_inference import extension_available
 
@@ -241,6 +242,12 @@ class FastFeedForwardBitNet(nn.Module):
             evaluator = self.pack(device=x.device)
             evaluator.chunk_size = chunk_size
             self._packed_eval = evaluator
+        if self.router_rank == "full":
+            if x.dim() > 2:
+                shape = x.shape
+                flat = x.reshape(-1, shape[-1])
+                return evaluator(flat).reshape(*shape[:-1], self.d_out)
+            return evaluator(x)
         if x.dim() > 2:
             shape = x.shape
             flat = x.reshape(-1, shape[-1])

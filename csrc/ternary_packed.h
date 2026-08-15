@@ -19,10 +19,32 @@ at::Tensor ternary_mm_cpu(const at::Tensor& x,
                           const at::Tensor& packed_w,
                           const at::Tensor& leaf_idx);
 
+// Fused single-pass routing + packed-ternary leaf matmul (CPU, ARM64 NEON).
+// Routes each row through the decision tree, AbsMax-quantizes activations and
+// evaluates only the routed leaf's packed rows.
+at::Tensor route_and_matmul_cpu(const at::Tensor& x,
+                                const at::Tensor& router_w,
+                                const at::Tensor& router_b,
+                                const at::Tensor& packed_w,
+                                int64_t depth,
+                                int64_t activation_bits,
+                                const c10::optional<at::Tensor>& leaf_bias,
+                                double eps);
+
 // Metal (MPS) grouped ternary matmul; implemented in ternary_packed_mps.mm
 at::Tensor ternary_mm_mps(const at::Tensor& x,
                           const at::Tensor& packed_w,
                           const at::Tensor& leaf_idx);
+
+// Fused single-pass routing + packed-ternary leaf matmul (Metal).
+at::Tensor route_and_matmul_mps(const at::Tensor& x,
+                                const at::Tensor& router_w,
+                                const at::Tensor& router_b,
+                                const at::Tensor& packed_w,
+                                int64_t depth,
+                                int64_t activation_bits,
+                                const c10::optional<at::Tensor>& leaf_bias,
+                                double eps);
 
 // True when an MTLDevice is available (even if torch MPS tensors are not built).
 bool mps_supported();
