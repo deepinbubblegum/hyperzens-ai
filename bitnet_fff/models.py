@@ -315,6 +315,41 @@ def _per_layer_caches(
     return [kv_cache]
 
 
+def _sample_from_logits(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    top_k: int | None = 50,
+    top_p: float | None = 0.9,
+) -> torch.Tensor:
+    """Sample one token per row from raw ``(..., vocab)`` logits, fully on-device.
+
+    ``temperature <= 0`` selects greedily via ``argmax``. Otherwise the logits
+    are temperature-scaled, softmaxed, optionally restricted to the ``top_k``
+    largest probabilities and to the nucleus of cumulative probability mass
+    ``top_p``, renormalized and drawn with ``torch.multinomial``. Every
+    operation stays on the input tensor's device, so sampling never round-trips
+    through the host.
+    """
+    if temperature <= 0:
+        return logits.argmax(dim=-1, keepdim=True)
+    probs = torch.softmax(logits / temperature, dim=-1)
+    if top_k is not None and top_k > 0:
+        k = min(int(top_k), probs.shape[-1])
+        kth = torch.topk(probs, k, dim=-1).values[..., -1:]
+        probs = torch.where(probs < kth, torch.zeros_like(probs), probs)
+    if top_p is not None and 0.0 < top_p < 1.0:
+        sorted_probs, order = torch.sort(probs, dim=-1, descending=True)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        sorted_probs = sorted_probs.masked_fill(
+            cumulative - sorted_probs > top_p, 0.0
+        )
+        probs = torch.zeros_like(probs).scatter_(-1, order, sorted_probs)
+    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(probs.dtype).tiny
+    )
+    return torch.multinomial(probs, num_samples=1)
+
+
 class BitNetFFTBlock(nn.Module):
     """Pre-norm transformer block: attention + FFF with residual connections."""
 
@@ -442,6 +477,142 @@ class BitNetFFTTransformer(nn.Module):
         if self.head is not None:
             x = self.head(x)
         return x
+
+    def generate(
+        self,
+        prompt_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        eos_token_id: int | None = None,
+    ) -> torch.Tensor:
+        """Autoregressively generate a continuation using a KV cache.
+
+        **Prefill** — the full prompt is run through the model once to populate
+        fresh per-layer :class:`KVCache` buffers (capacity ``max_seq_len``); the
+        last prompt row's logits already predict the first new token.
+
+        **Decode** — one token per step is embedded/projected using only the
+        cached key/value states (nothing before the current token is
+        recomputed), and each FFN block runs through the fused single-pass
+        kernel (:meth:`FastFeedForwardBitNet.fast_forward`) when
+        ``use_fast_inference`` is set; ``eval()`` mode is entered and restored
+        around the call so the fast path is always eligible.
+
+        **Sampling** — ``temperature <= 0`` gives greedy decoding (``argmax``);
+        otherwise temperature scaling, top-``k`` filtering and top-``p``
+        (nucleus) filtering are applied on-device followed by
+        ``torch.multinomial``.
+
+        **Stream discipline** — the whole loop runs under
+        ``torch.inference_mode()`` and every tensor stays on the model's device;
+        the only host-device synchronizations are a single scalar ``done`` check
+        per step (required for early eos termination) and a final eos trim.
+
+        Args:
+            prompt_ids: token ids, shape ``(seq,)`` or ``(batch, seq)``.
+            max_new_tokens: number of tokens to generate (>= 1).
+            temperature: sampling temperature; ``<= 0`` disables sampling.
+            top_k: keep only the ``top_k`` most probable tokens (``None``/0 off).
+            top_p: nucleus mass (``None``/0/1 off).
+            eos_token_id: stop generating for sequences that emit this token.
+
+        Returns:
+            Full sequence ``(batch, prompt_len + gen_len)`` (or ``(prompt_len +
+            gen_len,)`` for a 1D prompt) with generation truncated at the first
+            ``eos_token_id`` when one is supplied.
+        """
+        if max_new_tokens < 1:
+            raise ValueError(f"max_new_tokens must be >= 1, got {max_new_tokens}")
+        if self.embed is None or self.head is None:
+            raise ValueError("generate() requires a token model (vocab_size > 0)")
+
+        was_training = self.training
+        self.eval()
+        try:
+            with torch.inference_mode():
+                squeeze = prompt_ids.ndim == 1
+                tokens = prompt_ids if not squeeze else prompt_ids.unsqueeze(0)
+                if tokens.ndim != 2:
+                    raise ValueError(
+                        f"prompt_ids must be 1D or 2D, got {tuple(prompt_ids.shape)}"
+                    )
+                batch, prompt_len = tokens.shape
+                if prompt_len < 1:
+                    raise ValueError("prompt_ids must contain at least one token")
+                if prompt_len + max_new_tokens > self.cfg.max_seq_len:
+                    raise ValueError(
+                        f"prompt_len + max_new_tokens ({prompt_len} + "
+                        f"{max_new_tokens}) exceeds max_seq_len "
+                        f"{self.cfg.max_seq_len}"
+                    )
+
+                device = next(self.parameters()).device
+                dtype = next(self.parameters()).dtype
+                head_dim = self.cfg.d_model // self.cfg.n_heads
+                caches = [
+                    KVCache.preallocate(
+                        batch,
+                        self.cfg.n_heads,
+                        self.cfg.max_seq_len,
+                        head_dim,
+                        dtype=dtype,
+                        device=device,
+                    )
+                    for _ in self.layers
+                ]
+
+                # Prefill: full prompt once, cache all key/value states; the
+                # last row's logits already predict the first new token.
+                prefill = self(tokens, kv_cache=caches, past_length=0)
+                next_ids = _sample_from_logits(
+                    prefill[:, -1], temperature, top_k, top_p
+                )
+
+                pad = eos_token_id if eos_token_id is not None else 0
+                generated = torch.full(
+                    (batch, max_new_tokens), pad, dtype=torch.long, device=device
+                )
+                done = torch.zeros(batch, dtype=torch.bool, device=device)
+                if eos_token_id is not None:
+                    done = (next_ids == eos_token_id).squeeze(-1)
+                    next_ids = next_ids.masked_fill(done.unsqueeze(-1), eos_token_id)
+                generated[:, 0] = next_ids.squeeze(-1)
+
+                # Decode: one cached token per step; the newly sampled token
+                # occupies position prompt_len + step.
+                for step in range(1, max_new_tokens):
+                    if eos_token_id is not None and bool(done.all()):
+                        break
+                    logits = self(
+                        next_ids, kv_cache=caches, past_length=prompt_len + step - 1
+                    )
+                    next_ids = _sample_from_logits(
+                        logits[:, -1], temperature, top_k, top_p
+                    )
+                    if eos_token_id is not None:
+                        done = done | (next_ids == eos_token_id).squeeze(-1)
+                        next_ids = next_ids.masked_fill(
+                            done.unsqueeze(-1), eos_token_id
+                        )
+                    generated[:, step] = next_ids.squeeze(-1)
+
+                if eos_token_id is not None:
+                    is_eos = generated == eos_token_id
+                    has_eos = is_eos.any(dim=-1)
+                    eos_at = is_eos.to(torch.long).argmax(dim=-1)
+                    lengths = torch.where(
+                        has_eos,
+                        eos_at + 1,
+                        torch.full_like(eos_at, generated.shape[1]),
+                    )
+                    generated = generated[:, : int(lengths.max())]
+
+                out = torch.cat([tokens, generated], dim=1)
+                return out.squeeze(0) if squeeze else out
+        finally:
+            self.train(was_training)
 
     @property
     def fff_params(self) -> int:

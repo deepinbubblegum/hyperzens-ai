@@ -122,11 +122,11 @@ def test_fff_blocks_use_bitnet_fff():
 # --- KV-cache / autoregressive generation ----------------------------------
 
 
-def _cache_for(model: BitNetFFTTransformer) -> list[KVCache]:
+def _cache_for(model: BitNetFFTTransformer, batch: int = 1) -> list[KVCache]:
     head_dim = model.cfg.d_model // model.cfg.n_heads
     return [
         KVCache.preallocate(
-            1, model.cfg.n_heads, model.cfg.max_seq_len, head_dim, dtype=torch.float32
+            batch, model.cfg.n_heads, model.cfg.max_seq_len, head_dim, dtype=torch.float32
         )
         for _ in range(model.cfg.n_layers)
     ]
@@ -266,3 +266,128 @@ def test_block_kv_cache_shares_storage():
     m.layers[0](torch.randn(1, 2, cfg.d_model), kv_cache=cache, past_length=3)
     assert cache.size == 5
     assert torch.equal(cache.key_cache[..., :3, :], ref)
+
+
+# --- generate() -------------------------------------------------------------
+
+
+def _manual_greedy(m: BitNetFFTTransformer, prompt: torch.Tensor, n: int) -> torch.Tensor:
+    """Reference autoregressive decode: prefill once, then one cached token/step."""
+    caches = _cache_for(m, batch=prompt.shape[0])
+    logits = m(prompt, kv_cache=caches)
+    ids = [logits[:, -1].argmax(-1, keepdim=True)]
+    for step in range(1, n):
+        logits = m(ids[-1], kv_cache=caches, past_length=prompt.shape[1] + step - 1)
+        ids.append(logits[:, -1].argmax(-1, keepdim=True))
+    return torch.cat(ids, dim=1)
+
+
+def test_generate_greedy_matches_manual_decode():
+    torch.manual_seed(0)
+    cfg = _cfg(use_fast_inference=False)
+    m = BitNetFFTTransformer(cfg)
+    m.eval()
+    prompt = torch.randint(0, cfg.vocab_size, (2, 5))
+    with torch.no_grad():
+        manual = _manual_greedy(m, prompt, 8)
+        out = m.generate(prompt, max_new_tokens=8, temperature=0.0)
+    assert torch.equal(out, torch.cat([prompt, manual], dim=1))
+
+
+def test_generate_1d_and_batch_shapes():
+    torch.manual_seed(0)
+    cfg = _cfg(use_fast_inference=False)
+    m = BitNetFFTTransformer(cfg)
+    m.eval()
+    p1 = torch.randint(0, cfg.vocab_size, (6,))
+    p2 = torch.randint(0, cfg.vocab_size, (3, 6))
+    o1 = m.generate(p1, max_new_tokens=4, temperature=0.0)
+    o2 = m.generate(p2, max_new_tokens=4, temperature=0.0)
+    assert o1.ndim == 1 and o1.shape[0] == 10
+    assert o2.shape == (3, 10)
+
+
+def test_generate_sampling_in_vocab_and_seeded():
+    torch.manual_seed(0)
+    cfg = _cfg(use_fast_inference=False)
+    m = BitNetFFTTransformer(cfg)
+    m.eval()
+    prompt = torch.randint(0, cfg.vocab_size, (1, 4))
+    torch.manual_seed(123)
+    a = m.generate(prompt, max_new_tokens=6, temperature=1.0, top_k=50, top_p=0.9)
+    torch.manual_seed(123)
+    b = m.generate(prompt, max_new_tokens=6, temperature=1.0, top_k=50, top_p=0.9)
+    assert torch.equal(a, b)
+    assert a.shape == (1, 10)
+    assert (a[0, 4:] >= 0).all() and (a[0, 4:] < cfg.vocab_size).all()
+
+
+def test_generate_greedy_deterministic_across_runs():
+    torch.manual_seed(0)
+    cfg = _cfg(use_fast_inference=False)
+    m = BitNetFFTTransformer(cfg)
+    m.eval()
+    prompt = torch.randint(0, cfg.vocab_size, (1, 4))
+    a = m.generate(prompt, max_new_tokens=6, temperature=0.0)
+    b = m.generate(prompt, max_new_tokens=6, temperature=0.0)
+    assert torch.equal(a, b)
+
+
+def test_generate_eos_truncation(monkeypatch):
+    import bitnet_fff.models as models_mod
+
+    torch.manual_seed(0)
+    cfg = _cfg(use_fast_inference=False)
+    m = BitNetFFTTransformer(cfg)
+    m.eval()
+    eos = 42
+
+    def fake_eos(logits, temperature, top_k, top_p):
+        return torch.full((logits.shape[0], 1), eos, device=logits.device)
+
+    monkeypatch.setattr(models_mod, "_sample_from_logits", fake_eos)
+    out = m.generate(torch.tensor([[5, 6, 7]]), max_new_tokens=8, eos_token_id=eos)
+    assert out.shape == (1, 4)
+    assert out[0, -1] == eos
+
+    def fake_plain(logits, temperature, top_k, top_p):
+        return torch.full((logits.shape[0], 1), 7, device=logits.device)
+
+    monkeypatch.setattr(models_mod, "_sample_from_logits", fake_plain)
+    out2 = m.generate(torch.tensor([[5, 6, 7]]), max_new_tokens=8, eos_token_id=eos)
+    assert out2.shape == (1, 11)
+
+
+def test_generate_restores_training_mode():
+    torch.manual_seed(0)
+    m = BitNetFFTTransformer(_cfg(use_fast_inference=False))
+    m.train()
+    prompt = torch.randint(0, m.cfg.vocab_size, (1, 4))
+    m.generate(prompt, max_new_tokens=3, temperature=0.0)
+    assert m.training
+
+
+def test_generate_guards():
+    m = BitNetFFTTransformer(_cfg(use_fast_inference=False, max_seq_len=8))
+    prompt = torch.randint(0, m.cfg.vocab_size, (1, 6))
+    with pytest.raises(ValueError):
+        m.generate(prompt, max_new_tokens=3, temperature=0.0)
+    with pytest.raises(ValueError):
+        m.generate(prompt, max_new_tokens=0, temperature=0.0)
+    raw = BitNetFFTTransformer(_cfg(vocab_size=0))
+    with pytest.raises(ValueError):
+        raw.generate(torch.randint(0, 64, (1, 4)), max_new_tokens=2)
+
+
+def test_generate_mps_fast_inference():
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS required")
+    torch.manual_seed(0)
+    cfg = _cfg(use_fast_inference=True)
+    m = BitNetFFTTransformer(cfg).to("mps")
+    m.eval()
+    prompt = torch.randint(0, cfg.vocab_size, (1, 6), device="mps")
+    out = m.generate(prompt, max_new_tokens=8, temperature=0.0)
+    assert out.shape == (1, 14)
+    assert torch.isfinite(out).all()
+    assert m.layers[0].fff._packed_eval is not None
