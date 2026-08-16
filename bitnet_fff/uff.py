@@ -32,7 +32,15 @@ nodes:
    selected rows receive gradients) and combined with a softmax path
    weight, which gives the router a differentiable training signal.
 
-4. **BitNet 1.58-bit arithmetic.** Router ("node") projections and leaf
+4. **Bounded activation memory.** The two flat gathers — the ``(k, d_out,
+   d_in)`` leaf-weight slice per token and the ``(num_leaves, depth)``
+   path-node slice — are processed in mini-chunks of ``_DEFAULT_CHUNK``
+   (256) tokens, and the chunk is always clamped so the worst-case single
+   gather stays under ``_GATHER_BUDGET_BYTES`` (256 MB). A full
+   ``(B*S, k, d_out, d_in)`` 4D tensor is therefore never allocated, keeping
+   per-layer forward activation memory well under 500 MB during training.
+
+5. **BitNet 1.58-bit arithmetic.** Router ("node") projections and leaf
    weights are AbsMean-ternarized to {-1, 0, +1} with a straight-through
    estimator; activations use per-token AbsMax k-bit quantization on the leaf
    path, mirroring :class:`FastFeedForwardBitNet`.
@@ -68,8 +76,11 @@ class BitNetUFFLayer(nn.Module):
         bias: use leaf biases.
         activation_bits: BitNet activation quantization width applied to the
             leaf-projection input (``None`` or ``>= 32`` disables it).
-        chunk_size: if set, the top-k leaf gather + projection is processed in
-            batch chunks to bound peak unified-memory footprint.
+        chunk_size: maximum tokens processed per chunk in the routing / leaf
+            projection pass. If unset, ``_DEFAULT_CHUNK`` (256) is used, and
+            the chunk is always clamped so the worst-case single gather stays
+            under ``_GATHER_BUDGET_BYTES`` (256 MB), keeping per-layer forward
+            activation memory well under 500 MB during training.
         eps: numerical stability for quantizers.
         ternarize_threshold_scale: multiplier on the AbsMean ternary threshold
             (see :func:`absmean_ternarize`).
@@ -81,6 +92,11 @@ class BitNetUFFLayer(nn.Module):
         projections. The heap-id path table is a non-persistent ``long``
         buffer that travels with the module across devices.
     """
+
+    # Token mini-chunk and single-gather byte budget used to bound activation
+    # memory (see ``_chunk_size``). Tune for smaller GPUs as needed.
+    _DEFAULT_CHUNK = 256
+    _GATHER_BUDGET_BYTES = 256 * 1024 * 1024
 
     def __init__(
         self,
@@ -163,11 +179,29 @@ class BitNetUFFLayer(nn.Module):
 
     def leaf_gather_temp_bytes(self, batch: int) -> int:
         """Worst-case bytes of the gathered intermediates for a batch."""
-        rows = batch if self.chunk_size is None else min(batch, self.chunk_size)
+        rows = self._chunk_size(batch)
         per_row = (
             self.k * self.d_out * self.d_in + self.num_leaves * self.depth
         )
         return rows * per_row * 4
+
+    def _chunk_size(self, batch: int, elem_bytes: int = 4) -> int:
+        """Per-chunk token count that bounds this layer's activation spikes.
+
+        The flat UFF design materializes two activation-heavy gathers per
+        token: the ``(k, d_out, d_in)`` leaf-weight slice and the
+        ``(num_leaves * depth)`` path-node slice. ``_chunk_size`` returns the
+        largest chunk (``chunk_size`` if set, else ``_DEFAULT_CHUNK``) that
+        keeps the worst-case single gather under ``_GATHER_BUDGET_BYTES``, so
+        a full ``(B*S, k, d_out, d_in)`` 4D tensor is never allocated.
+        """
+        per_row = max(
+            self.k * self.d_out * self.d_in,  # 4D leaf-weight gather
+            self.num_leaves * self.depth,  # flat path-node gather (routing)
+        )
+        budget_rows = max(1, self._GATHER_BUDGET_BYTES // (per_row * elem_bytes))
+        chunk = self.chunk_size or self._DEFAULT_CHUNK
+        return min(chunk, budget_rows, batch)
 
     def _routing(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Flat single-pass routing -> ``(top-k leaf ids, softmax weights)``.
@@ -208,7 +242,13 @@ class BitNetUFFLayer(nn.Module):
         w: torch.Tensor,
         wq_leaf: torch.Tensor,
     ) -> torch.Tensor:
-        """Gather only the top-k leaves and combine their ternary projections."""
+        """Gather only the top-k leaves and combine their ternary projections.
+
+        Tokens are processed in mini-chunks (≤ ``_DEFAULT_CHUNK`` and always
+        clamped by ``_GATHER_BUDGET_BYTES``), so the gathered
+        ``(chunk, k, d_out, d_in)`` weight tensor — which autograd also saves
+        for the matmul backward during training — never grows with ``B*S``.
+        """
         batch = x.shape[0]
         device, dtype = x.device, x.dtype
         if self.activation_bits is not None and self.activation_bits < 32:
@@ -217,7 +257,7 @@ class BitNetUFFLayer(nn.Module):
             xq = x
 
         out = torch.empty((batch, self.d_out), device=device, dtype=dtype)
-        chunk = self.chunk_size or batch
+        chunk = self._chunk_size(batch, wq_leaf.element_size())
         for start in range(0, batch, chunk):
             end = min(start + chunk, batch)
             w_sel = wq_leaf[top_idx[start:end]]  # (c, k, d_out, d_in)
@@ -236,8 +276,19 @@ class BitNetUFFLayer(nn.Module):
             eps=self.eps,
             threshold_scale=self.ternarize_threshold_scale,
         )
-        top_idx, w = self._routing(x)
-        return self._leaf_projection(x, top_idx, w, wq_leaf)
+        batch = x.shape[0]
+        chunk = self._chunk_size(batch, x.element_size())
+        if batch <= chunk:
+            top_idx, w = self._routing(x)
+            return self._leaf_projection(x, top_idx, w, wq_leaf)
+        out = torch.empty((batch, self.d_out), device=x.device, dtype=x.dtype)
+        for start in range(0, batch, chunk):
+            end = min(start + chunk, batch)
+            top_idx, w = self._routing(x[start:end])
+            out[start:end] = self._leaf_projection(
+                x[start:end], top_idx, w, wq_leaf
+            )
+        return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() > 2:
