@@ -125,7 +125,11 @@ class FP16MasterAdamW:
     autograd accumulated) are promoted to FP32 for the exponential moving
     averages and the per-step update, then the result is written back to the
     FP16 master. This keeps gradient updates stable before any quantization
-    (ternary weights / 8-bit activations) is applied at forward time.
+    (ternary weights / 8-bit activations) is applied at forward time. Decoupled
+    weight decay is added **in place** to the promoted FP32 gradient
+    (``g.add_(p.detach(), alpha=weight_decay)``, exact for FP16 masters since
+    FP16 -> FP32 is lossless), so no per-parameter FP32 temporary is
+    allocated during :meth:`step`.
 
     Args:
         params: iterable of trainable parameters (forced to ``master_dtype``).
@@ -192,8 +196,8 @@ class FP16MasterAdamW:
             if st["exp_avg"] is None:
                 st["exp_avg"] = torch.zeros_like(g)
                 st["exp_avg_sq"] = torch.zeros_like(g)
-            if self.weight_decay:
-                g = g + self.weight_decay * p.data.float()
+            if self.weight_decay != 0:
+                g.add_(p.detach(), alpha=self.weight_decay)
             st["exp_avg"].mul_(self.betas[0]).add_(g, alpha=1 - self.betas[0])
             st["exp_avg_sq"].mul_(self.betas[1]).addcmul_(g, g, value=1 - self.betas[1])
             bc1 = 1 - self.betas[0] ** self.steps

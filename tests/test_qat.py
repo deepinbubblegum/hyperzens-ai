@@ -67,6 +67,39 @@ def test_fp16_master_state_dict_roundtrip():
     assert opt2.steps == sd["steps"]
 
 
+def test_fp16_master_weight_decay_added_in_place():
+    torch.manual_seed(0)
+    wd = 0.1
+    p = torch.nn.Parameter(torch.ones(4, device=DEVICE))
+    opt = FP16MasterAdamW([p], lr=1e-3, weight_decay=wd)
+    assert p.dtype == torch.float16
+    opt.zero_grad()
+    p.grad = torch.ones_like(p)
+    opt.step()
+
+    # first-step exp_avg = (1 - beta1) * decayed_grad, decayed_grad = 1 + wd * 1
+    st = opt.state[p]
+    expected = (1 - 0.9) * (1.0 + wd * 1.0)
+    torch.testing.assert_close(
+        st["exp_avg"], torch.full_like(st["exp_avg"], expected),
+        atol=1e-3, rtol=1e-3,
+    )
+    # the fp16 grad is untouched (decay mutated only the promoted FP32 copy)
+    torch.testing.assert_close(p.grad, torch.ones_like(p))
+    assert p.dtype == torch.float16 and torch.isfinite(p.float()).all()
+
+
+def test_fp16_master_zero_weight_decay_skips_add():
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.randn(4, device=DEVICE))
+    opt = FP16MasterAdamW([p], lr=1e-3, weight_decay=0.0)
+    opt.zero_grad()
+    p.grad = torch.randn_like(p)
+    opt.step()
+    g = p.grad.detach().to(torch.float32)
+    torch.testing.assert_close(opt.state[p]["exp_avg"], (1 - 0.9) * g, atol=1e-4, rtol=1e-4)
+
+
 def test_qat_linear_ternarizes_weights():
     lin = torch.nn.Linear(16, 32).to(DEVICE)
     wq = BitNetQAT(lin, activation_bits=16)
