@@ -34,16 +34,23 @@ nodes:
 
 4. **Bounded activation memory.** The two flat gathers — the ``(k, d_out,
    d_in)`` leaf-weight slice per token and the ``(num_leaves, depth)``
-   path-node slice — are processed in mini-chunks of ``_DEFAULT_CHUNK``
-   (256) tokens, and the chunk is always clamped so the worst-case single
-   gather stays under ``_GATHER_BUDGET_BYTES`` (256 MB). A full
-   ``(B*S, k, d_out, d_in)`` 4D tensor is therefore never allocated, keeping
-   per-layer forward activation memory well under 500 MB during training.
+   path-node slice — are processed in micro-chunks of ``_DEFAULT_CHUNK``
+   (64) tokens, and each chunk is clamped so the worst-case leaf-weight
+   gather stays under ``_LEAF_GATHER_BUDGET_BYTES`` (< 200 MB) and the
+   routing gather under ``_GATHER_BUDGET_BYTES``. A full ``(B*S, k, d_out,
+   d_in)`` 4D tensor is therefore never allocated, keeping per-layer forward
+   activation memory well under 500 MB during training.
 
 5. **BitNet 1.58-bit arithmetic.** Router ("node") projections and leaf
    weights are AbsMean-ternarized to {-1, 0, +1} with a straight-through
    estimator; activations use per-token AbsMax k-bit quantization on the leaf
    path, mirroring :class:`FastFeedForwardBitNet`.
+
+6. **fp16/bf16 type safety.** Ternary weights (exactly representable as
+   {-1, 0, +1} in fp16/bf16), path signs and biases are cast to the input's
+   compute dtype before any gather or matmul, so fp16/bf16 forward passes run
+   without implicit fp32 promotion (no upcast from the fp32 gather of a
+   half-precision weight).
 
 All indexing, matmul, ``topk`` and ``softmax`` operations are native torch
 ops that run under CUDA autocast (fp16/bf16) and on MPS devices.
@@ -76,11 +83,12 @@ class BitNetUFFLayer(nn.Module):
         bias: use leaf biases.
         activation_bits: BitNet activation quantization width applied to the
             leaf-projection input (``None`` or ``>= 32`` disables it).
-        chunk_size: maximum tokens processed per chunk in the routing / leaf
-            projection pass. If unset, ``_DEFAULT_CHUNK`` (256) is used, and
-            the chunk is always clamped so the worst-case single gather stays
-            under ``_GATHER_BUDGET_BYTES`` (256 MB), keeping per-layer forward
-            activation memory well under 500 MB during training.
+        chunk_size: maximum tokens processed per micro-chunk in the routing /
+            leaf projection pass. If unset, ``_DEFAULT_CHUNK`` (64) is used,
+            and the leaf chunk is clamped so the worst-case single
+            ``wq_leaf[top_idx[start:end]]`` gather stays under
+            ``_LEAF_GATHER_BUDGET_BYTES`` (< 200 MB), keeping per-layer
+            forward activation memory well under 500 MB during training.
         eps: numerical stability for quantizers.
         ternarize_threshold_scale: multiplier on the AbsMean ternary threshold
             (see :func:`absmean_ternarize`).
@@ -93,9 +101,11 @@ class BitNetUFFLayer(nn.Module):
         buffer that travels with the module across devices.
     """
 
-    # Token mini-chunk and single-gather byte budget used to bound activation
-    # memory (see ``_chunk_size``). Tune for smaller GPUs as needed.
-    _DEFAULT_CHUNK = 256
+    # Token micro-chunk and single-gather byte budgets used to bound
+    # activation memory (see ``_leaf_chunk_size`` / ``_routing_chunk_size``).
+    # Tune for smaller GPUs as needed.
+    _DEFAULT_CHUNK = 64
+    _LEAF_GATHER_BUDGET_BYTES = 180 * 1024 * 1024
     _GATHER_BUDGET_BYTES = 256 * 1024 * 1024
 
     def __init__(
@@ -177,29 +187,45 @@ class BitNetUFFLayer(nn.Module):
         """Fraction of leaf rows executed per token (``k / num_leaves``)."""
         return self.k / self.num_leaves
 
-    def leaf_gather_temp_bytes(self, batch: int) -> int:
-        """Worst-case bytes of the gathered intermediates for a batch."""
-        rows = self._chunk_size(batch)
-        per_row = (
-            self.k * self.d_out * self.d_in + self.num_leaves * self.depth
-        )
-        return rows * per_row * 4
+    def leaf_gather_temp_bytes(self, batch: int, elem_bytes: int = 2) -> int:
+        """Worst-case bytes of the gathered leaf intermediates for a batch."""
+        rows = self._leaf_chunk_size(batch, elem_bytes)
+        per_row = self.k * self.d_out * self.d_in
+        return rows * per_row * elem_bytes
 
-    def _chunk_size(self, batch: int, elem_bytes: int = 4) -> int:
-        """Per-chunk token count that bounds this layer's activation spikes.
+    def _leaf_chunk_size(self, batch: int, elem_bytes: int = 2) -> int:
+        """Per-chunk token count bounding the top-k leaf-weight gather.
 
-        The flat UFF design materializes two activation-heavy gathers per
-        token: the ``(k, d_out, d_in)`` leaf-weight slice and the
-        ``(num_leaves * depth)`` path-node slice. ``_chunk_size`` returns the
-        largest chunk (``chunk_size`` if set, else ``_DEFAULT_CHUNK``) that
-        keeps the worst-case single gather under ``_GATHER_BUDGET_BYTES``, so
-        a full ``(B*S, k, d_out, d_in)`` 4D tensor is never allocated.
+        The flat UFF design materializes a ``(chunk, k, d_out, d_in)``
+        leaf-weight slice per token (which autograd also saves for the matmul
+        backward during training). ``_leaf_chunk_size`` returns the largest
+        micro-chunk (``chunk_size`` if set, else ``_DEFAULT_CHUNK``) that
+        keeps that single gather under ``_LEAF_GATHER_BUDGET_BYTES`` (< 200
+        MB), so a full ``(B*S, k, d_out, d_in)`` 4D tensor is never allocated.
+        ``elem_bytes`` is the post-cast compute dtype width (2 for
+        fp16/bf16), since weights are cast to the input dtype before the
+        gather.
         """
-        per_row = max(
-            self.k * self.d_out * self.d_in,  # 4D leaf-weight gather
-            self.num_leaves * self.depth,  # flat path-node gather (routing)
+        per_row = self.k * self.d_out * self.d_in
+        budget_rows = max(
+            1, self._LEAF_GATHER_BUDGET_BYTES // (per_row * elem_bytes)
         )
-        budget_rows = max(1, self._GATHER_BUDGET_BYTES // (per_row * elem_bytes))
+        chunk = self.chunk_size or self._DEFAULT_CHUNK
+        return min(chunk, budget_rows, batch)
+
+    def _routing_chunk_size(self, batch: int, elem_bytes: int = 4) -> int:
+        """Per-chunk token count bounding the flat path-node gather.
+
+        The ``(chunk, num_leaves * depth)`` path-node gather and the
+        ``(chunk, num_leaves)`` path-log-probability table are both row-wise
+        ops (topk/softmax act per token), so routing can be split exactly
+        across micro-chunks. Returns the largest chunk under
+        ``_GATHER_BUDGET_BYTES``.
+        """
+        per_row = self.num_leaves * self.depth
+        budget_rows = max(
+            1, self._GATHER_BUDGET_BYTES // (per_row * elem_bytes)
+        )
         chunk = self.chunk_size or self._DEFAULT_CHUNK
         return min(chunk, budget_rows, batch)
 
@@ -219,21 +245,30 @@ class BitNetUFFLayer(nn.Module):
         ``(batch, k)`` softmax of the selected path log-probabilities.
         """
         batch = x.shape[0]
+        dtype = x.dtype
 
         wq_router = ste_ternarize(
             self.router_weight,
             eps=self.eps,
             threshold_scale=self.ternarize_threshold_scale,
-        )
-        logits = F.linear(x, wq_router, self.router_bias)  # (batch, nodes)
+        ).to(dtype)
+        router_bias = self.router_bias.to(dtype)
+        path_sign = self._path_sign.to(dtype)
 
-        logits_g = logits[:, self._path_nodes]  # (batch, leaves * depth)
-        logits_g = logits_g.reshape(batch, self.num_leaves, self.depth)
-        leaf_logp = -F.softplus(-self._path_sign * logits_g).sum(dim=-1)
+        chunk = self._routing_chunk_size(batch, x.element_size())
+        tops: list[torch.Tensor] = []
+        weights: list[torch.Tensor] = []
+        for start in range(0, batch, chunk):
+            end = min(start + chunk, batch)
+            logits = F.linear(x[start:end], wq_router, router_bias)
+            logits_g = logits[:, self._path_nodes]  # (c, leaves * depth)
+            logits_g = logits_g.reshape(end - start, self.num_leaves, self.depth)
+            leaf_logp = -F.softplus(-path_sign * logits_g).sum(dim=-1)
 
-        top_logp, top_idx = torch.topk(leaf_logp, self.k, dim=-1)
-        w = torch.softmax(top_logp, dim=-1)
-        return top_idx, w
+            top_logp, top_idx = torch.topk(leaf_logp, self.k, dim=-1)
+            tops.append(top_idx)
+            weights.append(torch.softmax(top_logp, dim=-1))
+        return torch.cat(tops, 0), torch.cat(weights, 0)
 
     def _leaf_projection(
         self,
@@ -244,10 +279,13 @@ class BitNetUFFLayer(nn.Module):
     ) -> torch.Tensor:
         """Gather only the top-k leaves and combine their ternary projections.
 
-        Tokens are processed in mini-chunks (≤ ``_DEFAULT_CHUNK`` and always
-        clamped by ``_GATHER_BUDGET_BYTES``), so the gathered
+        Tokens are processed in micro-chunks (≤ ``_DEFAULT_CHUNK`` and always
+        clamped by ``_LEAF_GATHER_BUDGET_BYTES`` < 200 MB), so the gathered
         ``(chunk, k, d_out, d_in)`` weight tensor — which autograd also saves
         for the matmul backward during training — never grows with ``B*S``.
+        ``wq_leaf`` is expected already cast to ``x.dtype`` (fp16/bf16), so
+        the gather and matmul run without implicit fp32 promotion; the leaf
+        bias is cast to the projection's dtype after indexing.
         """
         batch = x.shape[0]
         device, dtype = x.device, x.dtype
@@ -257,7 +295,7 @@ class BitNetUFFLayer(nn.Module):
             xq = x
 
         out = torch.empty((batch, self.d_out), device=device, dtype=dtype)
-        chunk = self._chunk_size(batch, wq_leaf.element_size())
+        chunk = self._leaf_chunk_size(batch, wq_leaf.element_size())
         for start in range(0, batch, chunk):
             end = min(start + chunk, batch)
             w_sel = wq_leaf[top_idx[start:end]]  # (c, k, d_out, d_in)
@@ -265,22 +303,22 @@ class BitNetUFFLayer(nn.Module):
                 w_sel.transpose(-1, -2), xq[start:end, None, :, None]
             ).squeeze(-1)  # (c, k, d_out, 1) -> (c, k, d_out)
             if self.leaf_bias is not None:
-                proj = proj + self.leaf_bias[top_idx[start:end]]
+                proj = proj + self.leaf_bias[top_idx[start:end]].to(proj.dtype)
             out[start:end] = (proj * w[start:end].unsqueeze(-1)).sum(dim=1)
         return out
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.contiguous()
+        # Cast the ternary leaf weights to the compute dtype (exact: values
+        # are {-1, 0, +1}) before gathering, so fp16/bf16 passes gather
+        # half-width tensors and never promote to fp32 in the matmul.
         wq_leaf = ste_ternarize(
             self.leaf_weight,
             eps=self.eps,
             threshold_scale=self.ternarize_threshold_scale,
-        )
+        ).to(x.dtype)
         batch = x.shape[0]
-        chunk = self._chunk_size(batch, x.element_size())
-        if batch <= chunk:
-            top_idx, w = self._routing(x)
-            return self._leaf_projection(x, top_idx, w, wq_leaf)
+        chunk = self._leaf_chunk_size(batch, wq_leaf.element_size())
         out = torch.empty((batch, self.d_out), device=x.device, dtype=x.dtype)
         for start in range(0, batch, chunk):
             end = min(start + chunk, batch)

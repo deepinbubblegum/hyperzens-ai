@@ -33,7 +33,7 @@ Usage:
     python scripts/distill_multitask.py --fff-depth 10 --top-k 8 \
         --device mps --checkpoint ckpts/mt_uff.pt  # BitNet-UFF student
     python scripts/distill_multitask.py --d-model 1024 --n-layers 6 \
-        --recurrent-steps 4 --fff-depth 8 --top-k 4 --use-galore \
+        --recurrent-steps 4 --fff-depth 8 --top-k 4 --optimizer galore \
         --device cuda --checkpoint ckpts/r3060_student.pt  # RTX 3060
 """
 
@@ -60,6 +60,7 @@ except ImportError:  # pragma: no cover - GaLore is optional
 
 from bitnet_fff.dataset import MultiTaskStreamer, multi_task_recipe
 from bitnet_fff.models import BitNetFFTConfig
+from bitnet_fff.qat import FP16MasterAdamW
 from bitnet_fff.mps_utils import (
     is_mps_available,
     mps_driver_allocated_bytes,
@@ -100,12 +101,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     m.add_argument("--no-tie-weights", action="store_true",
                    help="disable weight tying (overrides --tie-weights)")
 
-    g = p.add_argument_group("GaLore optimizer")
+    g = p.add_argument_group("optimizer / GaLore")
+    g.add_argument("--optimizer", choices=("adamw", "adamw_bnb_8bit", "galore"),
+                   default="adamw",
+                   help="optimizer: standard AdamW (FP32 state, safe for the "
+                        "FP16-master QAT path), bitsandbytes AdamW8bit "
+                        "(CUDA only), or GaLoreAdamW (low-rank gradient "
+                        "projection for 2D/3D matrix params)")
     g.add_argument("--use-galore", action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help="route 2D/3D matrix params through GaLoreAdamW "
-                        "low-rank projections (1D biases / LayerNorms stay on "
-                        "standard AdamW); disabled with --no-use-galore")
+                   default=None,
+                   help="legacy override for --optimizer: --use-galore selects "
+                        "'galore', --no-use-galore selects 'adamw' (default: "
+                        "follow --optimizer)")
     g.add_argument("--galore-rank", type=int, default=128,
                    help="low-rank dimension for the GaLore gradient projection")
     g.add_argument("--update-proj-gap", type=int, default=200,
@@ -516,6 +523,88 @@ def _galore_optimizer(
     )
 
 
+def _build_optimizer(
+    model, args: argparse.Namespace, device: torch.device
+) -> torch.optim.Optimizer:
+    """Build the optimizer chosen by ``--optimizer`` (legacy ``--use-galore`` overrides it).
+
+    ``galore`` routes 2D/3D matrix params through GaLoreAdamW low-rank
+    projections and 1D params through a plain AdamW group. ``adamw_bnb_8bit``
+    uses bitsandbytes quantized Adam state (CUDA only). ``adamw`` uses standard
+    AdamW math: :class:`FP16MasterAdamW` when the QAT model runs on FP16 master
+    weights (all Adam state stays FP32), plain :class:`torch.optim.AdamW`
+    otherwise.
+    """
+    name = args.optimizer
+    if args.use_galore is not None:
+        name = "galore" if args.use_galore else "adamw"
+        print(f"[optimizer] --use-galore={args.use_galore} maps to --optimizer {name}")
+
+    if name == "galore":
+        if GaLoreAdamW is None:
+            print("[optimizer] GaLoreAdamW unavailable "
+                  "(galore_torch not installed), falling back to adamw")
+        else:
+            try:
+                opt = _galore_optimizer(
+                    model, args.lr, (args.beta1, args.beta2),
+                    args.weight_decay, args.galore_rank,
+                    args.update_proj_gap, args.galore_scale,
+                    args.galore_proj_type,
+                )
+                print(f"[optimizer] GaLoreAdamW rank={args.galore_rank} "
+                      f"update_proj_gap={args.update_proj_gap} "
+                      f"scale={args.galore_scale} "
+                      f"(matrix params projected; 1D biases/LayerNorms -> AdamW)")
+                return opt
+            except Exception as e:
+                print(f"[optimizer] GaLoreAdamW setup failed ({e}), "
+                      "falling back to adamw")
+
+    if name == "adamw_bnb_8bit":
+        if device.type == "cuda":
+            try:
+                import bitsandbytes as bnb
+
+                opt = bnb.optim.AdamW8bit(
+                    model.parameters(),
+                    lr=args.lr,
+                    betas=(args.beta1, args.beta2),
+                    weight_decay=args.weight_decay,
+                )
+                print("[optimizer] using bitsandbytes AdamW8bit "
+                      "(8-bit quantized states for CUDA)")
+                return opt
+            except Exception as e:
+                print(f"[optimizer] bitsandbytes AdamW8bit unavailable ({e}), "
+                      "falling back to adamw")
+        else:
+            print("[optimizer] bitsandbytes AdamW8bit needs CUDA, "
+                  "falling back to adamw")
+
+    if getattr(model, "is_fp16_master", False) or any(
+        p.dtype == torch.float16 for p in model.parameters()
+    ):
+        opt = FP16MasterAdamW(
+            model.parameters(),
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            weight_decay=args.weight_decay,
+            master_dtype=getattr(model, "master_dtype", torch.float16),
+            clip_grad_norm=args.clip_grad_norm,
+        )
+        print("[optimizer] AdamW on FP16 master weights (FP32 state) for fp16 QAT")
+        return opt
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        weight_decay=args.weight_decay,
+    )
+    print("[optimizer] using torch.optim.AdamW")
+    return opt
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.grad_accum_steps < 1:
@@ -575,40 +664,7 @@ def main(argv: list[str] | None = None) -> int:
         clip_grad_norm=args.clip_grad_norm,
     )
 
-    galore_active = False
-    if args.use_galore:
-        if GaLoreAdamW is None:
-            print("[optimizer] GaLoreAdamW unavailable "
-                  "(galore_torch not installed), using default optimizer")
-        else:
-            try:
-                opt = _galore_optimizer(
-                    student, args.lr, (args.beta1, args.beta2),
-                    args.weight_decay, args.galore_rank,
-                    args.update_proj_gap, args.galore_scale,
-                    args.galore_proj_type,
-                )
-                galore_active = True
-                print(f"[optimizer] GaLoreAdamW rank={args.galore_rank} "
-                      f"update_proj_gap={args.update_proj_gap} "
-                      f"scale={args.galore_scale} "
-                      f"(matrix params projected; 1D biases/LayerNorms -> AdamW)")
-            except Exception as e:
-                print(f"[optimizer] GaLoreAdamW setup failed ({e}), "
-                      "using default optimizer")
-    if not galore_active and device.type == "cuda":
-        try:
-            import bitsandbytes as bnb
-
-            opt = bnb.optim.AdamW8bit(
-                student.parameters(),
-                lr=args.lr,
-                betas=(args.beta1, args.beta2),
-                weight_decay=args.weight_decay,
-            )
-            print("[optimizer] using bitsandbytes AdamW8bit (8-bit quantized states for CUDA)")
-        except Exception as e:
-            print(f"[optimizer] bitsandbytes AdamW8bit unavailable ({e}), using default optimizer")
+    opt = _build_optimizer(student, args, device)
 
     if args.gradient_checkpointing:
         student.gradient_checkpointing_enable()

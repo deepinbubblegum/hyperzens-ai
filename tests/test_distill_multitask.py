@@ -21,6 +21,7 @@ import pytest
 
 from bitnet_fff.models import BitNetFFTConfig, BitNetFFTTransformer
 from bitnet_fff.mps_utils import mps_empty_cache
+from bitnet_fff.qat import BitNetQAT
 from bitnet_fff.tokenizer import ByteTokenizer
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -113,11 +114,25 @@ def test_no_tie_weights_overrides():
 
 def test_galore_arg_defaults():
     args = mod.parse_args([])
-    assert args.use_galore is True
+    assert args.optimizer == "adamw"
+    assert args.use_galore is None
     assert args.galore_rank == 128
     assert args.update_proj_gap == 200
     assert args.galore_scale == 0.25
     assert args.galore_proj_type == "std"
+
+
+def test_optimizer_choice_arg():
+    assert mod.parse_args(["--optimizer", "adamw"]).optimizer == "adamw"
+    assert mod.parse_args(["--optimizer", "adamw_bnb_8bit"]).optimizer == "adamw_bnb_8bit"
+    assert mod.parse_args(["--optimizer", "galore"]).optimizer == "galore"
+    with pytest.raises(SystemExit):
+        mod.parse_args(["--optimizer", "sgd"])
+
+
+def test_use_galore_overrides_optimizer():
+    assert mod.parse_args(["--optimizer", "adamw", "--use-galore"]).use_galore is True
+    assert mod.parse_args(["--optimizer", "galore", "--no-use-galore"]).use_galore is False
 
 
 def test_no_use_galore_flag_disables():
@@ -166,9 +181,71 @@ def test_galore_optimizer_requires_params():
         )
 
 
+def test_build_optimizer_adamw_fp16_master():
+    cfg = _tiny_cfg()
+    student, _ = train_qat.make_qat_model(cfg, torch.device("cpu"), fp16=True)
+    assert student.is_fp16_master
+    opt = mod._build_optimizer(student, mod.parse_args([]), torch.device("cpu"))
+    assert isinstance(opt, mod.FP16MasterAdamW)
+
+
+def test_build_optimizer_adamw_plain():
+    cfg = _tiny_cfg()
+    student = BitNetQAT(BitNetFFTTransformer(cfg))  # fp32 params, no fp16 master
+    opt = mod._build_optimizer(
+        student, mod.parse_args(["--no-fp16"]), torch.device("cpu")
+    )
+    assert isinstance(opt, torch.optim.AdamW)
+
+
+def test_build_optimizer_galore():
+    student = _student()
+    opt = mod._build_optimizer(
+        student, mod.parse_args(["--optimizer", "galore", "--galore-rank", "4"]),
+        torch.device("cpu"),
+    )
+    assert opt.param_groups[0]["rank"] == 4
+
+
+def test_build_optimizer_use_galore_override():
+    student = _student()
+    opt = mod._build_optimizer(student, mod.parse_args(["--use-galore"]), torch.device("cpu"))
+    assert "rank" in opt.param_groups[0]
+    opt2 = mod._build_optimizer(
+        student, mod.parse_args(["--optimizer", "galore", "--no-use-galore"]),
+        torch.device("cpu"),
+    )
+    assert isinstance(opt2, mod.FP16MasterAdamW)
+
+
+def test_build_optimizer_bnb_8bit_off_cuda_falls_back(monkeypatch):
+    student = _student()
+    args = mod.parse_args(["--optimizer", "adamw_bnb_8bit"])
+    opt = mod._build_optimizer(student, args, torch.device("cpu"))
+    assert isinstance(opt, mod.FP16MasterAdamW)
+
+
+def test_build_optimizer_galore_missing_library_falls_back(monkeypatch):
+    monkeypatch.setattr(mod, "GaLoreAdamW", None)
+    student = _student()
+    args = mod.parse_args(["--optimizer", "galore"])
+    opt = mod._build_optimizer(student, args, torch.device("cpu"))
+    assert isinstance(opt, mod.FP16MasterAdamW)
+
+
 def test_main_e2e_use_galore(monkeypatch, tmp_path, capsys):
     _fake_load_dataset(monkeypatch, _recipe_fake_rows())
     args = _e2e_args(tmp_path, steps=3) + ["--use-galore", "--galore-rank", "4"]
+    rc = mod.main(args)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "GaLoreAdamW rank=4" in out
+    assert (tmp_path / "mt_student.pt").exists()
+
+
+def test_main_e2e_optimizer_galore(monkeypatch, tmp_path, capsys):
+    _fake_load_dataset(monkeypatch, _recipe_fake_rows())
+    args = _e2e_args(tmp_path, steps=3) + ["--optimizer", "galore", "--galore-rank", "4"]
     rc = mod.main(args)
     out = capsys.readouterr().out
     assert rc == 0
@@ -606,7 +683,6 @@ def _e2e_args(tmp_path, steps=6):
         "--batch-size", "2", "--grad-accum-steps", "2",
         "--steps", str(steps), "--val-every", "2", "--val-batches", "1",
         "--log-every", "2", "--save-every", "3", "--no-fp16", "--warmup-steps", "2",
-        "--no-use-galore",
         "--checkpoint", str(tmp_path / "mt_student.pt"),
     ]
 

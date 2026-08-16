@@ -207,6 +207,69 @@ def test_uff_chunked_projection_matches(device):
     torch.testing.assert_close(chunked(x), full(x), atol=1e-6, rtol=1e-6)
 
 
+def test_uff_forward_3d_micro_chunk_preserves_shape(device):
+    torch.manual_seed(0)
+    full = BitNetUFFLayer(d_in=16, depth=3, k=4, bias=True).to(device)
+    chunked = BitNetUFFLayer(d_in=16, depth=3, k=4, bias=True, chunk_size=7).to(
+        device
+    )
+    chunked.load_state_dict(full.state_dict())
+    x = torch.randn(5, 13, 16, device=device)
+    torch.testing.assert_close(chunked(x), full(x), atol=1e-6, rtol=1e-6)
+    assert chunked(x).shape == (5, 13, 16)
+
+
+def test_uff_micro_chunk_budget_caps_leaf_gather():
+    fff = BitNetUFFLayer(d_in=1024, d_out=1024, depth=8, k=4, bias=True)
+    assert fff._DEFAULT_CHUNK == 64
+    rows = fff._leaf_chunk_size(32768, elem_bytes=2)
+    assert 0 < rows <= 64
+    gathered = rows * fff.k * fff.d_out * fff.d_in * 2
+    assert gathered < 200 * 1024 * 1024
+    assert fff.leaf_gather_temp_bytes(32768) == gathered
+
+
+def test_uff_routing_micro_chunk_matches_full():
+    torch.manual_seed(0)
+    full = BitNetUFFLayer(d_in=16, depth=4, k=8, bias=True)
+    chunked = BitNetUFFLayer(d_in=16, depth=4, k=8, bias=True, chunk_size=3)
+    chunked.load_state_dict(full.state_dict())
+    x = torch.randn(31, 16)
+    with torch.no_grad():
+        ti, wi = full._routing(x)
+        tc, wc = chunked._routing(x)
+    torch.testing.assert_close(tc, ti)
+    torch.testing.assert_close(wc, wi)
+
+
+def test_uff_fp16_output_stays_half(device):
+    torch.manual_seed(0)
+    fff = BitNetUFFLayer(d_in=32, depth=3, k=4, bias=True).to(device, torch.float16)
+    x = torch.randn(16, 32, device=device, dtype=torch.float16)
+    with torch.no_grad():
+        out = fff(x)
+        top_idx, w = fff._routing(x)
+    assert out.dtype == torch.float16
+    assert w.dtype == torch.float16
+    assert torch.isfinite(out).all()
+
+
+def test_uff_bf16_forward_stays_half():
+    torch.manual_seed(0)
+    fff = BitNetUFFLayer(d_in=16, depth=4, k=8, bias=True)
+    x = torch.randn(4, 16)
+    with torch.no_grad():
+        ref = fff(x)
+    fffb = BitNetUFFLayer(d_in=16, depth=4, k=8, bias=True).to(torch.bfloat16)
+    fffb.load_state_dict(fff.state_dict())
+    with torch.no_grad():
+        out = fffb(x.to(torch.bfloat16))
+    assert out.dtype == torch.bfloat16
+    assert torch.isfinite(out).all()
+    # bf16 carries only 8 mantissa bits; keep a loose sanity bound
+    torch.testing.assert_close(out.float(), ref, atol=0.2, rtol=0.2)
+
+
 def test_uff_fast_forward_matches_forward(device):
     torch.manual_seed(0)
     fff = BitNetUFFLayer(d_in=16, depth=4, k=8, bias=True).to(device).eval()
