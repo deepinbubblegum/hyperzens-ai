@@ -23,6 +23,7 @@ import torch.utils.checkpoint
 
 from .bitlinear import absmax_quantize
 from .fast_fff import FastFeedForwardBitNet
+from .uff import BitNetUFFLayer
 
 __all__ = [
     "BitNetFFTConfig",
@@ -47,6 +48,12 @@ class BitNetFFTConfig:
         fff_d_out: per-leaf output width; defaults to ``d_model``.
         fff_depth: decision-tree depth (``log2(num_leaves)``). The tuner
             sweeps this against ``fff_threshold_scale``.
+        fff_k: number of top-k leaves activated per token when the UFF layer
+            is used. ``None`` selects the classic single-leaf
+            :class:`FastFeedForwardBitNet`; a positive int selects
+            :class:`BitNetUFFLayer` with that many active leaves per token
+            (default 8), turning deep trees (``fff_depth`` 10/12 -> 1024/4096
+            leaves) into ultra-sparse compute (8/4096 == 0.2% active).
         fff_threshold_scale: multiplier on the AbsMean ternary threshold
             (see :func:`absmean_ternarize`); 1.0 is the classic BitNet b1.58.
         activation_bits: BitNet activation quantization width applied to the
@@ -71,6 +78,7 @@ class BitNetFFTConfig:
     n_layers: int = 2
     fff_d_out: int | None = None
     fff_depth: int = 3
+    fff_k: int | None = None
     fff_threshold_scale: float = 1.0
     activation_bits: int = 8
     router_rank: str = "full"
@@ -431,6 +439,32 @@ def _apply_repetition_penalty(
     return logits
 
 
+def _build_fff(cfg: BitNetFFTConfig) -> nn.Module:
+    """Build the FFF layer for ``cfg`` (classic or UFF top-k).
+
+    ``cfg.fff_k is None`` selects the classic single-leaf
+    :class:`FastFeedForwardBitNet`; otherwise a :class:`BitNetUFFLayer` with
+    ``k = cfg.fff_k`` active leaves per token is built, which keeps deep trees
+    (``fff_depth`` 10/12) ultra-sparse.
+    """
+    common = dict(
+        d_in=cfg.d_model,
+        d_out=cfg.fff_out,
+        depth=cfg.fff_depth,
+        bias=cfg.fff_bias,
+        activation_bits=cfg.activation_bits,
+        chunk_size=cfg.chunk_size,
+        eps=cfg.eps,
+        ternarize_threshold_scale=cfg.fff_threshold_scale,
+    )
+    if cfg.fff_k is not None:
+        return BitNetUFFLayer(k=cfg.fff_k, **common)
+    return FastFeedForwardBitNet(
+        router_rank=cfg.router_rank,
+        **common,
+    )
+
+
 class BitNetFFTBlock(nn.Module):
     """Pre-norm transformer block: attention + FFF with residual connections."""
 
@@ -454,17 +488,7 @@ class BitNetFFTBlock(nn.Module):
             dropout=cfg.dropout,
         )
         self.norm2 = layer_norm_fn(cfg.d_model)
-        self.fff = FastFeedForwardBitNet(
-            d_in=cfg.d_model,
-            d_out=cfg.fff_out,
-            depth=cfg.fff_depth,
-            bias=cfg.fff_bias,
-            activation_bits=cfg.activation_bits,
-            router_rank=cfg.router_rank,
-            chunk_size=cfg.chunk_size,
-            eps=cfg.eps,
-            ternarize_threshold_scale=cfg.fff_threshold_scale,
-        )
+        self.fff = _build_fff(cfg)
         self.dropout = nn.Dropout(cfg.dropout) if cfg.dropout else nn.Identity()
 
     def _fff_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -889,17 +913,7 @@ class BitNetFFTMLP(nn.Module):
         for _ in range(cfg.n_layers):
             block = nn.Module()
             block.norm = layer_norm_fn(cfg.d_model)
-            block.fff = FastFeedForwardBitNet(
-                d_in=cfg.d_model,
-                d_out=cfg.fff_out,
-                depth=cfg.fff_depth,
-                bias=cfg.fff_bias,
-                activation_bits=cfg.activation_bits,
-                router_rank=cfg.router_rank,
-                chunk_size=cfg.chunk_size,
-                eps=cfg.eps,
-                ternarize_threshold_scale=cfg.fff_threshold_scale,
-            )
+            block.fff = _build_fff(cfg)
             self.layers.append(block)
         self.norm = layer_norm_fn(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.d_model)

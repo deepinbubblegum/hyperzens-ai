@@ -152,6 +152,7 @@ def _cli_arch_overrides(
         ("n_heads", "n_heads"),
         ("n_layers", "n_layers"),
         ("fff_depth", "fff_depth"),
+        ("fff_k", "fff_k"),
         ("vocab_size", "vocab_size"),
         ("max_seq_len", "max_seq_len"),
         ("activation_bits", "activation_bits"),
@@ -341,6 +342,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g.add_argument("--n-heads", type=int, default=4)
     g.add_argument("--n-layers", type=int, default=2)
     g.add_argument("--fff-depth", type=int, default=3)
+    g.add_argument("--fff-k", type=int, default=None,
+                   help="activate top-k leaves per token (BitNetUFF); "
+                        "None = classic single-leaf FFF. Pair with deep "
+                        "--fff-depth 10/12 for ultra-sparse compute")
     g.add_argument("--vocab-size", type=int, default=256)
     g.add_argument("--max-seq-len", type=int, default=128)
     g.add_argument("--activation-bits", type=int, default=8)
@@ -386,6 +391,7 @@ def _cfg_from_args(args: argparse.Namespace, tok) -> BitNetFFTConfig:
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         fff_depth=args.fff_depth,
+        fff_k=args.fff_k,
         max_seq_len=args.max_seq_len,
         activation_bits=args.activation_bits,
         attention_activation_bits=args.attention_activation_bits,
