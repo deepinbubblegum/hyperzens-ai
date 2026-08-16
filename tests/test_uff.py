@@ -247,11 +247,11 @@ def test_uff_fp16_and_autocast(device):
         assert torch.isfinite(out_ac).all()
 
 
-def test_transformer_uses_uff_when_fff_k_set():
+def test_transformer_uses_uff_when_top_k_set():
     torch.manual_seed(0)
     uff_cfg = BitNetFFTConfig(
         vocab_size=64, d_model=32, n_heads=2, n_layers=2,
-        fff_depth=10, fff_k=8, max_seq_len=16,
+        fff_depth=10, top_k=8, max_seq_len=16,
     )
     m = BitNetFFTTransformer(uff_cfg)
     for layer in m.layers:
@@ -265,7 +265,7 @@ def test_transformer_uses_uff_when_fff_k_set():
     grads = [p.grad for p in m.parameters() if p.grad is not None]
     assert grads and all(torch.isfinite(g).all() for g in grads)
 
-    # default (fff_k=None) still uses the classic single-leaf FFF
+    # default (top_k=None) still uses the classic single-leaf FFF
     classic_cfg = BitNetFFTConfig(
         vocab_size=64, d_model=32, n_heads=2, n_layers=1, fff_depth=3,
         max_seq_len=16,
@@ -280,7 +280,7 @@ def test_transformer_uff_eval_fast_path_matches_train(device):
     torch.manual_seed(0)
     cfg = BitNetFFTConfig(
         vocab_size=64, d_model=32, n_heads=2, n_layers=1,
-        fff_depth=8, fff_k=8, use_fast_inference=True, max_seq_len=16,
+        fff_depth=8, top_k=8, use_fast_inference=True, max_seq_len=16,
     )
     m = BitNetFFTTransformer(cfg).to(device)
     tokens = torch.randint(0, 64, (2, 8), device=device)
@@ -296,7 +296,7 @@ def test_mlp_stack_uses_uff():
     torch.manual_seed(0)
     cfg = BitNetFFTConfig(
         vocab_size=0, d_model=16, n_heads=2, n_layers=2,
-        fff_depth=8, fff_k=4,
+        fff_depth=8, top_k=4,
     )
     mlp = BitNetFFTMLP(cfg)
     x = torch.randn(3, 16)
@@ -319,7 +319,7 @@ def test_uff_generate_deep_tree(device):
     torch.manual_seed(0)
     cfg = BitNetFFTConfig(
         vocab_size=64, d_model=32, n_heads=2, n_layers=1,
-        fff_depth=12, fff_k=8, max_seq_len=16, use_fast_inference=True,
+        fff_depth=12, top_k=8, max_seq_len=16, use_fast_inference=True,
     )
     m = BitNetFFTTransformer(cfg).to(device)
     assert m.layers[0].fff.num_leaves == 4096

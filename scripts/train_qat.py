@@ -214,7 +214,7 @@ def build_cfg(args: argparse.Namespace) -> BitNetFFTConfig:
         n_heads=g("n_heads", 4),
         n_layers=g("n_layers", 2),
         fff_depth=g("fff_depth", 3),
-        fff_k=g("fff_k", None),
+        top_k=g("top_k", None),
         max_seq_len=g("max_seq_len", 64),
         activation_bits=g("activation_bits", 8),
         attention_activation_bits=g("attention_activation_bits", None),
@@ -333,7 +333,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     m.add_argument("--n-heads", type=int, default=4)
     m.add_argument("--n-layers", type=int, default=2)
     m.add_argument("--fff-depth", type=int, default=3)
-    m.add_argument("--fff-k", type=int, default=None,
+    m.add_argument("--top-k", type=int, default=None,
                    help="activate top-k leaves per token (BitNetUFF); "
                         "None = classic single-leaf FFF. Pair with deep "
                         "--fff-depth 10/12 for ultra-sparse compute")
@@ -416,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
         clip_grad_norm=args.clip_grad_norm,
     )
     print(f"[qat] {cfg.d_model}/{cfg.n_heads}/{cfg.n_layers} fff_depth={cfg.fff_depth} "
-          f"fff_k={cfg.fff_k} vocab={cfg.vocab_size} fp16_master={not args.no_fp16} "
+          f"top_k={cfg.top_k} vocab={cfg.vocab_size} fp16_master={not args.no_fp16} "
           f"quant_mode={args.quant_mode} device={device}")
 
     step = 0

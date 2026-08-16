@@ -48,7 +48,7 @@ class BitNetFFTConfig:
         fff_d_out: per-leaf output width; defaults to ``d_model``.
         fff_depth: decision-tree depth (``log2(num_leaves)``). The tuner
             sweeps this against ``fff_threshold_scale``.
-        fff_k: number of top-k leaves activated per token when the UFF layer
+        top_k: number of top-k leaves activated per token when the UFF layer
             is used. ``None`` selects the classic single-leaf
             :class:`FastFeedForwardBitNet`; a positive int selects
             :class:`BitNetUFFLayer` with that many active leaves per token
@@ -78,7 +78,7 @@ class BitNetFFTConfig:
     n_layers: int = 2
     fff_d_out: int | None = None
     fff_depth: int = 3
-    fff_k: int | None = None
+    top_k: int | None = None
     fff_threshold_scale: float = 1.0
     activation_bits: int = 8
     router_rank: str = "full"
@@ -442,9 +442,9 @@ def _apply_repetition_penalty(
 def _build_fff(cfg: BitNetFFTConfig) -> nn.Module:
     """Build the FFF layer for ``cfg`` (classic or UFF top-k).
 
-    ``cfg.fff_k is None`` selects the classic single-leaf
+    ``cfg.top_k is None`` selects the classic single-leaf
     :class:`FastFeedForwardBitNet`; otherwise a :class:`BitNetUFFLayer` with
-    ``k = cfg.fff_k`` active leaves per token is built, which keeps deep trees
+    ``k = cfg.top_k`` active leaves per token is built, which keeps deep trees
     (``fff_depth`` 10/12) ultra-sparse.
     """
     common = dict(
@@ -457,8 +457,8 @@ def _build_fff(cfg: BitNetFFTConfig) -> nn.Module:
         eps=cfg.eps,
         ternarize_threshold_scale=cfg.fff_threshold_scale,
     )
-    if cfg.fff_k is not None:
-        return BitNetUFFLayer(k=cfg.fff_k, **common)
+    if cfg.top_k is not None:
+        return BitNetUFFLayer(k=cfg.top_k, **common)
     return FastFeedForwardBitNet(
         router_rank=cfg.router_rank,
         **common,

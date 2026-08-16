@@ -30,6 +30,8 @@ Usage:
         --batch-size 8 --val-every 500 --checkpoint ckpts/mt_student.pt
     python scripts/distill_multitask.py --teacher hf://Qwen/Qwen2.5-0.5B \
         --tasks math,code --weights 0.6,0.4 --steps 20000 --device mps
+    python scripts/distill_multitask.py --fff-depth 10 --top-k 8 \
+        --device mps --checkpoint ckpts/mt_uff.pt  # BitNet-UFF student
 """
 
 from __future__ import annotations
@@ -72,6 +74,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     m.add_argument("--n-heads", type=int, default=4)
     m.add_argument("--n-layers", type=int, default=2)
     m.add_argument("--fff-depth", type=int, default=3)
+    m.add_argument("--top-k", type=int, default=8,
+                   help="Number of active top-k leaves per token in BitNet-UFF")
     m.add_argument("--vocab-size", type=int, default=256)
     m.add_argument("--max-seq-len", type=int, default=64)
     m.add_argument("--activation-bits", type=int, default=8)
@@ -432,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         fff_depth=args.fff_depth,
+        top_k=args.top_k,
         fff_bias=not args.no_fff_bias,
         max_seq_len=args.max_seq_len,
         activation_bits=args.activation_bits,
@@ -476,6 +481,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[student] torch.compile enabled")
     print(f"[student] d_model={cfg.d_model} n_heads={cfg.n_heads} "
           f"n_layers={cfg.n_layers} fff_depth={cfg.fff_depth} "
+          f"top_k={cfg.top_k} "
           f"vocab={cfg.vocab_size} tie_weights={tie} alpha={args.alpha} "
           f"T={args.temperature} device={device}")
     if args.warmup_steps > 0:

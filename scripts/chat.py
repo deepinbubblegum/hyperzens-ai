@@ -122,13 +122,17 @@ def _checkpoint_config(state: dict) -> BitNetFFTConfig | None:
 
     Checkpoints saved by ``train_qat.save_checkpoint`` store the full config
     (``dataclasses.asdict``), so the architecture (``d_model``, ``n_heads``,
-    ``n_layers``, ``fff_depth``, ``max_seq_len``, ...) can be recovered without
-    passing CLI flags. Unknown or ``None`` keys are dropped so older checkpoints
-    stay compatible.
+    ``n_layers``, ``fff_depth``, ``top_k``, ``max_seq_len``, ...) can be
+    recovered without passing CLI flags. Unknown or ``None`` keys are dropped
+    so older checkpoints stay compatible; the pre-``top_k`` config key
+    ``fff_k`` (BitNet-UFF active leaves) is migrated to ``top_k``.
     """
     saved = state.get("config")
     if not isinstance(saved, dict):
         return None
+    saved = dict(saved)
+    if "fff_k" in saved and "top_k" not in saved:
+        saved["top_k"] = saved.pop("fff_k")
     allowed = set(BitNetFFTConfig.__dataclass_fields__)
     known = {k: v for k, v in saved.items() if k in allowed and v is not None}
     if not known:
@@ -152,7 +156,7 @@ def _cli_arch_overrides(
         ("n_heads", "n_heads"),
         ("n_layers", "n_layers"),
         ("fff_depth", "fff_depth"),
-        ("fff_k", "fff_k"),
+        ("uff_k", "top_k"),
         ("vocab_size", "vocab_size"),
         ("max_seq_len", "max_seq_len"),
         ("activation_bits", "activation_bits"),
@@ -342,10 +346,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g.add_argument("--n-heads", type=int, default=4)
     g.add_argument("--n-layers", type=int, default=2)
     g.add_argument("--fff-depth", type=int, default=3)
-    g.add_argument("--fff-k", type=int, default=None,
-                   help="activate top-k leaves per token (BitNetUFF); "
-                        "None = classic single-leaf FFF. Pair with deep "
-                        "--fff-depth 10/12 for ultra-sparse compute")
+    g.add_argument("--uff-k", type=int, default=None,
+                   help="activate top-k leaves per token in BitNet-UFF "
+                        "(--top-k is taken by sampling); None = classic "
+                        "single-leaf FFF. Pair with deep --fff-depth 10/12 "
+                        "for ultra-sparse compute")
     g.add_argument("--vocab-size", type=int, default=256)
     g.add_argument("--max-seq-len", type=int, default=128)
     g.add_argument("--activation-bits", type=int, default=8)
@@ -391,7 +396,7 @@ def _cfg_from_args(args: argparse.Namespace, tok) -> BitNetFFTConfig:
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         fff_depth=args.fff_depth,
-        fff_k=args.fff_k,
+        top_k=args.uff_k,
         max_seq_len=args.max_seq_len,
         activation_bits=args.activation_bits,
         attention_activation_bits=args.attention_activation_bits,
@@ -432,6 +437,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[cfg] architecture loaded from checkpoint "
                   f"(d_model={cfg.d_model} n_heads={cfg.n_heads} "
                   f"n_layers={cfg.n_layers} fff_depth={cfg.fff_depth} "
+                  f"top_k={cfg.top_k} "
                   f"max_seq_len={cfg.max_seq_len} vocab={cfg.vocab_size} "
                   f"tie_weights={cfg.tie_weights})")
             if names:

@@ -204,6 +204,27 @@ def test_checkpoint_config_drops_unknown_keys():
     assert mod._checkpoint_config({"config": saved}).d_model == 16
 
 
+def test_checkpoint_config_loads_top_k():
+    mod = _load_chat_module()
+    saved = {
+        "vocab_size": 256, "d_model": 16, "n_heads": 2, "n_layers": 1,
+        "fff_depth": 10, "top_k": 8, "max_seq_len": 32,
+    }
+    cfg = mod._checkpoint_config({"config": saved})
+    assert cfg.top_k == 8
+
+
+def test_checkpoint_config_migrates_legacy_fff_k_to_top_k():
+    mod = _load_chat_module()
+    saved = {
+        "vocab_size": 256, "d_model": 16, "n_heads": 2, "n_layers": 1,
+        "fff_depth": 10, "fff_k": 8, "max_seq_len": 32,
+    }
+    cfg = mod._checkpoint_config({"config": saved})
+    assert cfg.top_k == 8
+    assert "fff_k" not in cfg.__dataclass_fields__
+
+
 def test_checkpoint_config_none_without_config_key():
     mod = _load_chat_module()
     assert mod._checkpoint_config({"model": {}}) is None
