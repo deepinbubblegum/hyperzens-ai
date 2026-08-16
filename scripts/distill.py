@@ -50,6 +50,15 @@ import train_qat
 
 HF_PREFIX = "hf://"
 
+# Memory budget for :func:`distillation_loss`. KL/CE intermediates of shape
+# ``(tokens, vocab)`` are computed in FP32, so the sequence is processed in
+# chunks of at most ``KD_CHUNK_TOKENS`` tokens (or fewer when the FP32 byte
+# size of a single chunk tensor would exceed ``KD_BUDGET_BYTES``). For the
+# high-vocab case (V = 200019, ``o200k`` tokenizers) a 64-token chunk keeps
+# every intermediate at ~51 MB, far below the 100 MB allocation target.
+KD_CHUNK_TOKENS = 64
+KD_BUDGET_BYTES = 96 * 1024 * 1024
+
 
 def load_teacher(
     spec: str,
@@ -128,20 +137,52 @@ def distillation_loss(
     temperature: float,
     vocab: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return ``(loss, kd, ce)`` with temperature-scaled KL distillation."""
-    s = student_logits[:, :-1].float()
-    t = teacher_logits_[:, :-1].float()
+    """Return ``(loss, kd, ce)`` with temperature-scaled KL distillation.
+
+    The student/teacher logits are shifted one token left (predict position
+    ``i`` from ``i-1``) and compared against the shifted labels, mirroring
+    teacher-forced next-token training:
+
+        loss = alpha * T^2 * KL(softmax(s/T) || softmax(t/T)) + (1-alpha) * CE(s)
+
+    ``kd`` is the ``batchmean`` KL (sum over all elements divided by the batch
+    size ``B``) scaled by ``T^2``, matching the ``reduction="batchmean"``
+    semantics; ``ce`` is the mean per-token cross-entropy.
+
+    The sequence dimension is processed in chunks of ``KD_CHUNK_TOKENS`` tokens
+    so the FP32 ``(tokens, vocab)`` intermediates (logits, log-softmax, softmax,
+    KL pointwise loss) stay bounded by ``KD_BUDGET_BYTES`` and never exceed
+    100 MB even for high-vocab (V ~ 200019) logits under BF16/FP16 autocast.
+    Chunking is numerically exact: the per-chunk sums reproduce the full-tensor
+    ``batchmean``/``mean`` reductions.
+    """
+    s = student_logits[:, :-1]
+    t = teacher_logits_[:, :-1]
     labels = labels[:, 1:]
-    ce = F.cross_entropy(s.reshape(-1, vocab), labels.reshape(-1))
+    B, S, V = s.shape
     T = temperature
-    kd = (
-        F.kl_div(
-            F.log_softmax(s / T, dim=-1),
-            F.softmax(t / T, dim=-1),
-            reduction="batchmean",
+    chunk_tokens = max(1, min(KD_CHUNK_TOKENS, KD_BUDGET_BYTES // (V * 4)))
+    seq_chunk = max(1, chunk_tokens // B)
+    kd_sum = torch.zeros((), device=s.device, dtype=torch.float32)
+    ce_sum = torch.zeros((), device=s.device, dtype=torch.float32)
+    for start in range(0, S, seq_chunk):
+        end = min(start + seq_chunk, S)
+        # copy=True guarantees fresh FP32 storage even when the input is already
+        # float32, so the in-place temperature scaling below never mutates the
+        # caller's logits (``.float()`` is a no-op for float32 tensors).
+        sc = s[:, start:end].to(torch.float32, copy=True)
+        tc = t[:, start:end].to(torch.float32, copy=True)
+        lc = labels[:, start:end].reshape(-1)
+        ce_sum = ce_sum + F.cross_entropy(sc.reshape(-1, V), lc, reduction="sum")
+        sc.div_(T)
+        tc.div_(T)
+        kd_sum = kd_sum + F.kl_div(
+            F.log_softmax(sc, dim=-1),
+            F.softmax(tc, dim=-1),
+            reduction="sum",
         )
-        * T * T
-    )
+    kd = kd_sum / B * T * T
+    ce = ce_sum / (B * S)
     loss = alpha * kd + (1.0 - alpha) * ce
     return loss, kd, ce
 

@@ -19,6 +19,7 @@ import sys
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(REPO, "scripts")
@@ -366,6 +367,49 @@ def test_distill_loss_alpha_extremes():
     alpha = 0.7
     loss, kd, ce = distill.distillation_loss(s, t, labels, alpha, 2.0, vocab)
     assert loss.item() == pytest.approx(alpha * kd.item() + (1 - alpha) * ce.item())
+
+
+def test_distill_loss_chunked_matches_reference():
+    """Chunked KL/CE must reproduce the full-tensor reductions exactly."""
+    torch.manual_seed(0)
+    vocab = 256
+    # >64 tokens forces multiple sequence chunks even with fp16 (autocast) inputs
+    s = torch.randn(2, 100, vocab, dtype=torch.float16)
+    t = torch.randn(2, 100, vocab, dtype=torch.float16)
+    labels = torch.randint(0, vocab, (2, 100))
+    assert 2 * (100 - 1) > distill.KD_CHUNK_TOKENS
+    T, alpha = 2.0, 0.7
+    loss, kd, ce = distill.distillation_loss(s, t, labels, alpha, T, vocab)
+    # reference: full-tensor batchmean KL * T^2 and mean CE
+    sf = s[:, :-1].float()
+    tf = t[:, :-1].float()
+    lf = labels[:, 1:]
+    ce_ref = F.cross_entropy(sf.reshape(-1, vocab), lf.reshape(-1))
+    kd_ref = (
+        F.kl_div(F.log_softmax(sf / T, dim=-1), F.softmax(tf / T, dim=-1),
+                 reduction="batchmean") * T * T
+    )
+    assert kd == pytest.approx(kd_ref.item(), rel=1e-5)
+    assert ce == pytest.approx(ce_ref.item(), rel=1e-5)
+    assert loss.item() == pytest.approx(alpha * kd.item() + (1 - alpha) * ce.item())
+
+
+def test_distill_loss_bounded_allocations():
+    """High-vocab (V=200019) distillation never allocates a tensor >= 100 MB."""
+    torch.manual_seed(0)
+    vocab = 200019
+    B, S = 4, 64
+    s = torch.randn(B, S, vocab, dtype=torch.float16)
+    t = torch.randn(B, S, vocab, dtype=torch.float16)
+    labels = torch.randint(0, vocab, (B, S))
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            profile_memory=True,
+        ) as prof:
+            distill.distillation_loss(s, t, labels, 0.7, 2.0, vocab)
+    max_alloc = max((e.self_cpu_memory_usage for e in prof.events()), default=0)
+    assert 0 < max_alloc < 100 * 1024 * 1024, f"peak allocation {max_alloc / 1e6:.1f} MB"
 
 
 def test_distill_saves_checkpoint(tmp_path):
