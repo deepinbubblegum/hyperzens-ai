@@ -7,6 +7,8 @@ monkeypatch ``datasets.load_dataset`` so no network access is required.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 
@@ -15,6 +17,9 @@ from bitnet_fff.dataset_mixture import (
     DOMAINS,
     MASTER_DATASETS,
     MixtureStreamer,
+    bbh_format,
+    function_calling_format,
+    gpqa_format,
     mixture_recipe,
     robust_parse,
 )
@@ -150,6 +155,205 @@ class TestRobustParse:
         """When both 'text' and QA keys exist, plain text wins (first match)."""
         ex = {"text": "plain", "question": "q", "answer": "a"}
         assert robust_parse(ex) == "plain"
+
+
+# ---------------------------------------------------------------------------
+# function_calling_format
+# ---------------------------------------------------------------------------
+
+
+class TestFunctionCallingFormat:
+    """Verify structured ChatML tool-call output."""
+
+    def test_xlam_schema(self):
+        ex = {
+            "query": "What is 2+2?",
+            "tools": json.dumps([
+                {"name": "math.add", "description": "Add two numbers", "parameters": {}}
+            ]),
+            "answers": json.dumps([{"name": "math.add", "arguments": {"a": 2, "b": 2}}]),
+        }
+        result = function_calling_format(ex)
+        assert "User: What is 2+2?" in result
+        assert "math.add" in result
+        assert "<tool_call>" in result
+        assert "</tool_call>" in result
+
+    def test_dict_tools(self):
+        ex = {
+            "query": "search for AI",
+            "tools": {"name": "web.search", "description": "Search the web"},
+            "answers": {"name": "web.search", "arguments": {"q": "AI"}},
+        }
+        result = function_calling_format(ex)
+        assert "User: search for AI" in result
+        assert "web.search" in result
+
+    def test_list_tools(self):
+        ex = {
+            "query": "do something",
+            "tools": [{"name": "a"}, {"name": "b"}],
+            "answers": [{"name": "a"}],
+        }
+        result = function_calling_format(ex)
+        assert "a" in result
+        assert "b" in result
+
+    def test_missing_query_returns_none(self):
+        ex = {"tools": "[]", "answers": "[]"}
+        assert function_calling_format(ex) is None
+
+    def test_missing_tools_uses_empty(self):
+        ex = {"query": "hello"}
+        result = function_calling_format(ex)
+        assert "Available tools:" in result
+        assert "[]" in result
+
+    def test_string_answers(self):
+        ex = {
+            "query": "call func",
+            "answers": "func_name(arg1=val1)",
+        }
+        result = function_calling_format(ex)
+        assert "func_name(arg1=val1)" in result
+
+    def test_question_fallback(self):
+        ex = {"question": "fallback query"}
+        result = function_calling_format(ex)
+        assert "User: fallback query" in result
+
+
+# ---------------------------------------------------------------------------
+# bbh_format
+# ---------------------------------------------------------------------------
+
+
+class TestBBHFormat:
+    """Verify BIG-Bench Hard CoT prompt formatting."""
+
+    def test_with_choices(self):
+        ex = {
+            "question": "What is 2+2?",
+            "choices": {"label": ["A", "B", "C"], "text": ["3", "4", "5"]},
+            "target": "(B) 4",
+        }
+        result = bbh_format(ex)
+        assert "Question: What is 2+2?" in result
+        assert "(A) 3" in result
+        assert "(B) 4" in result
+        assert "(C) 5" in result
+        assert "<thought>" in result
+        assert "Answer: (B) 4" in result
+
+    def test_flat_choices_list(self):
+        ex = {
+            "question": "Pick one",
+            "choices": ["yes", "no", "maybe"],
+            "target": "yes",
+        }
+        result = bbh_format(ex)
+        assert "(A) yes" in result
+        assert "(B) no" in result
+        assert "(C) maybe" in result
+
+    def test_no_choices(self):
+        ex = {
+            "question": "Is this true?",
+            "target": "yes",
+        }
+        result = bbh_format(ex)
+        assert "Question: Is this true?" in result
+        assert "Choices:" not in result
+        assert "Answer: yes" in result
+
+    def test_target_as_list(self):
+        ex = {
+            "question": "Test",
+            "target": ["(A) answer"],
+        }
+        result = bbh_format(ex)
+        assert "Answer: (A) answer" in result
+
+    def test_missing_question_returns_none(self):
+        ex = {"target": "yes"}
+        assert bbh_format(ex) is None
+
+    def test_input_fallback(self):
+        ex = {"input": "input text", "target": "ans"}
+        result = bbh_format(ex)
+        assert "Question: input text" in result
+
+
+# ---------------------------------------------------------------------------
+# gpqa_format
+# ---------------------------------------------------------------------------
+
+
+class TestGPQAFormat:
+    """Verify GPQA graduate-level CoT prompt formatting."""
+
+    def test_standard_schema(self):
+        ex = {
+            "Question": "What is the capital of France?",
+            "Correct Answer": "Paris",
+            "Incorrect Answer 1": "London",
+            "Incorrect Answer 2": "Berlin",
+            "Incorrect Answer 3": "Madrid",
+            "Subdomain": "Geography",
+        }
+        result = gpqa_format(ex)
+        assert "Question: What is the capital of France?" in result
+        assert "Domain: Geography" in result
+        assert "(A) Paris" in result
+        assert "(B) London" in result
+        assert "(C) Berlin" in result
+        assert "(D) Madrid" in result
+        assert "<thought>" in result
+        assert "Answer: (A) Paris" in result
+
+    def test_no_subdomain(self):
+        ex = {
+            "Question": "Test?",
+            "Correct Answer": "Yes",
+            "Incorrect Answer 1": "No",
+        }
+        result = gpqa_format(ex)
+        assert "Domain:" not in result
+        assert "(A) Yes" in result
+        assert "(B) No" in result
+
+    def test_single_answer_no_choices(self):
+        ex = {"Question": "Solo", "Correct Answer": "Only"}
+        result = gpqa_format(ex)
+        assert "Question: Solo" in result
+        assert "Choices:" not in result
+        assert "Answer: (A) Only" in result
+
+    def test_high_level_domain_fallback(self):
+        ex = {
+            "Question": "Physics?",
+            "Correct Answer": "A",
+            "High-level domain": "Physics",
+        }
+        result = gpqa_format(ex)
+        assert "Domain: Physics" in result
+
+    def test_missing_question_returns_none(self):
+        ex = {"Correct Answer": "A"}
+        assert gpqa_format(ex) is None
+
+    def test_missing_correct_returns_none(self):
+        ex = {"Question": "What?"}
+        assert gpqa_format(ex) is None
+
+    def test_lowercase_keys(self):
+        ex = {
+            "question": "lower",
+            "correct_answer": "yes",
+            "incorrect_answer_1": "no",
+        }
+        result = gpqa_format(ex)
+        assert "(A) yes" in result
 
 
 # ---------------------------------------------------------------------------
@@ -303,13 +507,15 @@ class TestDelimiterPacking:
 class TestDomainDefinitions:
     """Verify the master domain list structure and weight consistency."""
 
-    def test_six_domains(self):
-        assert len(DOMAINS) == 6
+    def test_nine_domains(self):
+        assert len(DOMAINS) == 9
 
     def test_domain_names(self):
         names = [d["name"] for d in DOMAINS]
-        assert names == ["reasoning", "general", "stem",
-                         "specialties", "coding", "thai"]
+        assert names == [
+            "reasoning", "general", "stem", "specialties", "coding", "thai",
+            "function_calling", "logic", "graduate_stem",
+        ]
 
     def test_weights_sum_to_one(self):
         total = sum(d["weight"] for d in DOMAINS)
@@ -317,7 +523,7 @@ class TestDomainDefinitions:
 
     def test_each_domain_has_datasets(self):
         for domain in DOMAINS:
-            assert len(domain["datasets"]) >= 2
+            assert len(domain["datasets"]) >= 1
 
     def test_master_datasets_count(self):
         total_ds = sum(len(d["datasets"]) for d in DOMAINS)
@@ -347,7 +553,7 @@ class TestMixtureStreamerIntegration:
     """End-to-end tests for the filtered + delimited streamer."""
 
     def _build_fake_mixture(self, monkeypatch):
-        """Create fake data for all 15 datasets with unique markers."""
+        """Create fake data for all datasets with unique markers."""
         fake: dict[str, list[dict]] = {}
         for domain in DOMAINS:
             for i, ds in enumerate(domain["datasets"]):
