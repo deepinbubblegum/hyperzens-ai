@@ -7,8 +7,10 @@ Logic, Graduate STEM) at configurable sampling ratios.
 A **robust universal formatter** handles heterogeneous schemas (``text``,
 ``conversations``, ``messages``, ``instruction``/``output``,
 ``question``/``answer``).  **Specialized formatters** produce structured
-outputs for function-calling (ChatML ``<tool_call>`` blocks) and
-multiple-choice CoT prompts with ``<thought>`` tags (BBH / GPQA).
+outputs for function-calling (ChatML ``<tool_call>`` blocks), multiple-choice
+CoT prompts with ``<thought>`` tags (BBH / GPQA), and DeepSeek-R1-style
+reasoning/math chains (:func:`cot_format`) that wrap every prompt with a
+``<thought>`` block before the final ``Answer:`` response.
 
 A **token-length filter** drops examples outside a configurable range
 (default 32–512 tokens).  Continuous packing joins consecutive examples with
@@ -52,6 +54,7 @@ __all__ = [
     "DOMAINS",
     "MASTER_DATASETS",
     "robust_parse",
+    "cot_format",
     "function_calling_format",
     "bbh_format",
     "gpqa_format",
@@ -129,6 +132,55 @@ def robust_parse(example: dict) -> str | None:
                 return f"Q: {q}\nA: {a}"
 
     return None
+
+
+def cot_format(ex: dict) -> str | None:
+    """Format reasoning / math QA rows as DeepSeek-R1-style CoT.
+
+    Every example becomes a question followed by a structured ``<thought>``
+    block that precedes the final ``Answer:`` response, so the model is
+    trained to emit its reasoning trace before committing to an answer::
+
+        Q: <problem>
+
+        <thought>
+        Let me solve this step by step.
+        </thought>
+
+        Answer: <solution>
+
+    Handles the common reasoning/math schemas: ``problem``/``solution``
+    (``open-r1/OpenR1-Math-220k``), ``question``/``answer``,
+    ``instruction``/``output``, ``prompt``/``response``, ``query``, ``target``
+    and a plain ``text`` fallback.
+    """
+    question = None
+    for key in ("problem", "question", "instruction", "prompt", "query", "text"):
+        val = ex.get(key)
+        if isinstance(val, str) and val.strip():
+            question = val.strip()
+            break
+    if not question:
+        return None
+
+    answer = None
+    for key in (
+        "solution", "answer", "output", "response", "target", "final_answer",
+    ):
+        val = ex.get(key)
+        if isinstance(val, str) and val.strip():
+            answer = val.strip()
+            break
+
+    parts = [f"Q: {question}"]
+    parts.append(
+        "\n\n<thought>\n"
+        "Let me solve this step by step.\n"
+        "</thought>"
+    )
+    if answer:
+        parts.append(f"\n\nAnswer: {answer}")
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -386,8 +438,16 @@ DOMAINS: list[dict] = [
         "name": "reasoning",
         "weight": 0.20,
         "datasets": [
-            {"name": "open-r1/OpenR1-Math-220k", "split": "train"},
-            {"name": "BespokeLabs/Bespoke-Stratos-17k", "split": "train"},
+            {
+                "name": "open-r1/OpenR1-Math-220k",
+                "split": "train",
+                "formatter": cot_format,
+            },
+            {
+                "name": "BespokeLabs/Bespoke-Stratos-17k",
+                "split": "train",
+                "formatter": cot_format,
+            },
         ],
     },
     {
@@ -415,7 +475,11 @@ DOMAINS: list[dict] = [
         "datasets": [
             {"name": "medalpaca/medical_meadow_medqa", "split": "train"},
             {"name": "nguien/legal-qa-v1", "split": "train"},
-            {"name": "gbader/FinQA", "split": "train"},
+            {
+                "name": "gbader/FinQA",
+                "split": "train",
+                "formatter": cot_format,
+            },
         ],
     },
     {

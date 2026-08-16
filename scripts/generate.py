@@ -61,7 +61,7 @@ def _fresh_caches(
             batch, model.cfg.n_heads, model.cfg.max_seq_len, head_dim,
             dtype=dtype, device=device,
         )
-        for _ in model.layers
+        for _ in range(model.cfg.n_layers * model.cfg.recurrent_steps)
     ]
 
 

@@ -18,6 +18,7 @@ from bitnet_fff.dataset_mixture import (
     MASTER_DATASETS,
     MixtureStreamer,
     bbh_format,
+    cot_format,
     function_calling_format,
     gpqa_format,
     mixture_recipe,
@@ -357,6 +358,87 @@ class TestGPQAFormat:
 
 
 # ---------------------------------------------------------------------------
+# cot_format — DeepSeek-R1 style reasoning / math CoT
+# ---------------------------------------------------------------------------
+
+
+class TestCoTFormat:
+    """Verify the <thought> CoT formatter for reasoning and math datasets."""
+
+    def test_problem_solution(self):
+        ex = {"problem": "2+2", "solution": "4"}
+        result = cot_format(ex)
+        assert result.startswith("Q: 2+2")
+        assert "<thought>" in result
+        assert "Let me solve this step by step." in result
+        assert "</thought>" in result
+        assert result.endswith("Answer: 4")
+
+    def test_question_answer(self):
+        ex = {"question": "x?", "answer": "y"}
+        result = cot_format(ex)
+        assert "Q: x?" in result
+        assert "Answer: y" in result
+
+    def test_instruction_output(self):
+        ex = {"instruction": "expand", "output": "done"}
+        result = cot_format(ex)
+        assert "Q: expand" in result
+        assert "Answer: done" in result
+
+    def test_prompt_response(self):
+        ex = {"prompt": "p", "response": "r"}
+        result = cot_format(ex)
+        assert "Q: p" in result
+        assert "Answer: r" in result
+
+    def test_query_target(self):
+        ex = {"query": "q", "target": "t"}
+        result = cot_format(ex)
+        assert "Q: q" in result
+        assert "Answer: t" in result
+
+    def test_text_fallback_has_no_answer(self):
+        ex = {"text": "just text"}
+        result = cot_format(ex)
+        assert "Q: just text" in result
+        assert "Answer:" not in result
+
+    def test_missing_question_returns_none(self):
+        assert cot_format({}) is None
+        assert cot_format({"solution": "4"}) is None
+        assert cot_format({"problem": 123, "solution": "4"}) is None
+
+    def test_strips_whitespace(self):
+        result = cot_format({"problem": "  spaced  ", "solution": "   ans  "})
+        assert "Q: spaced" in result
+        assert result.endswith("Answer: ans")
+
+    def test_thought_precedes_answer(self):
+        ex = {"problem": "p", "solution": "s"}
+        result = cot_format(ex)
+        assert result.index("<thought>") < result.index("Answer: s")
+        assert result.index("</thought>") < result.index("Answer: s")
+
+
+class TestCoTDomainAssignment:
+    """Reasoning and math datasets must train on the CoT formatter."""
+
+    def test_reasoning_datasets_use_cot(self):
+        for ds_spec in MASTER_DATASETS:
+            if ds_spec.dataset in (
+                "open-r1/OpenR1-Math-220k",
+                "BespokeLabs/Bespoke-Stratos-17k",
+            ):
+                assert ds_spec.formatter is cot_format
+
+    def test_finqa_uses_cot(self):
+        for ds_spec in MASTER_DATASETS:
+            if ds_spec.dataset == "gbader/FinQA":
+                assert ds_spec.formatter is cot_format
+
+
+# ---------------------------------------------------------------------------
 # Token-length filtering
 # ---------------------------------------------------------------------------
 
@@ -580,10 +662,12 @@ class TestMixtureStreamerIntegration:
         tasks = self._build_fake_mixture(monkeypatch)
         streamer = MixtureStreamer(
             tasks, _tok(), VOCAB, seq_len=16, batch_size=4,
-            min_tokens=50, max_tokens=100, seed=42,
+            min_tokens=150, max_tokens=1000, seed=42,
         )
         batches = list(streamer)
-        # Markers are 40 chars each → 40 tokens < min_tokens=50 → all dropped
+        # Markers are 40 chars → 40 tokens plain, ~98 tokens once cot_format
+        # wraps the reasoning rows with <thought>; both sit below min_tokens=150
+        # (the bbh/gpqa/function_calling rows need QA schemas and are dropped).
         assert batches == []
 
     def test_streamer_is_reiterable(self, monkeypatch):
@@ -594,6 +678,25 @@ class TestMixtureStreamerIntegration:
         first = [b.tolist() for b in streamer]
         second = [b.tolist() for b in streamer]
         assert first == second and first
+
+    def test_streamer_packs_into_seq_len_512(self, monkeypatch):
+        """Continuous packing fills each row to the full 512-token budget."""
+        rows = [{"text": "PACK" * 5}] * 500  # "PACKPACK..." ~= 20 chars = 20 tokens
+        _fake_datasets(monkeypatch, {"ds_a": rows})
+        tasks = [TaskSpec(name="a", dataset="ds_a", weight=1.0)]
+        streamer = MixtureStreamer(
+            tasks, _tok(), VOCAB, seq_len=512, batch_size=2,
+            min_tokens=5, max_tokens=512, seed=0,
+        )
+        batches = list(streamer)
+        assert batches
+        for b in batches:
+            assert b.shape == (2, 512)
+            assert b.dtype == torch.long
+        # Decode the first row: every boundary must fall on a full-length row,
+        # so each 512-token row holds several packed examples (no padding).
+        decoded = _tok().decode([int(x) for x in batches[0][0]])
+        assert decoded.count("PACK") >= 2
 
     def test_streamer_handles_heterogeneous_schemas(self, monkeypatch):
         """Mix different schema types in different datasets."""

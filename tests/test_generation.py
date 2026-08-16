@@ -46,9 +46,10 @@ def _cfg(**overrides) -> BitNetFFTConfig:
 
 def _caches(model: BitNetFFTTransformer, batch: int = 1) -> list[KVCache]:
     head_dim = model.cfg.d_model // model.cfg.n_heads
+    total = model.cfg.n_layers * model.cfg.recurrent_steps
     return [
         KVCache.preallocate(batch, model.cfg.n_heads, model.cfg.max_seq_len, head_dim)
-        for _ in range(model.cfg.n_layers)
+        for _ in range(total)
     ]
 
 
@@ -70,7 +71,7 @@ def test_prefill_logits_match_full_forward():
         caches = _caches(m, batch=2)
         prefill = m(ctx, kv_cache=caches)
     assert torch.allclose(prefill, full, atol=1e-5)
-    assert [c.size for c in caches] == [8] * m.cfg.n_layers
+    assert [c.size for c in caches] == [8] * (m.cfg.n_layers * m.cfg.recurrent_steps)
 
 
 def test_stepwise_decode_logits_match_full_forward():
@@ -85,7 +86,7 @@ def test_stepwise_decode_logits_match_full_forward():
         ]
         got = torch.cat(rows, dim=1)
     assert torch.allclose(got, full, atol=1e-5)
-    assert [c.size for c in caches] == [8] * m.cfg.n_layers
+    assert [c.size for c in caches] == [8] * (m.cfg.n_layers * m.cfg.recurrent_steps)
 
 
 def test_generate_matches_stepwise_cached_decode():
@@ -103,6 +104,32 @@ def test_generate_matches_stepwise_cached_decode():
             ids.append(logits[:, -1].argmax(-1, keepdim=True))
         manual = torch.cat([prompt, torch.cat(ids, dim=1)], dim=1)
     assert torch.equal(out, manual)
+
+
+def test_recurrent_generate_matches_stepwise_cached_decode():
+    """Recurrent generate() reproduces a manual cached decode over the full
+    R*n_layers cache layout."""
+    m = _model(recurrent_steps=2)
+    prompt = torch.randint(0, m.cfg.vocab_size, (1, 5))
+    with torch.no_grad():
+        out = m.generate(prompt, max_new_tokens=8, temperature=0.0)
+        caches = _caches(m, batch=1)
+        logits = m(prompt, kv_cache=caches)
+        ids = [logits[:, -1].argmax(-1, keepdim=True)]
+        for step in range(1, 8):
+            logits = m(ids[-1], kv_cache=caches, past_length=5 + step - 1)
+            ids.append(logits[:, -1].argmax(-1, keepdim=True))
+        manual = torch.cat([prompt, torch.cat(ids, dim=1)], dim=1)
+    assert torch.equal(out, manual)
+
+
+def test_recurrent_stream_generate_matches_greedy():
+    m = _model(recurrent_steps=2)
+    prompt = torch.randint(0, m.cfg.vocab_size, (5,))
+    with torch.no_grad():
+        full = m.generate(prompt, max_new_tokens=8, temperature=0.0)
+        ids = list(m.stream_generate(prompt, max_new_tokens=8, temperature=0.0))
+    assert ids == full[5:].tolist()
 
 
 # --- stopping conditions -----------------------------------------------------

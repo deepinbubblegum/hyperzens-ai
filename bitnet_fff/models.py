@@ -63,6 +63,12 @@ class BitNetFFTConfig:
         max_seq_len: learned positional embedding width (transformer only).
         dropout: dropout probability on residual branches.
         tie_weights: tie the output head to the input embedding.
+        recurrent_steps: number of times the whole layer stack is applied
+            (recurrent depth). ``1`` disables recurrence; ``>1`` re-applies
+            the shared block stack that many times, adding a learned per-step
+            embedding (:attr:`BitNetFFTTransformer.step_emb`) at the start of
+            every pass. Effective depth is ``n_layers * recurrent_steps`` with
+            ``n_layers`` parameter blocks.
         use_fast_inference: in ``eval()`` use the packed-ternary Metal/NEON
             path when available (falls back to the reference path otherwise).
         eps: numerical stability for quantizers.
@@ -86,6 +92,7 @@ class BitNetFFTConfig:
     max_seq_len: int = 128
     dropout: float = 0.0
     tie_weights: bool = False
+    recurrent_steps: int = 4
     use_fast_inference: bool = True
     eps: float = 1e-8
     attention_activation_bits: int | None = None
@@ -340,26 +347,42 @@ def _causal_mask(seq: int, device: torch.device) -> torch.Tensor:
 
 
 def _per_layer_caches(
-    kv_cache: KVCache | list[KVCache] | None, n_layers: int
+    kv_cache: KVCache | list[KVCache] | None,
+    n_layers: int,
+    recurrent_steps: int = 1,
 ) -> list[KVCache | None]:
-    """Expand a per-model cache into one cache per transformer layer.
+    """Expand a per-model cache into one cache per ``(recurrent step, layer)``.
 
-    A bare :class:`KVCache` is only allowed for single-layer models (each
-    layer needs its own key/value storage); otherwise a list of ``n_layers``
-    caches is required so layer N never overwrites layer M's states.
+    A bare :class:`KVCache` is only allowed when the model needs exactly one
+    cache (``n_layers * recurrent_steps == 1``); otherwise a flat list of
+    ``n_layers * recurrent_steps`` caches is required so step N / layer M never
+    overwrites step N' / layer M' key/value states. A nested list of
+    ``recurrent_steps`` groups (each holding ``n_layers`` caches) is flattened
+    for convenience.
     """
+    total = n_layers * recurrent_steps
     if kv_cache is None:
-        return [None] * n_layers
+        return [None] * total
     if isinstance(kv_cache, (list, tuple)):
-        if len(kv_cache) != n_layers:
-            raise ValueError(
-                f"expected {n_layers} KVCache entries, got {len(kv_cache)}"
+        if len(kv_cache) == total:
+            return list(kv_cache)
+        if (
+            recurrent_steps > 1
+            and len(kv_cache) == recurrent_steps
+            and all(
+                isinstance(g, (list, tuple)) and len(g) == n_layers
+                for g in kv_cache
             )
-        return list(kv_cache)
-    if n_layers != 1:
+        ):
+            return [c for group in kv_cache for c in group]
         raise ValueError(
-            "provide one KVCache per layer (a list) for n_layers > 1; "
-            f"got a single cache for {n_layers} layers"
+            f"expected {total} KVCache entries (one per recurrent step x "
+            f"layer), got {len(kv_cache)}"
+        )
+    if total != 1:
+        raise ValueError(
+            "provide one KVCache per (recurrent step, layer) for recurrent "
+            f"models; got a single cache for {total} cache slots"
         )
     return [kv_cache]
 
@@ -537,6 +560,14 @@ class BitNetFFTTransformer(nn.Module):
         if cfg.vocab_size > 0:
             self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
             self.pos = nn.Embedding(cfg.max_seq_len, cfg.d_model)
+        self.step_emb = None
+        if cfg.recurrent_steps > 1:
+            # Learned per-pass embedding for recurrent depth (DeepSeek-style):
+            # added once at the start of every pass through the layer stack so
+            # each recurrence is distinguishable. Broadcast (d_model,) against
+            # ``(..., seq, d_model)`` keeps shapes consistent across passes.
+            self.step_emb = nn.Parameter(torch.empty(cfg.recurrent_steps, cfg.d_model))
+            nn.init.normal_(self.step_emb, std=0.02)
         self.layers = nn.ModuleList([BitNetFFTBlock(cfg, layer_norm_fn) for _ in range(cfg.n_layers)])
         self.norm = layer_norm_fn(cfg.d_model)
         self.head = None
@@ -577,32 +608,49 @@ class BitNetFFTTransformer(nn.Module):
     ) -> torch.Tensor:
         """Run the transformer on ``x`` (token ids or ``d_model`` rows).
 
-        ``kv_cache`` may be a single :class:`KVCache` (broadcast to every
-        layer) or a list/tuple with one cache per layer; ``past_length`` is the
-        number of already-generated tokens so each step only embeds/projects
-        the new token.
+        ``kv_cache`` may be a single :class:`KVCache` (only for a model with
+        exactly one ``(recurrent step, layer)`` slot), a flat list/tuple with
+        one cache per ``(recurrent step, layer)`` slot, or a nested list of
+        ``recurrent_steps`` groups each holding ``n_layers`` caches.
+        ``past_length`` is the number of already-generated tokens so each step
+        only embeds/projects the new token.
+
+        Recurrent depth: the shared layer stack is applied ``cfg.recurrent_steps``
+        times. Each pass adds a learned step embedding and runs the stack over
+        the same residual stream (``d_model`` throughout), so no shape mismatch
+        can arise from looping. With a KV cache every ``(step, layer)`` pair
+        owns its own key/value storage, keeping stepwise decode exactly equal
+        to a single full forward.
         """
         if self.embed is not None:
             x = self._apply_embeddings(x, pos_start=past_length)
         if mask is None and x.shape[-2] > 1:
             mask = _causal_mask(x.shape[-2], x.device)
-        layer_caches = _per_layer_caches(kv_cache, len(self.layers))
+        r = self.cfg.recurrent_steps
+        layer_caches = _per_layer_caches(kv_cache, len(self.layers), r)
         if self.gradient_checkpointing and self.training:
             ckpt_kwargs = dict(self._gradient_checkpointing_kwargs)
             if "use_reentrant" not in ckpt_kwargs:
                 ckpt_kwargs["use_reentrant"] = False
-            for layer, layer_cache in zip(self.layers, layer_caches):
-                x = torch.utils.checkpoint.checkpoint(
-                    layer,
-                    x,
-                    mask,
-                    layer_cache,
-                    past_length,
-                    **ckpt_kwargs,
-                )
-        else:
-            for layer, layer_cache in zip(self.layers, layer_caches):
-                x = layer(x, mask=mask, kv_cache=layer_cache, past_length=past_length)
+        for step in range(r):
+            if r > 1 and self.step_emb is not None:
+                x = x + self.step_emb[step]
+            offset = step * len(self.layers)
+            for i, layer in enumerate(self.layers):
+                layer_cache = layer_caches[offset + i]
+                if self.gradient_checkpointing and self.training:
+                    x = torch.utils.checkpoint.checkpoint(
+                        layer,
+                        x,
+                        mask,
+                        layer_cache,
+                        past_length,
+                        **ckpt_kwargs,
+                    )
+                else:
+                    x = layer(
+                        x, mask=mask, kv_cache=layer_cache, past_length=past_length
+                    )
         x = self.norm(x)
         if self.head is not None:
             x = self.head(x)
@@ -689,6 +737,7 @@ class BitNetFFTTransformer(nn.Module):
                 device = next(self.parameters()).device
                 dtype = next(self.parameters()).dtype
                 head_dim = self.cfg.d_model // self.cfg.n_heads
+                total_caches = self.cfg.recurrent_steps * len(self.layers)
                 caches = [
                     KVCache.preallocate(
                         batch,
@@ -698,7 +747,7 @@ class BitNetFFTTransformer(nn.Module):
                         dtype=dtype,
                         device=device,
                     )
-                    for _ in self.layers
+                    for _ in range(total_caches)
                 ]
 
                 # Prefill: full prompt once, cache all key/value states; the
@@ -830,6 +879,7 @@ class BitNetFFTTransformer(nn.Module):
                 device = next(self.parameters()).device
                 dtype = next(self.parameters()).dtype
                 head_dim = self.cfg.d_model // self.cfg.n_heads
+                total_caches = self.cfg.recurrent_steps * len(self.layers)
                 caches = [
                     KVCache.preallocate(
                         batch,
@@ -839,7 +889,7 @@ class BitNetFFTTransformer(nn.Module):
                         dtype=dtype,
                         device=device,
                     )
-                    for _ in self.layers
+                    for _ in range(total_caches)
                 ]
 
                 def _emit(ids: torch.Tensor):

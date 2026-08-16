@@ -124,11 +124,12 @@ def test_fff_blocks_use_bitnet_fff():
 
 def _cache_for(model: BitNetFFTTransformer, batch: int = 1) -> list[KVCache]:
     head_dim = model.cfg.d_model // model.cfg.n_heads
+    total = model.cfg.n_layers * model.cfg.recurrent_steps
     return [
         KVCache.preallocate(
             batch, model.cfg.n_heads, model.cfg.max_seq_len, head_dim, dtype=torch.float32
         )
-        for _ in range(model.cfg.n_layers)
+        for _ in range(total)
     ]
 
 
@@ -238,7 +239,7 @@ def test_transformer_kv_cache_generation_matches_full():
 
 def test_transformer_kv_cache_single_layer_broadcast():
     torch.manual_seed(0)
-    cfg = _cfg(use_fast_inference=False, n_layers=1)
+    cfg = _cfg(use_fast_inference=False, n_layers=1, recurrent_steps=1)
     m = BitNetFFTTransformer(cfg)
     m.eval()
     tokens = torch.randint(0, cfg.vocab_size, (1, 8))
@@ -422,3 +423,89 @@ def test_gradient_checkpointing():
 
     m.gradient_checkpointing_disable()
     assert not m.gradient_checkpointing
+
+
+# --- Recurrent depth --------------------------------------------------------
+
+
+def test_step_emb_created_only_when_recurrent():
+    m1 = BitNetFFTTransformer(_cfg(recurrent_steps=1))
+    assert m1.step_emb is None
+    m2 = BitNetFFTTransformer(_cfg(recurrent_steps=3))
+    assert m2.step_emb is not None
+    assert m2.step_emb.shape == (3, 32)
+    assert m2.step_emb.dtype == torch.float32
+
+
+def test_recurrent_backward_finite_grads():
+    torch.manual_seed(0)
+    cfg = _cfg(recurrent_steps=3)
+    m = BitNetFFTTransformer(cfg)
+    m.train()
+    tokens = torch.randint(0, cfg.vocab_size, (2, 8))
+    out = m(tokens)
+    out.sum().backward()
+    grads = [p.grad for p in m.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads)
+    assert m.step_emb.grad is not None
+    assert torch.isfinite(m.step_emb.grad).all()
+
+
+def test_recurrent_steps_change_output():
+    torch.manual_seed(0)
+    m1 = BitNetFFTTransformer(_cfg(n_layers=1, recurrent_steps=1))
+    m2 = BitNetFFTTransformer(_cfg(n_layers=1, recurrent_steps=3))
+    tokens = torch.randint(0, m1.cfg.vocab_size, (2, 8))
+    with torch.no_grad():
+        a, b = m1(tokens), m2(tokens)
+    assert a.shape == b.shape == (2, 8, m1.cfg.vocab_size)
+    assert not torch.allclose(a, b, atol=1e-4)
+
+
+def test_recurrent_kv_cache_generation_matches_full():
+    torch.manual_seed(0)
+    cfg = _cfg(use_fast_inference=False, recurrent_steps=2)
+    m = BitNetFFTTransformer(cfg).eval()
+    tokens = torch.randint(0, cfg.vocab_size, (1, 8))
+    with torch.no_grad():
+        full = m(tokens)
+        caches = _cache_for(m)
+        outs = [m(tokens[:, t : t + 1], kv_cache=caches, past_length=t) for t in range(8)]
+        got = torch.cat(outs, dim=1)
+    assert torch.allclose(got, full, atol=1e-5)
+
+
+def test_recurrent_nested_caches_accepted():
+    torch.manual_seed(0)
+    cfg = _cfg(use_fast_inference=False, recurrent_steps=2)
+    m = BitNetFFTTransformer(cfg).eval()
+    flat = _cache_for(m)
+    nested = [flat[2 * i : 2 * i + 2] for i in range(2)]
+    tokens = torch.randint(0, cfg.vocab_size, (1, 6))
+    with torch.no_grad():
+        a = m(tokens, kv_cache=flat)
+        b = m(tokens, kv_cache=nested)
+    assert torch.allclose(a, b, atol=1e-5)
+
+
+def test_recurrent_requires_per_step_layer_cache():
+    cfg = _cfg(use_fast_inference=False, n_layers=2, recurrent_steps=2)
+    m = BitNetFFTTransformer(cfg)
+    tokens = torch.randint(0, cfg.vocab_size, (1, 4))
+    with pytest.raises(ValueError):
+        m(tokens, kv_cache=_cache_for(m)[:3])  # only 3 of 4 slots
+    with pytest.raises(ValueError):
+        m(tokens, kv_cache=[_cache_for(m)[:2]])  # nested but only one step group
+
+
+def test_gradient_checkpointing_with_recurrence():
+    torch.manual_seed(0)
+    cfg = _cfg(recurrent_steps=2)
+    m = BitNetFFTTransformer(cfg)
+    m.gradient_checkpointing_enable()
+    m.train()
+    tokens = torch.randint(0, cfg.vocab_size, (2, 8))
+    out = m(tokens)
+    out.sum().backward()
+    grads = [p.grad for p in m.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads)

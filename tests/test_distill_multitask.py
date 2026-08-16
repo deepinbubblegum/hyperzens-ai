@@ -108,6 +108,74 @@ def test_no_tie_weights_overrides():
     assert args.no_tie_weights is True
 
 
+# --- GaLore optimizer --------------------------------------------------------
+
+
+def test_galore_arg_defaults():
+    args = mod.parse_args([])
+    assert args.use_galore is True
+    assert args.galore_rank == 128
+    assert args.update_proj_gap == 200
+    assert args.galore_scale == 0.25
+    assert args.galore_proj_type == "std"
+
+
+def test_no_use_galore_flag_disables():
+    assert mod.parse_args(["--no-use-galore"]).use_galore is False
+    assert mod.parse_args(["--use-galore"]).use_galore is True
+
+
+def test_galore_rank_arg():
+    assert mod.parse_args(["--galore-rank", "64"]).galore_rank == 64
+    assert mod.parse_args(["--update-proj-gap", "50"]).update_proj_gap == 50
+
+
+def test_galore_optimizer_routes_matrix_params_to_rank_group():
+    student = _student()
+    opt = mod._galore_optimizer(student, 1e-3, (0.9, 0.999), 0.01, rank=4)
+    assert len(opt.param_groups) == 2
+    galore_group, regular_group = opt.param_groups
+    assert galore_group["rank"] == 4
+    assert "rank" not in regular_group
+
+    leaf = next(p for p in student.parameters() if p.ndim == 3)
+    assert leaf.ndim == 3  # UFF leaf_weight stays 3D in the model
+    assert any(leaf is p for p in galore_group["params"])
+    assert galore_group["params"] and regular_group["params"]
+    for p in galore_group["params"]:
+        assert p.ndim >= 2
+    for p in regular_group["params"]:
+        assert p.ndim == 1
+
+
+def test_galore_optimizer_step_keeps_leaf_3d():
+    student = _student()
+    opt = mod._galore_optimizer(student, 1e-3, (0.9, 0.999), 0.01, rank=4)
+    teacher = _teacher()
+    batches = [_batch(n=2)]
+    loss, kd, ce = mod.accum_step(student, opt, teacher, batches, 0.7, 2.0, 64, grad_accum=1)
+    assert torch.isfinite(torch.tensor(loss))
+    leaf = next(p for p in student.parameters() if p.ndim == 3)
+    assert leaf.ndim == 3 and torch.isfinite(leaf).all()
+
+
+def test_galore_optimizer_requires_params():
+    with pytest.raises(ValueError, match="at least one parameter"):
+        mod._galore_optimizer(
+            torch.nn.ParameterList([]), 1e-3, (0.9, 0.999), 0.01, rank=4
+        )
+
+
+def test_main_e2e_use_galore(monkeypatch, tmp_path, capsys):
+    _fake_load_dataset(monkeypatch, _recipe_fake_rows())
+    args = _e2e_args(tmp_path, steps=3) + ["--use-galore", "--galore-rank", "4"]
+    rc = mod.main(args)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "GaLoreAdamW rank=4" in out
+    assert (tmp_path / "mt_student.pt").exists()
+
+
 # --- linear warmup scheduler -------------------------------------------------
 
 
@@ -538,6 +606,7 @@ def _e2e_args(tmp_path, steps=6):
         "--batch-size", "2", "--grad-accum-steps", "2",
         "--steps", str(steps), "--val-every", "2", "--val-batches", "1",
         "--log-every", "2", "--save-every", "3", "--no-fp16", "--warmup-steps", "2",
+        "--no-use-galore",
         "--checkpoint", str(tmp_path / "mt_student.pt"),
     ]
 

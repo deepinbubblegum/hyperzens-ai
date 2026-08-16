@@ -32,6 +32,9 @@ Usage:
         --tasks math,code --weights 0.6,0.4 --steps 20000 --device mps
     python scripts/distill_multitask.py --fff-depth 10 --top-k 8 \
         --device mps --checkpoint ckpts/mt_uff.pt  # BitNet-UFF student
+    python scripts/distill_multitask.py --d-model 1024 --n-layers 6 \
+        --recurrent-steps 4 --fff-depth 8 --top-k 4 --use-galore \
+        --device cuda --checkpoint ckpts/r3060_student.pt  # RTX 3060
 """
 
 from __future__ import annotations
@@ -49,6 +52,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import train_qat
 import distill as distill_mod
+
+try:
+    from galore_torch import GaLoreAdamW
+except ImportError:  # pragma: no cover - GaLore is optional
+    GaLoreAdamW = None  # type: ignore[assignment,misc]
 
 from bitnet_fff.dataset import MultiTaskStreamer, multi_task_recipe
 from bitnet_fff.models import BitNetFFTConfig
@@ -73,6 +81,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     m.add_argument("--d-model", type=int, default=128)
     m.add_argument("--n-heads", type=int, default=4)
     m.add_argument("--n-layers", type=int, default=2)
+    m.add_argument("--recurrent-steps", type=int, default=4,
+                   help="recurrent depth: how many times the layer stack is "
+                        "applied per forward (effective depth = "
+                        "n_layers * recurrent_steps)")
     m.add_argument("--fff-depth", type=int, default=3)
     m.add_argument("--top-k", type=int, default=8,
                    help="Number of active top-k leaves per token in BitNet-UFF")
@@ -87,6 +99,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "(enabled by default)")
     m.add_argument("--no-tie-weights", action="store_true",
                    help="disable weight tying (overrides --tie-weights)")
+
+    g = p.add_argument_group("GaLore optimizer")
+    g.add_argument("--use-galore", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="route 2D/3D matrix params through GaLoreAdamW "
+                        "low-rank projections (1D biases / LayerNorms stay on "
+                        "standard AdamW); disabled with --no-use-galore")
+    g.add_argument("--galore-rank", type=int, default=128,
+                   help="low-rank dimension for the GaLore gradient projection")
+    g.add_argument("--update-proj-gap", type=int, default=200,
+                   help="recompute the GaLore projection basis every N steps")
+    g.add_argument("--galore-scale", type=float, default=0.25,
+                   help="GaLore projector scale (multiplier on the projected "
+                        "gradient returned to full rank)")
+    g.add_argument("--galore-proj-type", choices=("std", "left", "right", "full"),
+                   default="std", help="GaLore projection type")
 
     tm = p.add_argument_group("teacher")
     tm.add_argument("--teacher", default="local",
@@ -398,6 +426,96 @@ class LinearWarmupScheduler:
         self._set_lr(self._lr_for(self.last_step))
 
 
+class _GaLoreAdamWRouting(GaLoreAdamW):
+    """GaLoreAdamW that projects 2D/3D matrix params through a low-rank basis.
+
+    ``galore_torch.GaLoreAdamW`` projects gradients with an SVD-derived
+    orthogonal basis, which only works on 2D matrices. 3D parameters (e.g.
+    ``BitNetUFFLayer.leaf_weight (L, d_out, d_in)``) are flattened to
+    ``(L * d_out, d_in)`` for the duration of :meth:`step` -- the ``rows >>
+    cols`` orientation keeps the projected optimizer state at ``rank``
+    columns instead of the full matrix -- and the in-place update flows
+    through the shared storage view, so the 3D parameter sees the change and
+    its ``grad`` is restored to the original shape for the next backward.
+
+    1D parameters (biases / LayerNorm scales) live in a group without a
+    ``rank`` key and are updated by the plain Adam branch.
+    """
+
+    def step(self, closure: Callable | None = None) -> object:
+        reshaped: list[tuple[torch.nn.Parameter, tuple[int, ...]]] = []
+        for group in self.param_groups:
+            if "rank" not in group:
+                continue
+            for p in group["params"]:
+                if p.grad is None or p.grad.ndim <= 2:
+                    continue
+                shape = tuple(p.shape)
+                p.data = p.data.reshape(shape[0] * shape[1], shape[2])
+                p.grad = p.grad.reshape(shape[0] * shape[1], shape[2])
+                reshaped.append((p, shape))
+        try:
+            return super().step(closure)
+        finally:
+            for p, shape in reshaped:
+                p.data = p.data.view(*shape)
+                if p.grad is not None:
+                    p.grad = p.grad.view(*shape)
+
+
+def _galore_optimizer(
+    model,
+    lr: float,
+    betas: tuple[float, float],
+    weight_decay: float,
+    rank: int,
+    update_proj_gap: int = 200,
+    scale: float = 0.25,
+    proj_type: str = "std",
+) -> GaLoreAdamW:
+    """Build a GaLoreAdamW with matrix params projected and 1D params on AdamW.
+
+    Parameters with ``ndim >= 2`` (attention projections, embeddings, the
+    output head, and the FFF/UFF router + leaf weights) go into the GaLore
+    group and are updated through a rank-``rank`` gradient projection, which
+    shrinks their Adam state from ``2 * numel`` to ``2 * rank * max_dim``.
+    1D parameters (biases, LayerNorm weight/bias) go into a plain AdamW group
+    (no ``rank`` key). Returns a single optimizer object so the warmup
+    scheduler and checkpoint ``state_dict`` round-trip unchanged.
+    """
+    proj_params: list[torch.nn.Parameter] = []
+    regular_params: list[torch.nn.Parameter] = []
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim >= 2:
+            proj_params.append(p)
+        else:
+            regular_params.append(p)
+    param_groups: list[dict] = []
+    if proj_params:
+        param_groups.append(
+            {
+                "params": proj_params,
+                "rank": int(rank),
+                "update_proj_gap": int(update_proj_gap),
+                "scale": float(scale),
+                "proj_type": proj_type,
+            }
+        )
+    if regular_params:
+        param_groups.append({"params": regular_params})
+    if not param_groups:
+        raise ValueError("GaLore optimizer requires at least one parameter")
+    return _GaLoreAdamWRouting(
+        param_groups,
+        lr=lr,
+        betas=betas,
+        weight_decay=weight_decay,
+        no_deprecation_warning=True,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.grad_accum_steps < 1:
@@ -435,6 +553,7 @@ def main(argv: list[str] | None = None) -> int:
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
+        recurrent_steps=args.recurrent_steps,
         fff_depth=args.fff_depth,
         top_k=args.top_k,
         fff_bias=not args.no_fff_bias,
@@ -456,7 +575,28 @@ def main(argv: list[str] | None = None) -> int:
         clip_grad_norm=args.clip_grad_norm,
     )
 
-    if device.type == "cuda":
+    galore_active = False
+    if args.use_galore:
+        if GaLoreAdamW is None:
+            print("[optimizer] GaLoreAdamW unavailable "
+                  "(galore_torch not installed), using default optimizer")
+        else:
+            try:
+                opt = _galore_optimizer(
+                    student, args.lr, (args.beta1, args.beta2),
+                    args.weight_decay, args.galore_rank,
+                    args.update_proj_gap, args.galore_scale,
+                    args.galore_proj_type,
+                )
+                galore_active = True
+                print(f"[optimizer] GaLoreAdamW rank={args.galore_rank} "
+                      f"update_proj_gap={args.update_proj_gap} "
+                      f"scale={args.galore_scale} "
+                      f"(matrix params projected; 1D biases/LayerNorms -> AdamW)")
+            except Exception as e:
+                print(f"[optimizer] GaLoreAdamW setup failed ({e}), "
+                      "using default optimizer")
+    if not galore_active and device.type == "cuda":
         try:
             import bitsandbytes as bnb
 
@@ -480,8 +620,8 @@ def main(argv: list[str] | None = None) -> int:
         student = torch.compile(student)
         print("[student] torch.compile enabled")
     print(f"[student] d_model={cfg.d_model} n_heads={cfg.n_heads} "
-          f"n_layers={cfg.n_layers} fff_depth={cfg.fff_depth} "
-          f"top_k={cfg.top_k} "
+          f"n_layers={cfg.n_layers} recurrent_steps={cfg.recurrent_steps} "
+          f"fff_depth={cfg.fff_depth} top_k={cfg.top_k} "
           f"vocab={cfg.vocab_size} tie_weights={tie} alpha={args.alpha} "
           f"T={args.temperature} device={device}")
     if args.warmup_steps > 0:

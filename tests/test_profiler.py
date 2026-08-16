@@ -27,7 +27,11 @@ def test_layer_profiler_records_times():
     assert len(summary) >= 5
     for name, r in summary.items():
         assert r["best_ms"] <= r["mean_ms"]
-        assert r["calls"] == 4  # 1 warmup + 3 iters
+        if name.startswith("layers."):
+            expected = 4 * m.cfg.recurrent_steps  # layers run once per recurrent step
+        else:
+            expected = 4  # final norm / root run once per forward
+        assert r["calls"] == expected
     assert summary["<root>"]["self_ms"] >= 0.0
 
 
