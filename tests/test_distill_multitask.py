@@ -225,6 +225,36 @@ def test_build_optimizer_bnb_8bit_off_cuda_falls_back(monkeypatch):
     assert isinstance(opt, mod.FP16MasterAdamW)
 
 
+def test_build_optimizer_bnb_8bit_cuda_uses_AdamW8bit_and_skips_galore(monkeypatch):
+    import types
+
+    calls = {}
+
+    class FakeAdamW8bit:
+        def __init__(self, params, **kwargs):
+            calls["params"] = list(params)
+            calls["kwargs"] = kwargs
+
+    fake_bnb = types.SimpleNamespace(optim=types.SimpleNamespace(AdamW8bit=FakeAdamW8bit))
+    monkeypatch.setitem(sys.modules, "bitsandbytes", fake_bnb)
+
+    def _boom(*a, **k):
+        raise AssertionError("GaLore must be bypassed for adamw_bnb_8bit")
+
+    monkeypatch.setattr(mod, "_galore_optimizer", _boom)
+
+    student = _student()
+    args = mod.parse_args(["--optimizer", "adamw_bnb_8bit"])
+    opt = mod._build_optimizer(student, args, torch.device("cuda"))
+
+    assert isinstance(opt, FakeAdamW8bit)
+    assert calls["params"]
+    assert calls["params"][0] is next(student.parameters())
+    assert calls["kwargs"]["lr"] == 1e-3
+    assert calls["kwargs"]["betas"] == (0.9, 0.999)
+    assert calls["kwargs"]["weight_decay"] == 0.01
+
+
 def test_build_optimizer_galore_missing_library_falls_back(monkeypatch):
     monkeypatch.setattr(mod, "GaLoreAdamW", None)
     student = _student()
