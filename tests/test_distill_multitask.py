@@ -263,6 +263,44 @@ def test_build_optimizer_galore_missing_library_falls_back(monkeypatch):
     assert isinstance(opt, mod.FP16MasterAdamW)
 
 
+def test_module_loads_without_galore_torch():
+    """Module must import and run adamw when galore_torch is missing (no TypeError)."""
+    import subprocess
+
+    code = f"""
+import sys
+
+class _BlockGalore:
+    def find_spec(self, name, path=None, target=None):
+        if name == "galore_torch" or name.startswith("galore_torch."):
+            raise ImportError("blocked for test")
+        return None
+
+sys.meta_path.insert(0, _BlockGalore())
+for m in list(sys.modules):
+    if m == "galore_torch" or m.startswith("galore_torch."):
+        del sys.modules[m]
+sys.path.insert(0, {SCRIPTS!r})
+import torch
+import distill_multitask as dm
+assert dm.GaLoreAdamW is None
+assert dm._GaLoreAdamWRouting.__bases__ == (object,)
+from bitnet_fff.qat import BitNetQAT
+from bitnet_fff.models import BitNetFFTConfig, BitNetFFTTransformer
+cfg = BitNetFFTConfig(vocab_size=64, d_model=16, n_heads=2, n_layers=1,
+                      fff_depth=1, max_seq_len=8, tie_weights=True, use_fast_inference=False)
+student = BitNetQAT(BitNetFFTTransformer(cfg))
+opt = dm._build_optimizer(student, dm.parse_args(["--optimizer", "adamw"]), torch.device("cpu"))
+assert isinstance(opt, torch.optim.AdamW), type(opt)
+print("OK")
+"""
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, cwd=REPO
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "OK" in out.stdout
+
+
 def test_main_e2e_use_galore(monkeypatch, tmp_path, capsys):
     _fake_load_dataset(monkeypatch, _recipe_fake_rows())
     args = _e2e_args(tmp_path, steps=3) + ["--use-galore", "--galore-rank", "4"]

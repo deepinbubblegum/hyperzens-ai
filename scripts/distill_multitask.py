@@ -433,7 +433,8 @@ class LinearWarmupScheduler:
         self._set_lr(self._lr_for(self.last_step))
 
 
-class _GaLoreAdamWRouting(GaLoreAdamW):
+base_cls = GaLoreAdamW if GaLoreAdamW is not None else object
+class _GaLoreAdamWRouting(base_cls):  # type: ignore[misc]
     """GaLoreAdamW that projects 2D/3D matrix params through a low-rank basis.
 
     ``galore_torch.GaLoreAdamW`` projects gradients with an SVD-derived
@@ -447,6 +448,12 @@ class _GaLoreAdamWRouting(GaLoreAdamW):
 
     1D parameters (biases / LayerNorm scales) live in a group without a
     ``rank`` key and are updated by the plain Adam branch.
+
+    When ``galore_torch`` is unavailable the base falls back to ``object``
+    and the class is never instantiated: the ``galore`` branch of
+    :func:`_build_optimizer` refuses to build GaLore optimizers unless
+    ``GaLoreAdamW is not None``, and ``adamw`` / ``adamw_bnb_8bit`` never
+    touch GaLore routing at all.
     """
 
     def step(self, closure: Callable | None = None) -> object:
@@ -490,6 +497,11 @@ def _galore_optimizer(
     (no ``rank`` key). Returns a single optimizer object so the warmup
     scheduler and checkpoint ``state_dict`` round-trip unchanged.
     """
+    if GaLoreAdamW is None:
+        raise ValueError(
+            "GaLoreAdamW is unavailable (galore_torch not installed); "
+            "select --optimizer adamw or adamw_bnb_8bit instead"
+        )
     proj_params: list[torch.nn.Parameter] = []
     regular_params: list[torch.nn.Parameter] = []
     for p in model.parameters():
